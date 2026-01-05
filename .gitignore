@@ -1,0 +1,22 @@
+# Python runtime cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments (Conda/Venv)
+env/
+venv/
+.venv/
+
+# Distribution / Builds
+build/
+dist/
+*.egg-info/
+
+# IDE settings (optional but recommended)
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db

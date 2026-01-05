@@ -1,0 +1,46 @@
+{
+    "strips": [
+        {
+            "uid": "c7c5175e-ad27-484d-adb8-eb34deaf3d3f",
+            "label": "Desktop",
+            "kind": "input",
+            "mode": "virtual",
+            "volume": 0.8346456692913385,
+            "mute": false,
+            "routes": [
+                "4d00edf7-d2d6-428d-b51c-22bc2288db16"
+            ],
+            "device_name": null,
+            "midi_volume": {
+                "channel": 0,
+                "control": 23,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 4,
+                "type": "note_on"
+            }
+        },
+        {
+            "uid": "4d00edf7-d2d6-428d-b51c-22bc2288db16",
+            "label": "Speakers",
+            "kind": "output",
+            "mode": "physical",
+            "volume": 0.5196850393700787,
+            "mute": false,
+            "routes": [],
+            "device_name": "alsa_output.usb-C-Media_Electronics_Inc._Hifi_Audio-00.analog-stereo",
+            "midi_volume": {
+                "channel": 0,
+                "control": 62,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 27,
+                "type": "note_on"
+            }
+        }
+    ]
+}
