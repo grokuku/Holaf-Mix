@@ -41,6 +41,9 @@ class Strip:
         # List of application names (strings) assigned to this strip (e.g. ["Firefox", "Spotify"])
         self.assigned_apps = []
 
+        # System Default Sink Flag
+        self.is_default = False
+
         # MIDI Mapping configuration
         self.midi_volume = None 
         self.midi_mute = None
@@ -57,6 +60,7 @@ class Strip:
             'routes': self.routes,
             'device_name': self.device_name,
             'assigned_apps': self.assigned_apps,
+            'is_default': self.is_default,
             'midi_volume': self.midi_volume,
             'midi_mute': self.midi_mute
         }
@@ -75,6 +79,7 @@ class Strip:
         strip.routes = data.get('routes', [])
         strip.device_name = data.get('device_name')
         strip.assigned_apps = data.get('assigned_apps', [])
+        strip.is_default = data.get('is_default', False)
         strip.midi_volume = data.get('midi_volume')
         strip.midi_mute = data.get('midi_mute')
         

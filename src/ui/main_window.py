@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QLabel, QScrollArea, QFrame, QPushButton, QInputDialog, QMessageBox,
-                               QDialog, QCheckBox, QDialogButtonBox)
+                               QDialog, QCheckBox, QDialogButtonBox, QSizePolicy)
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, Slot, QTimer
 from src.config import settings
 from src.models.strip_model import Strip, StripType, StripMode
@@ -30,8 +30,6 @@ class AppSelectionDialog(QDialog):
         
         self.check_boxes = []
         
-        # Merge running apps with already assigned ones (even if not running)
-        # to ensure we don't lose config
         all_names = set([app['name'] for app in running_apps])
         all_names.update(assigned_apps)
         
@@ -71,7 +69,6 @@ class MainWindow(QMainWindow):
     def __init__(self, audio_engine=None, midi_engine=None):
         super().__init__()
         self.setWindowTitle("Holaf-Mix")
-        self.resize(1100, 700)
         
         self.audio_engine = audio_engine
         self.midi_engine = midi_engine
@@ -79,30 +76,37 @@ class MainWindow(QMainWindow):
         self.thread_pool.setMaxThreadCount(4)
         
         self.midi_lookup = {}
-        self.widgets = {} 
+        self.widgets = {}
         
         self.strips = settings.load_config()
         self._rebuild_midi_lookup()
         
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
+        
         self.main_layout = QHBoxLayout(self.central_widget)
         self.main_layout.setSpacing(0)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
-
+        
         self.inputs_container = self._create_section("INPUTS", "#2b2b2b", StripType.INPUT)
         self.main_layout.addWidget(self.inputs_container)
 
         self.outputs_container = self._create_section("OUTPUTS", "#1e1e1e", StripType.OUTPUT)
         self.main_layout.addWidget(self.outputs_container)
-
+        
         self.refresh_ui()
         self._init_midi()
 
-        # Start a slow timer to enforce app routing (optional but good for persistence)
+        # Timer for routing enforcement
         self.enforce_timer = QTimer(self)
         self.enforce_timer.timeout.connect(self._enforce_app_routing)
-        self.enforce_timer.start(5000) # Check every 5s
+        self.enforce_timer.start(5000) 
+        
+        # Timer for VU Meters (High frequency)
+        self.meter_timer = QTimer(self)
+        self.meter_timer.setInterval(40) # 40ms = 25 FPS
+        self.meter_timer.timeout.connect(self._update_meters)
+        self.meter_timer.start()
 
     def _init_midi(self):
         if not self.midi_engine: return
@@ -161,7 +165,10 @@ class MainWindow(QMainWindow):
     def _create_section(self, title, bg_color, strip_kind):
         container = QWidget()
         container.setStyleSheet(f"background-color: {bg_color};")
+        container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        
         layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
         
         header_widget = QWidget()
         header_layout = QHBoxLayout(header_widget)
@@ -180,8 +187,10 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(lambda: self.on_add_clicked(strip_kind))
 
         header_layout.addWidget(label)
-        header_layout.addStretch()
+        header_layout.addSpacing(10)
         header_layout.addWidget(btn_add)
+        header_layout.addStretch() 
+        
         layout.addWidget(header_widget)
 
         scroll = QScrollArea()
@@ -193,6 +202,7 @@ class MainWindow(QMainWindow):
         content_layout = QHBoxLayout(content_widget)
         content_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         content_layout.setSpacing(10)
+        content_layout.setContentsMargins(10, 10, 10, 10) 
         content_widget.setLayout(content_layout)
         scroll.setWidget(content_widget)
         layout.addWidget(scroll)
@@ -217,7 +227,8 @@ class MainWindow(QMainWindow):
             widget.route_changed.connect(self.on_strip_route_changed)
             widget.midi_learn_requested.connect(self.on_midi_learn_requested)
             widget.device_changed.connect(self.on_strip_device_changed)
-            widget.app_selection_requested.connect(self.on_app_selection_requested) # NEW
+            widget.app_selection_requested.connect(self.on_app_selection_requested)
+            widget.default_changed.connect(self.on_strip_default_changed) 
             
             if strip.kind == StripType.INPUT:
                 widget.set_routing_targets(output_strips)
@@ -226,10 +237,55 @@ class MainWindow(QMainWindow):
                 self.outputs_container.content_layout.addWidget(widget)
         
         self._populate_devices()
+        
+        # Increase delay to ensure layout count is accurate
+        QTimer.singleShot(50, self._adjust_window_size)
+
+    def _adjust_window_size(self):
+        """
+        Calculates required width and forces distribution via Stretch Factors.
+        """
+        STRIP_WIDTH = 100
+        SPACING = 10
+        MARGIN_TOTAL_PER_SECTION = 22
+        MIN_SECTION_WIDTH = 160 
+        
+        def calculate_section_width(layout):
+            count = layout.count()
+            if count == 0:
+                return MIN_SECTION_WIDTH
+            total = (count * STRIP_WIDTH) + (max(0, count - 1) * SPACING) + MARGIN_TOTAL_PER_SECTION
+            return max(total, MIN_SECTION_WIDTH)
+
+        width_inputs = calculate_section_width(self.inputs_container.content_layout)
+        width_outputs = calculate_section_width(self.outputs_container.content_layout)
+        
+        self.main_layout.setStretch(0, width_inputs)
+        self.main_layout.setStretch(1, width_outputs)
+
+        total_width = width_inputs + width_outputs
+        
+        self.setMinimumWidth(0)
+        self.setFixedWidth(total_width)
+    
+    def _update_meters(self):
+        """
+        Polls the audio engine for VU meter levels and updates the widgets.
+        """
+        if not self.audio_engine: return
+        
+        levels = self.audio_engine.get_meter_levels()
+        for uid, (left, right) in levels.items():
+            widget = self.widgets.get(uid)
+            if widget:
+                widget.update_vumeter(left, right)
 
     def _populate_devices(self):
-        # Fetch Sinks (for outputs) and Sources (for inputs)
         nodes = pipewire_utils.get_audio_nodes()
+        
+        # Sort nodes alphabetically by description for better UX
+        nodes.sort(key=lambda x: x.get('description', '').lower())
+        
         sinks = [n for n in nodes if n.get('media_class') == 'Audio/Sink']
         sources = [n for n in nodes if n.get('media_class') == 'Audio/Source']
 
@@ -279,41 +335,27 @@ class MainWindow(QMainWindow):
     def on_app_selection_requested(self, uid):
         strip = next((s for s in self.strips if s.uid == uid), None)
         if not strip: return
-        
-        # 1. Get currently running apps
         running_apps = pipewire_utils.get_sink_inputs()
-        
-        # 2. Show Dialog
         dlg = AppSelectionDialog(running_apps, strip.assigned_apps, self)
         if dlg.exec():
             selected = dlg.get_selected_apps()
             strip.assigned_apps = selected
             settings.save_config(self.strips)
-            
-            # 3. Apply changes (Move apps)
             self._move_apps_to_strip(strip, running_apps)
 
     def _move_apps_to_strip(self, strip, running_apps=None):
         if not running_apps:
             running_apps = pipewire_utils.get_sink_inputs()
-            
         target_sink_name = f"Holaf_Strip_{strip.uid}"
-        
         for app in running_apps:
             if app['name'] in strip.assigned_apps:
-                # Move it!
-                success = pipewire_utils.move_sink_input(app['id'], target_sink_name)
-                if success:
-                    print(f"Moved {app['name']} to {strip.label}")
-                else:
-                    print(f"Failed to move {app['name']}")
+                pipewire_utils.move_sink_input(app['id'], target_sink_name)
 
     def _enforce_app_routing(self):
-        """Periodically ensures apps are on their assigned strips."""
         running_apps = pipewire_utils.get_sink_inputs()
         for strip in self.strips:
             if strip.kind == StripType.INPUT and strip.mode == StripMode.VIRTUAL:
-                 if strip.assigned_apps:
+                 if strip.assigned_apps and not strip.is_default:
                      self._move_apps_to_strip(strip, running_apps)
 
     # --- Backend Interfacing ---
@@ -352,3 +394,16 @@ class MainWindow(QMainWindow):
                 self.audio_engine.shutdown()
                 self.audio_engine.start_engine(self.strips)
             self._run_in_background(reload)
+
+    def on_strip_default_changed(self, uid, is_default):
+        if is_default:
+            for s in self.strips:
+                if s.kind == StripType.INPUT and s.uid != uid:
+                    s.is_default = False
+                    w = self.widgets.get(s.uid)
+                    if w: w.set_default_state(False)
+            target = next((s for s in self.strips if s.uid == uid), None)
+            if target: target.is_default = True
+            settings.save_config(self.strips)
+            if self.audio_engine:
+                self._run_in_background(self.audio_engine.set_system_default, uid)

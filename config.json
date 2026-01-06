@@ -1,60 +1,16 @@
 {
     "strips": [
         {
-            "uid": "c7c5175e-ad27-484d-adb8-eb34deaf3d3f",
-            "label": "Default",
-            "kind": "input",
-            "mode": "virtual",
-            "volume": 1.0,
-            "mute": false,
-            "routes": [
-                "4d00edf7-d2d6-428d-b51c-22bc2288db16",
-                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
-            ],
-            "device_name": null,
-            "assigned_apps": [],
-            "midi_volume": {
-                "channel": 0,
-                "control": 23,
-                "type": "control_change"
-            },
-            "midi_mute": {
-                "channel": 0,
-                "note": 4,
-                "type": "note_on"
-            }
-        },
-        {
             "uid": "4d00edf7-d2d6-428d-b51c-22bc2288db16",
-            "label": "HP",
+            "label": "Casque",
             "kind": "output",
             "mode": "physical",
             "volume": 0.0,
             "mute": false,
             "routes": [],
-            "device_name": "alsa_output.usb-C-Media_Electronics_Inc._Hifi_Audio-00.analog-stereo",
-            "assigned_apps": [],
-            "midi_volume": {
-                "channel": 0,
-                "control": 62,
-                "type": "control_change"
-            },
-            "midi_mute": {
-                "channel": 0,
-                "note": 27,
-                "type": "note_on"
-            }
-        },
-        {
-            "uid": "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
-            "label": "Casque",
-            "kind": "output",
-            "mode": "physical",
-            "volume": 0.11811023622047244,
-            "mute": false,
-            "routes": [],
             "device_name": "alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40",
             "assigned_apps": [],
+            "is_default": false,
             "midi_volume": {
                 "channel": 0,
                 "control": 61,
@@ -67,36 +23,135 @@
             }
         },
         {
+            "uid": "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
+            "label": "HP",
+            "kind": "output",
+            "mode": "physical",
+            "volume": 0.5748031496062992,
+            "mute": false,
+            "routes": [],
+            "device_name": "alsa_output.usb-C-Media_Electronics_Inc._Hifi_Audio-00.analog-stereo",
+            "assigned_apps": [],
+            "is_default": false,
+            "midi_volume": {
+                "channel": 0,
+                "control": 62,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 27,
+                "type": "note_on"
+            }
+        },
+        {
             "uid": "22eee65f-b74c-4540-a4b4-087a6364b608",
-            "label": "web",
+            "label": "Mic",
+            "kind": "input",
+            "mode": "physical",
+            "volume": 1.0,
+            "mute": false,
+            "routes": [],
+            "device_name": "alsa_input.usb-PreSonus_Studio_26c_01424548-00.analog-stereo",
+            "assigned_apps": [],
+            "is_default": false,
+            "midi_volume": {
+                "channel": 0,
+                "control": 19,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 1,
+                "type": "note_on"
+            }
+        },
+        {
+            "uid": "a187b6c2-4e6f-4b6b-ba8a-ec9b4d77c304",
+            "label": "Default",
             "kind": "input",
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
             "routes": [
+                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
+                "4d00edf7-d2d6-428d-b51c-22bc2288db16"
+            ],
+            "device_name": null,
+            "assigned_apps": [],
+            "is_default": true,
+            "midi_volume": {
+                "channel": 0,
+                "control": 23,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 4,
+                "type": "note_on"
+            }
+        },
+        {
+            "uid": "16c798e3-c9f2-4f4d-bcdf-985f23d04821",
+            "label": "Web",
+            "kind": "input",
+            "mode": "virtual",
+            "volume": 1.0,
+            "mute": false,
+            "routes": [
+                "4d00edf7-d2d6-428d-b51c-22bc2288db16",
                 "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
             ],
             "device_name": null,
             "assigned_apps": [
                 "Firefox"
             ],
-            "midi_volume": null,
-            "midi_mute": null
+            "is_default": false,
+            "midi_volume": {
+                "channel": 0,
+                "control": 27,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 7,
+                "type": "note_on"
+            }
         },
         {
-            "uid": "8b4b72e6-e0e7-44a1-be0b-69a9400c126c",
-            "label": "Mic",
+            "uid": "306af803-d52d-427f-ac87-578a31c66347",
+            "label": "Chat",
             "kind": "input",
-            "mode": "physical",
+            "mode": "virtual",
             "volume": 1.0,
             "mute": false,
-            "routes": [
-                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
-            ],
-            "device_name": "alsa_input.usb-PreSonus_Studio_26c_01424548-00.analog-stereo",
+            "routes": [],
+            "device_name": null,
             "assigned_apps": [],
-            "midi_volume": null,
-            "midi_mute": null
+            "is_default": false,
+            "midi_volume": {
+                "channel": 0,
+                "control": 31,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 10,
+                "type": "note_on"
+            }
         }
-    ]
+    ],
+    "window": {
+        "x": 0,
+        "y": 0,
+        "height": 423,
+        "maximized": false
+    },
+    "window_geometry": "01d9d0cb00030000000000000000000000000243000002c8000000000000000000000243000002c800000001000000000a00000000000000000000000243000002c8",
+    "window_state": {
+        "x": 2560,
+        "y": 0,
+        "h": 575,
+        "maximized": false
+    }
 }

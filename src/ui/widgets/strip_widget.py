@@ -1,8 +1,48 @@
 from PySide6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QPushButton, 
-                               QSlider, QLabel, QWidget, QMenu, QInputDialog, QComboBox)
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
-from PySide6.QtGui import QAction
+                               QSlider, QLabel, QWidget, QMenu, QInputDialog, QComboBox, QCheckBox, QSizePolicy)
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QRect
+from PySide6.QtGui import QAction, QPainter, QColor, QLinearGradient, QBrush
 from src.models.strip_model import StripType, StripMode
+
+class VUMeterWidget(QWidget):
+    """
+    Vertical bar displaying audio level.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(6)  # Thin bar
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.level = 0.0  # 0.0 to 1.0
+        
+        # Colors
+        self.bg_color = QColor("#222")
+        self.gradient = QLinearGradient(0, 0, 0, 1) # Coordinates will be updated in paintEvent
+        self.gradient.setColorAt(0.0, QColor("#ff3333")) # Red (Top)
+        self.gradient.setColorAt(0.2, QColor("#ffff33")) # Yellow
+        self.gradient.setColorAt(1.0, QColor("#33ff33")) # Green (Bottom)
+
+    def set_level(self, val):
+        self.level = max(0.0, min(1.0, val))
+        self.update() # Trigger repaint
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect()
+        
+        # Draw Background
+        painter.fillRect(rect, self.bg_color)
+        
+        # Calculate filled height based on level
+        fill_height = int(rect.height() * self.level)
+        if fill_height > 0:
+            # Draw form bottom to top
+            fill_rect = QRect(0, rect.height() - fill_height, rect.width(), fill_height)
+            
+            # Update gradient vector to match current widget height
+            self.gradient.setFinalStop(0, rect.height())
+            self.gradient.setStart(0, 0)
+            
+            painter.fillRect(fill_rect, QBrush(self.gradient))
 
 class StripWidget(QFrame):
     """
@@ -18,6 +58,7 @@ class StripWidget(QFrame):
     midi_learn_requested = Signal(str, str) # uid, property ("volume" or "mute")
     device_changed = Signal(str, str)   # uid, device_name (for Output/Input)
     app_selection_requested = Signal(str) # uid, requests app dialog
+    default_changed = Signal(str, bool) # uid, is_default
     
     def __init__(self, strip_model, parent=None):
         super().__init__(parent)
@@ -52,6 +93,8 @@ class StripWidget(QFrame):
                 border-radius: 5px;
             }}
             QLabel {{ color: white; background: transparent; }}
+            QCheckBox {{ color: #ccc; font-size: 9px; spacing: 4px; }}
+            QCheckBox::indicator {{ width: 10px; height: 10px; }}
         """)
 
     def _init_ui(self):
@@ -115,6 +158,13 @@ class StripWidget(QFrame):
             self.device_combo.currentIndexChanged.connect(self._on_device_changed)
             dev_layout.addWidget(self.device_combo)
 
+            # Default Checkbox
+            self.cb_default = QCheckBox("Default Sink")
+            self.cb_default.setToolTip("Set as system default output (catches all unassigned audio)")
+            self.cb_default.setChecked(self.strip.is_default)
+            self.cb_default.toggled.connect(self._on_default_toggled)
+            dev_layout.addWidget(self.cb_default)
+
             # Button for Apps (Only visible if Virtual Mode)
             self.btn_apps = QPushButton("SELECT APPS")
             self.btn_apps.setCursor(Qt.PointingHandCursor)
@@ -124,6 +174,7 @@ class StripWidget(QFrame):
             """)
             self.btn_apps.clicked.connect(lambda: self.app_selection_requested.emit(self.strip.uid))
             dev_layout.addWidget(self.btn_apps)
+            
             self._update_app_btn_visibility()
 
         # --- 3. Routing Area ---
@@ -145,8 +196,15 @@ class StripWidget(QFrame):
             lbl_out.setAlignment(Qt.AlignCenter)
             layout.addWidget(lbl_out)
 
-        # --- 4. Volume Fader ---
-        slider_layout = QHBoxLayout()
+        # --- 4. Volume Fader & VU Meters ---
+        fader_area_layout = QHBoxLayout()
+        fader_area_layout.setSpacing(4) # Space between meter and slider
+        
+        # Left VU Meter
+        self.vu_left = VUMeterWidget()
+        fader_area_layout.addWidget(self.vu_left)
+        
+        # Slider
         self.slider = QSlider(Qt.Vertical)
         self.slider.setRange(0, 100)
         self.slider.setValue(int(self.strip.volume * 100))
@@ -166,11 +224,13 @@ class StripWidget(QFrame):
             QSlider::sub-page:vertical { background: #222; }
         """)
         self.slider.valueChanged.connect(self._on_slider_move)
+        fader_area_layout.addWidget(self.slider)
+
+        # Right VU Meter
+        self.vu_right = VUMeterWidget()
+        fader_area_layout.addWidget(self.vu_right)
         
-        slider_layout.addStretch()
-        slider_layout.addWidget(self.slider)
-        slider_layout.addStretch()
-        layout.addLayout(slider_layout)
+        layout.addLayout(fader_area_layout)
 
         # --- 5. Mute Button ---
         self.btn_mute = QPushButton("MUTE")
@@ -244,11 +304,21 @@ class StripWidget(QFrame):
             self.strip.device_name = device_name
             self._update_app_btn_visibility()
 
+    def _on_default_toggled(self, checked):
+        # Update model immediately
+        self.strip.is_default = checked
+        self._update_app_btn_visibility()
+        self.default_changed.emit(self.strip.uid, checked)
+
     def _update_app_btn_visibility(self):
         if hasattr(self, 'btn_apps'):
             # Show "Select Apps" only if NO physical device is selected (Virtual Mode)
+            # AND if it's NOT the default strip (Default catches everything, so no need to select)
             is_virtual = (self.device_combo.currentData() is None)
-            self.btn_apps.setVisible(is_virtual)
+            is_not_default = not self.strip.is_default
+            
+            should_show = is_virtual and is_not_default
+            self.btn_apps.setVisible(should_show)
 
     # --- Renaming Logic ---
     def eventFilter(self, obj, event):
@@ -343,6 +413,15 @@ class StripWidget(QFrame):
     def _on_slider_move(self, val):
         self.strip.volume = val / 100.0
 
+    def set_default_state(self, is_default: bool):
+        """Allows external setting of default state without triggering signal loops."""
+        if hasattr(self, 'cb_default'):
+            self.cb_default.blockSignals(True)
+            self.cb_default.setChecked(is_default)
+            self.cb_default.blockSignals(False)
+            self.strip.is_default = is_default
+            self._update_app_btn_visibility()
+
     def update_ui_from_model(self):
         self.slider.blockSignals(True)
         self.slider.setValue(int(self.strip.volume * 100))
@@ -351,6 +430,10 @@ class StripWidget(QFrame):
         self.btn_mute.setChecked(self.strip.mute)
         self.btn_mute.blockSignals(False)
         self._update_mute_style()
+        
+        # Sync Default Checkbox
+        if hasattr(self, 'cb_default'):
+            self.set_default_state(self.strip.is_default)
 
     def _check_and_send_volume(self):
         current_vol = round(self.strip.volume, 2)
@@ -373,3 +456,10 @@ class StripWidget(QFrame):
 
     def _on_delete_clicked(self):
         self.delete_requested.emit(self.strip.uid)
+
+    def update_vumeter(self, left, right):
+        """Called by main window to update visual levels."""
+        if hasattr(self, 'vu_left'):
+            self.vu_left.set_level(left)
+        if hasattr(self, 'vu_right'):
+            self.vu_right.set_level(right)

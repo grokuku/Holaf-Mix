@@ -1,107 +1,86 @@
-# Project Context: Holaf-Mix
-
-    ## 1. Project Overview
+## 1. Project Overview
     - **Goal**: Linux audio mixer (Voicemeeter-like) using PipeWire and PySide6.
-    - **Current Phase**: **HARDWARE INTEGRATION & APP ROUTING**.
+    - **Current Phase**: **STABILIZATION & REFINEMENT**.
     - **Status**: 
-        - functional Audio & MIDI Engine.
-        - Physical Input/Output selection working.
-        - App assignment UI implemented (Backend routing currently under debugging).
+        - Functional Audio & MIDI Engine.
+        - Reliable App Routing & Hardware Volume control.
+        - UI Layout fixed & Cleaned (Pollution removed from dropdowns).
+        - **PARTIAL**: VU Meters work for Inputs/Virtual strips, but are unreliable for Physical Outputs.
 
     ## 2. Architecture (Hybrid MVC)
-    - **Model**: `Strip` class. Single source of truth (UID, Label, Volume, Mute, Routes, Device Name, Assigned Apps, MIDI Mappings).
+    - **Model**: `Strip` class. Single source of truth.
     - **View (UI)**: `MainWindow` and `StripWidget`.
     - **Controller (Backend)**: 
-        - `AudioEngine`: Manages PipeWire Graph (Nodes, Links, Volumes).
+        - `AudioEngine`: Manages PipeWire Graph & lazy-loads metering.
         - `MidiEngine`: Handles Hardware MIDI events.
+        - `MeteringEngine`: **NEW (Async)**. Uses `sounddevice` in separate threads with automatic retry logic to avoid blocking the UI.
     - **Data Flow**: 
         - **UI Input**: Slider Move -> Update Model -> Timer (10Hz) -> `AudioEngine` -> PipeWire.
-        - **MIDI Input**: MIDI Msg -> `MidiEngine` -> Signal -> Update Model -> Update UI -> Timer (10Hz) -> `AudioEngine` -> PipeWire.
+        - **Meters**: PipeWire -> `sounddevice` (ALSA/Pulse plugin) -> Threaded Callback -> UI Timer (25FPS).
 
     ## 3. Project File Structure (Map & Responsibilities)
 
     ```text
     Holaf_Mix/
     ├── main.py                     # [ENTRY POINT] Bootstrapper.
-    ├── pipewire_utils.py           # [LOW-LEVEL] Wrapper for `pw-cli`, `pw-dump`, `pactl`.
-    │                               # *UPDATED*: Added `get_sink_inputs`, `move_sink_input`.
-    ├── config.json                 # [PERSISTENCE] Stores Strips state, routing, devices, and app assignments.
+    ├── pipewire_utils.py           # [LOW-LEVEL] Wrapper for `pw-cli`, `pw-dump`, `pactl`. Now supports filtering internal nodes.
+    ├── config.json                 # [PERSISTENCE] Stores Strips state.
     ├── project_context.md          # [MEMORY] Project state and rules.
-    ├── requirements.txt            # [DEPENDENCIES] PySide6, mido, python-rtmidi.
+    ├── requirements.txt            # [DEPENDENCIES] PySide6, mido, python-rtmidi, sounddevice, numpy.
     │
     ├── src/
     │   ├── backend/
-    │   │   ├── audio_engine.py     # [CONTROLLER] 
-    │   │   │                       # - Creates Virtual Nodes (pw-cli preferred).
-    │   │   │                       # - Links Physical Mics to Virtual Strips.
-    │   │   │                       # - Manages Volume via pactl (Hardware compat).
-    │   │   │                       # - Cleans "Zombie" nodes on startup.
-    │   │   └── midi_engine.py      # [CONTROLLER] MIDI Listener thread.
+    │   │   ├── audio_engine.py     # [CONTROLLER] Manages Nodes. Retry logic for meters. Robust linking.
+    │   │   ├── midi_engine.py      # [CONTROLLER] MIDI Listener.
+    │   │   └── metering.py         # [CONTROLLER] Async Sounddevice engine (Threaded).
     │   │
     │   ├── config/
     │   │   └── settings.py         # [IO] JSON Serialization.
     │   │
     │   ├── models/
-    │   │   └── strip_model.py      # [MODEL] Added `device_name` (Hardware) and `assigned_apps` (List[str]).
+    │   │   └── strip_model.py      # [MODEL] Data structure.
     │   │
     │   └── ui/
-    │       ├── main_window.py      # [VIEW] 
-    │       │                       # - Manages `AppSelectionDialog`.
-    │       │                       # - Orchestrates App Routing (move_sink_input).
+    │       ├── main_window.py      # [VIEW] Orchestrates UI updates & filtering.
     │       └── widgets/
-    │           └── strip_widget.py # [VIEW] 
-    │                               # - Added `QComboBox` for Device Selection.
-    │                               # - Added "Select Apps" button (Input/Virtual mode).
-    │                               # - Added Label Renaming (Double-click).
+    │           └── strip_widget.py # [VIEW] Visual VUMeterWidget & Control logic.
     ```
 
     ## 4. Technical Implementation Details (State: Jan 06, 2026)
 
     ### Audio Engine Logic
-    - **Node Creation Strategy**:
-        - **Primary**: `pw-cli create-node adapter ...` used to create Null Sinks. This ensures `node.description` is correctly quoted and visible in OS Mixers.
-        - **Fallback**: `pactl load-module module-null-sink` (used previously, kept as backup).
-    - **Cleanup**: On startup, `_clean_zombie_nodes()` scans for any node named `Holaf_Strip_*` and destroys it to prevent duplicates/ghosts.
-    - **Naming**: Nodes are named `Holaf_Strip_[UID]`. Descriptions are formatted as `Holaf: [UserLabel]`.
-    - **Default Sink**: Logic searches for Strip labeled "Desktop" -> then "Default" -> then First Input to set as System Default.
+    - **Node Creation**: Mixed strategy (`pw-cli` preferred, `pactl` fallback).
+    - **Linking**: Robust "Force Unlink" logic added to fix desynchronization issues (e.g., when toggling routes).
+    - **Zombie Cleanup**: Uses `include_internal=True` to strictly identify and remove old Holaf nodes.
 
-    ### Hardware & Volume Logic
-    - **Volume Control**: moved to `pactl set-sink-volume [name] [N]%`. This ensures that changing volume in Holaf-Mix moves the hardware fader (and OSD) in KDE/Gnome.
-    - **Physical Inputs**: If a Physical Source (Mic) is selected on an Input Strip, the engine creates a `pw-link` from the Mic's ports to the Virtual Strip's inputs.
+    ### Metering Logic (New Stable Arch)
+    - **Library**: `sounddevice` (PortAudio wrapper) targeting the `pulse` ALSA device.
+    - **Targeting**: Uses `os.environ["PULSE_SOURCE"]` to target specific monitors per stream.
+    - **Concurrency**: `start_monitoring` spawns a non-blocking thread. If ALSA timeouts, it fails silently and adds the strip to a `pending_retries` queue.
+    - **Retry**: `AudioEngine` triggers a retry every ~2 seconds for meters that failed to start immediately (Lazy Loading).
 
-    ### App Routing Logic
-    - **Detection**: `pipewire_utils.get_sink_inputs()` scans for running audio streams (Firefox, Spotify).
-    - **Assignment**: `Strip` model holds a list of app names (`assigned_apps`).
-    - **Enforcement**: `MainWindow` attempts to move streams using `pactl move-sink-input` when assignments change or periodically.
+    ### UX / Filtering
+    - `pipewire_utils.get_audio_nodes` supports an `include_internal` flag.
+    - **UI Mode**: Hides `Holaf_Strip_*`, `Monitor of...`, and `(null)` devices to keep dropdowns clean.
+    - **Backend Mode**: Sees everything to manage the graph correctly.
 
     ## 5. Features Status
     - [x] **Core Audio**: Create/Delete Virtual Strips, Detect Physical Devices.
-    - [x] **Renaming**: Double-click on strip label to rename.
-    - [x] **Hardware Routing**: 
-        - Output Strips can map to Physical Speakers.
-        - Input Strips can accept Physical Microphones.
-    - [x] **Persistence**: State (including Device selection & App lists) saved/restored.
-    - [x] **MIDI Control**: Full bidirectional control + Learning.
-    - [x] **UI/UX**: 
-        - Device Selector (Combo Box).
-        - App Selection Dialog (Checkboxes).
-    - [ ] **App Routing**: Logic implemented but currently buggy (Apps do not switch sinks effectively).
+    - [x] **Hardware Routing**: Mics to Inputs, Outputs to Speakers.
+    - [x] **Volume Control**: Syncs UI, Sink, and Hardware Monitor.
+    - [x] **App Routing**: Apps strictly follow their assigned strip.
+    - [x] **Default Sink**: Checkbox to define the system-wide default output.
+    - [x] **UI Layout**: Dynamic resizing, no empty spaces, sorted device lists.
+    - [~] **VU Meters**: 
+        - [x] **Virtual Strips**: Working (Async).
+        - [x] **Physical Inputs**: Working (Mic).
+        - [ ] **Physical Outputs**: **BROKEN**. The application guesses the monitor name (`{sink_name}.monitor`), which often fails for hardware sinks (e.g. `alsa_output...`).
 
-    ## 6. Environment & Dependencies
-    - **Python**: 3.10+
-    - **Libraries**: `PySide6`, `mido`, `python-rtmidi`.
-    - **System Tools**: `pipewire`, `pipewire-pulse`, `pw-cli`, `pactl`, `pw-link`.
+    ## 6. Known Considerations & Issues
+    - **Physical Output Metering**: Requires mapping a Sink ID to its Source ID via `pactl list sources` to get the *exact* monitor name. Simple string concatenation is unreliable.
+    - **ALSA Timeouts**: If the system is under load, opening a stream might take seconds. The current Threaded implementation hides this latency from the user, which is good.
 
-    ## 7. Known Considerations & Issues
-    - **Hot-Plugging**: Adding/Removing a strip triggers a full engine restart.
-    - **Latency**: 100ms UI throttling on volume.
-    - **App Routing Bug**: Selecting an app in the UI does not currently force it to the target strip; it remains on Default.
-
-    ## 8. Roadmap (Next Steps)
-    1.  **Fix App Routing**: Debug `pactl move-sink-input` logic (potential ID mismatch or timing issue).
-    2.  **Default Strip Toggle**: Add a checkbox on Input Strips to explicitly set one as the "System Default".
-        - *Logic*: If checked, disables "Select Apps" for this strip (it catches everything else).
-    3.  **Window Persistence**: Save/Restore Window Size and Position in `config.json`.
-    4.  **Auto-Resize**: 
-        - Automatically adjust Window Width based on the number of active strips.
-        - Disable horizontal manual resizing.
+    ## 7. Roadmap (Next Steps)
+    1.  **Fix Physical Output Metering**: Implement a safe lookup method to find the Monitor Source ID of a hardware Sink without destabilizing the graph or causing regressions.
+    2.  **Visual Polish**: Improve Routing buttons styling.
+    3.  **Refactoring**: Clean up `audio_engine.py` redundancy once stable.
