@@ -33,8 +33,7 @@ def find_monitor_id_by_name(target_name: str):
 def get_audio_nodes(include_internal=False):
     """
     Retrieves list of Audio Nodes.
-    :param include_internal: If True, returns ALL nodes (including Holaf strips and monitors).
-                             If False (default), filters them out for clean UI.
+    Now extracts 'monitor_source_name' for Sinks to allow accurate metering.
     """
     nodes = []
     
@@ -58,13 +57,17 @@ def get_audio_nodes(include_internal=False):
                 pw_id = int(props.get('pipewire.node.id', 0))
                 final_id = pw_id if pw_id > 0 else s.get('index')
                 
+                # EXTRACTION: Get the real monitor name (Crucial for physical hardware metering)
+                monitor_name = s.get('monitor_source_name')
+                
                 nodes.append({
                     'id': final_id, 
                     'name': name,
                     'description': desc,
                     'media_class': 'Audio/Sink',
                     'volume': s.get('volume'),
-                    'mute': s.get('mute')
+                    'mute': s.get('mute'),
+                    'monitor_source_name': monitor_name  # NEW FIELD
                 })
         except json.JSONDecodeError:
             pass

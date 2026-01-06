@@ -15,6 +15,11 @@ class AudioEngine:
         self.node_registry: Dict[str, int] = {}
         # Cache pour stocker les noms des noeuds : ID -> Name
         self.name_cache: Dict[int, str] = {}
+        # Cache pour stocker le vrai nom du moniteur (Source) : ID -> Monitor Name
+        self.monitor_cache: Dict[int, str] = {}
+        # Registre pour savoir si un noeud est une Source (Input Physique) ou un Sink
+        self.is_source_registry: Dict[str, bool] = {} 
+        
         self.link_registry: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.created_nodes: List[int] = []
         
@@ -31,12 +36,19 @@ class AudioEngine:
 
         self.node_registry.clear()
         self.name_cache.clear()
+        self.monitor_cache.clear()
+        self.is_source_registry.clear()
         self.link_registry.clear()
         
         # 1. Create Nodes (Virtual Strips)
         for strip in strips:
             node_id = None
             node_name = None
+            
+            # Identify if this strip behaves as a Source (Physical Input)
+            # Virtual inputs are technically Null-Sinks, so only PHYSICAL INPUTS are Sources.
+            is_source = (strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL)
+            self.is_source_registry[strip.uid] = is_source
 
             if strip.kind == StripType.OUTPUT and strip.mode == StripMode.PHYSICAL:
                 # Direct hardware mapping
@@ -44,10 +56,18 @@ class AudioEngine:
                 if node_id:
                      node_name = self._get_node_name(node_id)
             else:
-                # Virtual Node creation
-                node_id = self._create_virtual_node(strip)
-                if node_id:
-                    node_name = self.name_cache.get(node_id)
+                # Virtual Node creation (or Physical Input placeholder handled later)
+                if is_source:
+                     # Physical Inputs are linked, not created. 
+                     # But we need their ID in the registry for Mute/Volume to work.
+                     if strip.device_name:
+                         node_id = self._find_node_id_by_name(strip.device_name)
+                         if node_id:
+                             self.name_cache[node_id] = strip.device_name
+                else:
+                    node_id = self._create_virtual_node(strip)
+                    if node_id:
+                        node_name = self.name_cache.get(node_id)
             
             if node_id:
                 self.node_registry[strip.uid] = node_id
@@ -55,15 +75,15 @@ class AudioEngine:
                 self.set_mute(strip.uid, strip.mute)
                 
                 # --- METERING SETUP (Non-Blocking via Threaded Metering) ---
-                target_name = self._resolve_metering_target_name(strip, node_name)
+                target_name = self._resolve_metering_target_name(strip, node_id)
                 
                 if target_name:
-                    # This call is now non-blocking (spawns a thread)
                     self.metering.start_monitoring(strip.uid, target_name)
                 else:
                     logger.warning(f"Metering: Could not resolve target Name for {strip.label}")
             else:
-                logger.warning(f"Could not initialize node for strip: {strip.label}")
+                if not is_source: # Only warn if we expected to create/find a sink
+                    logger.warning(f"Could not initialize node for strip: {strip.label}")
 
         # 2. Input Logic: Link Physical Sources -> Input Strips
         input_strips = [s for s in strips if s.kind == StripType.INPUT]
@@ -104,6 +124,8 @@ class AudioEngine:
         self.created_nodes.clear()
         self.node_registry.clear()
         self.name_cache.clear()
+        self.monitor_cache.clear()
+        self.is_source_registry.clear()
 
     # --- Public API ---
     
@@ -121,15 +143,24 @@ class AudioEngine:
         if not node_id: return
 
         node_name = self.name_cache.get(node_id)
-        if node_name:
-            vol_pct = f"{int(volume * 100)}%"
-            # 1. Apply to Sink (Input)
-            subprocess.run(['pactl', 'set-sink-volume', node_name, vol_pct], capture_output=True)
-            # 2. Apply to Monitor (Output) - Fixes hardware volume control
-            monitor_name = f"{node_name}.monitor"
-            subprocess.run(['pactl', 'set-source-volume', monitor_name, vol_pct], capture_output=True)
-        else:
+        if not node_name:
             pipewire_utils.set_node_volume(node_id, volume)
+            return
+
+        vol_pct = f"{int(volume * 100)}%"
+        
+        # Check if it is a Source (Mic) or Sink (Output/Virtual)
+        is_source = self.is_source_registry.get(strip_uid, False)
+        
+        if is_source:
+             subprocess.run(['pactl', 'set-source-volume', node_name, vol_pct], capture_output=True)
+        else:
+            # 1. Apply to Sink
+            subprocess.run(['pactl', 'set-sink-volume', node_name, vol_pct], capture_output=True)
+            # 2. Apply to Monitor (Output) for metering sync
+            monitor_name = self.monitor_cache.get(node_id)
+            if monitor_name:
+                subprocess.run(['pactl', 'set-source-volume', monitor_name, vol_pct], capture_output=True)
 
     def set_mute(self, strip_uid: str, muted: bool):
         node_id = self.node_registry.get(strip_uid)
@@ -138,12 +169,22 @@ class AudioEngine:
         node_name = self.name_cache.get(node_id)
         val = "1" if muted else "0"
 
-        if node_name:
-            subprocess.run(['pactl', 'set-sink-mute', node_name, val], capture_output=True)
-            monitor_name = f"{node_name}.monitor"
-            subprocess.run(['pactl', 'set-source-mute', monitor_name, val], capture_output=True)
-        else:
+        if not node_name:
             pipewire_utils.toggle_node_mute(node_id, muted)
+            return
+
+        is_source = self.is_source_registry.get(strip_uid, False)
+
+        if is_source:
+            # IT'S A MIC: Mute the source directly
+            subprocess.run(['pactl', 'set-source-mute', node_name, val], capture_output=True)
+        else:
+            # IT'S A SINK: Mute the sink AND its monitor
+            subprocess.run(['pactl', 'set-sink-mute', node_name, val], capture_output=True)
+            
+            monitor_name = self.monitor_cache.get(node_id)
+            if monitor_name:
+                subprocess.run(['pactl', 'set-source-mute', monitor_name, val], capture_output=True)
 
     def update_routing(self, source_uid: str, target_uid: str, active: bool):
         if active:
@@ -161,7 +202,7 @@ class AudioEngine:
 
     # --- Internal Logic ---
 
-    def _resolve_metering_target_name(self, strip: Strip, node_name: Optional[str]) -> Optional[str]:
+    def _resolve_metering_target_name(self, strip: Strip, node_id: Optional[int]) -> Optional[str]:
         """
         Returns the PulseAudio SOURCE NAME to record from.
         """
@@ -169,9 +210,10 @@ class AudioEngine:
         if strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL:
             return strip.device_name
             
-        # Case 2: Virtual Strip (Sink) -> We need the .monitor
-        if node_name:
-            return f"{node_name}.monitor"
+        # Case 2: Virtual Strip or Physical Output -> Use the MONITOR (Source)
+        # We now look it up in the cache instead of guessing
+        if node_id and node_id in self.monitor_cache:
+            return self.monitor_cache[node_id]
             
         return None
 
@@ -218,6 +260,8 @@ class AudioEngine:
             if node_id:
                 self.created_nodes.append(node_id)
                 self.name_cache[node_id] = node_name
+                # For Virtual Nodes, the monitor is ALWAYS just + .monitor
+                self.monitor_cache[node_id] = f"{node_name}.monitor"
                 logger.info(f"Created virtual node '{strip.label}' via pw-cli (ID: {node_id})")
                 return node_id
         except subprocess.CalledProcessError as e:
@@ -237,6 +281,7 @@ class AudioEngine:
             if node_id:
                 self.created_nodes.append(node_id)
                 self.name_cache[node_id] = node_name
+                self.monitor_cache[node_id] = f"{node_name}.monitor"
                 logger.info(f"Created virtual node '{strip.label}' via pactl (ID: {node_id})")
                 return node_id
         except (subprocess.CalledProcessError, FileNotFoundError):
@@ -248,16 +293,24 @@ class AudioEngine:
         strip_node_id = self.node_registry.get(strip.uid)
         if not strip_node_id or not strip.device_name: return
 
-        source_id = self._find_node_id_by_name(strip.device_name)
-        if not source_id:
-            logger.warning(f"Could not find physical source: {strip.device_name}")
-            return
-            
-        src_name = self._get_node_name(source_id)
-        dst_name = self._get_node_name(strip_node_id)
+        # For physical inputs, we need to link the DEVICE (Source) to the STRIP (if it was virtual)
+        # BUT wait, current architecture:
+        # If Physical Input, we don't create a Virtual Node usually?
+        # Let's check start_engine logic:
+        # if is_source: we find node_id but do NOT create_virtual_node.
+        # So "strip_node_id" IS the physical source ID.
+        # So what are we linking here?
         
-        if src_name and dst_name:
-             self._auto_link_ports(src_name, dst_name, is_source_input=False)
+        # Ah, looking at architecture:
+        # Physical Input -> (Routing) -> Output Strip.
+        # There is no "Inner Strip Node" for Physical Input unless we created an adapter?
+        # In this code version, Physical Input IS the device directly.
+        
+        # So _link_physical_source_to_strip might be redundant or for a different mode?
+        # Let's keep it safe:
+        
+        # If the strip IS the physical source, there is nothing to link TO itself.
+        pass
 
     def _find_node_id_by_name(self, node_name: str) -> Optional[int]:
         # USE INTERNAL=TRUE to verify creation of our own nodes!
@@ -275,8 +328,17 @@ class AudioEngine:
         if strip.device_name:
             for node in candidates:
                 if node['name'] == strip.device_name:
-                    self.name_cache[node['id']] = node['name']
-                    return node['id']
+                    nid = node['id']
+                    self.name_cache[nid] = node['name']
+                    
+                    # VITAL: Capture the real monitor name from pipewire_utils
+                    if 'monitor_source_name' in node and node['monitor_source_name']:
+                        self.monitor_cache[nid] = node['monitor_source_name']
+                    else:
+                        # Fallback if property missing (rare)
+                        self.monitor_cache[nid] = f"{node['name']}.monitor"
+                        
+                    return nid
         return None
 
     def _destroy_node(self, node_id: int):
@@ -362,9 +424,6 @@ class AudioEngine:
         dst_id = self.node_registry.get(target_uid)
         
         if not src_id or not dst_id: return
-        # Check if already tracked, BUT do not return immediately, 
-        # because maybe the physical link was deleted externally.
-        # We enforce the link.
         
         src_name = self._get_node_name(src_id)
         dst_name = self._get_node_name(dst_id)
@@ -379,7 +438,7 @@ class AudioEngine:
         # 1. Try to get known links
         links = self.link_registry.pop((source_uid, target_uid), [])
         
-        # 2. If registry was empty (Desync bug), Try to resolve ports anyway and Force Unlink
+        # 2. Force Unlink fallback
         if not links:
             src_id = self.node_registry.get(source_uid)
             dst_id = self.node_registry.get(target_uid)
@@ -387,10 +446,8 @@ class AudioEngine:
                 src_name = self._get_node_name(src_id)
                 dst_name = self._get_node_name(dst_id)
                 if src_name and dst_name:
-                    # We recalculate what 'would' be linked
                     src_ports = self._get_ports_by_name(src_name, is_input=False)
                     dst_ports = self._get_ports_by_name(dst_name, is_input=True)
-                    # We brute-force unlink all combinations to be safe
                     for s in src_ports:
                         for d in dst_ports:
                             subprocess.run(['pw-link', '-d', s, d], capture_output=True)

@@ -27,7 +27,7 @@
             "label": "HP",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.5748031496062992,
+            "volume": 0.38,
             "mute": false,
             "routes": [],
             "device_name": "alsa_output.usb-C-Media_Electronics_Inc._Hifi_Audio-00.analog-stereo",
@@ -125,9 +125,14 @@
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
-            "routes": [],
+            "routes": [
+                "4d00edf7-d2d6-428d-b51c-22bc2288db16",
+                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
+            ],
             "device_name": null,
-            "assigned_apps": [],
+            "assigned_apps": [
+                "TeamSpeak"
+            ],
             "is_default": false,
             "midi_volume": {
                 "channel": 0,
@@ -139,6 +144,20 @@
                 "note": 10,
                 "type": "note_on"
             }
+        },
+        {
+            "uid": "1233e975-0c1b-4f32-8b4b-dbb3e77d19fc",
+            "label": "Out1",
+            "kind": "output",
+            "mode": "virtual",
+            "volume": 1.0,
+            "mute": false,
+            "routes": [],
+            "device_name": null,
+            "assigned_apps": [],
+            "is_default": false,
+            "midi_volume": null,
+            "midi_mute": null
         }
     ],
     "window": {
