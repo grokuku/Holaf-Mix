@@ -5,8 +5,9 @@
             "label": "Casque",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.0,
+            "volume": 0.5039370078740157,
             "mute": false,
+            "is_mono": false,
             "routes": [],
             "device_name": "alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40",
             "assigned_apps": [],
@@ -20,15 +21,17 @@
                 "channel": 0,
                 "note": 22,
                 "type": "note_on"
-            }
+            },
+            "midi_mono": null
         },
         {
             "uid": "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
             "label": "HP",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.38,
+            "volume": 0.0,
             "mute": false,
+            "is_mono": false,
             "routes": [],
             "device_name": "alsa_output.usb-C-Media_Electronics_Inc._Hifi_Audio-00.analog-stereo",
             "assigned_apps": [],
@@ -42,7 +45,8 @@
                 "channel": 0,
                 "note": 27,
                 "type": "note_on"
-            }
+            },
+            "midi_mono": null
         },
         {
             "uid": "22eee65f-b74c-4540-a4b4-087a6364b608",
@@ -51,7 +55,10 @@
             "mode": "physical",
             "volume": 1.0,
             "mute": false,
-            "routes": [],
+            "is_mono": true,
+            "routes": [
+                "5f2928d1-499c-41b6-961d-27926b51a70c"
+            ],
             "device_name": "alsa_input.usb-PreSonus_Studio_26c_01424548-00.analog-stereo",
             "assigned_apps": [],
             "is_default": false,
@@ -64,6 +71,11 @@
                 "channel": 0,
                 "note": 1,
                 "type": "note_on"
+            },
+            "midi_mono": {
+                "channel": 0,
+                "note": 3,
+                "type": "note_on"
             }
         },
         {
@@ -73,6 +85,7 @@
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
+            "is_mono": false,
             "routes": [
                 "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
                 "4d00edf7-d2d6-428d-b51c-22bc2288db16"
@@ -89,6 +102,11 @@
                 "channel": 0,
                 "note": 4,
                 "type": "note_on"
+            },
+            "midi_mono": {
+                "channel": 0,
+                "note": 6,
+                "type": "note_on"
             }
         },
         {
@@ -96,8 +114,9 @@
             "label": "Web",
             "kind": "input",
             "mode": "virtual",
-            "volume": 1.0,
+            "volume": 0.4881889763779528,
             "mute": false,
+            "is_mono": false,
             "routes": [
                 "4d00edf7-d2d6-428d-b51c-22bc2288db16",
                 "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
@@ -116,6 +135,11 @@
                 "channel": 0,
                 "note": 7,
                 "type": "note_on"
+            },
+            "midi_mono": {
+                "channel": 0,
+                "note": 9,
+                "type": "note_on"
             }
         },
         {
@@ -125,6 +149,7 @@
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
+            "is_mono": true,
             "routes": [
                 "4d00edf7-d2d6-428d-b51c-22bc2288db16",
                 "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
@@ -143,21 +168,28 @@
                 "channel": 0,
                 "note": 10,
                 "type": "note_on"
+            },
+            "midi_mono": {
+                "channel": 0,
+                "note": 12,
+                "type": "note_on"
             }
         },
         {
-            "uid": "1233e975-0c1b-4f32-8b4b-dbb3e77d19fc",
-            "label": "Out1",
+            "uid": "5f2928d1-499c-41b6-961d-27926b51a70c",
+            "label": "Mix Out",
             "kind": "output",
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
+            "is_mono": false,
             "routes": [],
             "device_name": null,
             "assigned_apps": [],
             "is_default": false,
             "midi_volume": null,
-            "midi_mute": null
+            "midi_mute": null,
+            "midi_mono": null
         }
     ],
     "window": {

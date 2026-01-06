@@ -19,7 +19,9 @@ class AudioEngine:
         self.monitor_cache: Dict[int, str] = {}
         # Registre pour savoir si un noeud est une Source (Input Physique) ou un Sink
         self.is_source_registry: Dict[str, bool] = {} 
-        
+        # Registre pour stocker l'état Mono des strips
+        self.mono_registry: Dict[str, bool] = {}
+
         self.link_registry: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.created_nodes: List[int] = []
         
@@ -38,6 +40,7 @@ class AudioEngine:
         self.name_cache.clear()
         self.monitor_cache.clear()
         self.is_source_registry.clear()
+        self.mono_registry.clear()
         self.link_registry.clear()
         
         # 1. Create Nodes (Virtual Strips)
@@ -49,6 +52,7 @@ class AudioEngine:
             # Virtual inputs are technically Null-Sinks, so only PHYSICAL INPUTS are Sources.
             is_source = (strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL)
             self.is_source_registry[strip.uid] = is_source
+            self.mono_registry[strip.uid] = strip.is_mono
 
             if strip.kind == StripType.OUTPUT and strip.mode == StripMode.PHYSICAL:
                 # Direct hardware mapping
@@ -126,6 +130,7 @@ class AudioEngine:
         self.name_cache.clear()
         self.monitor_cache.clear()
         self.is_source_registry.clear()
+        self.mono_registry.clear()
 
     # --- Public API ---
     
@@ -186,6 +191,29 @@ class AudioEngine:
             if monitor_name:
                 subprocess.run(['pactl', 'set-source-mute', monitor_name, val], capture_output=True)
 
+    def set_mono(self, strip_uid: str, enabled: bool):
+        """
+        Updates the mono state and refreshes routing links if needed.
+        """
+        if self.mono_registry.get(strip_uid) == enabled:
+            return # No change
+        
+        self.mono_registry[strip_uid] = enabled
+        logger.info(f"Setting Mono for {strip_uid}: {enabled}")
+        
+        # We need to refresh all OUTPUT links originating from this strip.
+        # Find all targets linked to this source
+        targets_to_refresh = []
+        for (src, dst) in self.link_registry.keys():
+            if src == strip_uid:
+                targets_to_refresh.append(dst)
+        
+        # Re-apply routing for each target
+        for dst_uid in targets_to_refresh:
+            self._destroy_link(strip_uid, dst_uid)
+            self._create_link(strip_uid, dst_uid)
+
+
     def update_routing(self, source_uid: str, target_uid: str, active: bool):
         if active:
             self._create_link(source_uid, target_uid)
@@ -239,77 +267,60 @@ class AudioEngine:
 
     def _create_virtual_node(self, strip: Strip) -> Optional[int]:
         node_name = f"Holaf_Strip_{strip.uid}"
-        description = f"Holaf: {strip.label}"
+        # SINK Description (what you see in Output list)
+        sink_desc = f"Holaf Mix: {strip.label}"
         
-        # Strategy A: pw-cli (Preferred)
-        props = (
-            f"{{ factory.name=support.null-audio-sink, "
-            f"node.name=\"{node_name}\", "
-            f"node.description=\"{description}\", "
-            f"media.class=Audio/Sink, "
-            f"object.linger=true, "
-            f"audio.position=[FL,FR] }}"
-        )
-        cmd_pw = ['pw-cli', 'create-node', 'adapter', props]
+        # Strategy: pactl (Primary for compatibility)
+        # This registers the device correctly in the PulseAudio DB used by Discord/Teamspeak.
+        # Note: The monitor will be auto-named "Monitor of Holaf Mix: ..." by Pulse.
+        cmd_pactl = [
+            'pactl', 'load-module', 'module-null-sink',
+            f'sink_name={node_name}',
+            f'sink_properties=device.description="{sink_desc}"'
+        ]
         
         try:
-            subprocess.run(cmd_pw, check=True, capture_output=True)
-            time.sleep(0.2)
+            # We don't use check=True immediately to handle errors gracefully
+            proc = subprocess.run(cmd_pactl, capture_output=True, text=True)
+            if proc.returncode != 0:
+                logger.warning(f"pactl failed: {proc.stderr}")
+                # Retry logic or fallback could go here, but pactl is usually robust.
+            else:
+                logger.info(f"Created virtual sink via pactl: {node_name}")
+            
+            time.sleep(0.3) # Give PipeWire slightly more time to register
             
             node_id = self._find_node_id_by_name(node_name)
             if node_id:
                 self.created_nodes.append(node_id)
                 self.name_cache[node_id] = node_name
-                # For Virtual Nodes, the monitor is ALWAYS just + .monitor
-                self.monitor_cache[node_id] = f"{node_name}.monitor"
-                logger.info(f"Created virtual node '{strip.label}' via pw-cli (ID: {node_id})")
-                return node_id
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"pw-cli failed ({e}), trying pactl fallback...")
+                
+                # Retrieve the AUTO-GENERATED monitor name
+                # pactl creates it, PipeWire maps it.
+                # It is usually just node_name + .monitor, BUT let's fetch it safely if possible
+                # or fallback to standard convention.
+                
+                # Try to get the real monitor name from the node properties if available
+                node_info = pipewire_utils.get_node_info(node_id)
+                monitor_prop = None
+                if node_info and 'info' in node_info:
+                    monitor_prop = node_info.get('monitor_source_name') 
+                
+                if monitor_prop:
+                    self.monitor_cache[node_id] = monitor_prop
+                else:
+                    self.monitor_cache[node_id] = f"{node_name}.monitor"
 
-        # Strategy B: pactl (Fallback)
-        cmd_pactl = [
-            'pactl', 'load-module', 'module-null-sink',
-            f'sink_name={node_name}',
-            f'sink_properties=device.description="{description}"' 
-        ]
-        
-        try:
-            subprocess.run(cmd_pactl, check=True, capture_output=True)
-            time.sleep(0.2)
-            node_id = self._find_node_id_by_name(node_name)
-            if node_id:
-                self.created_nodes.append(node_id)
-                self.name_cache[node_id] = node_name
-                self.monitor_cache[node_id] = f"{node_name}.monitor"
-                logger.info(f"Created virtual node '{strip.label}' via pactl (ID: {node_id})")
                 return node_id
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            logger.error("Both pw-cli and pactl strategies failed.")
+                
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.error(f"Failed to create node via pactl: {e}")
         
         return None
 
     def _link_physical_source_to_strip(self, strip: Strip):
         strip_node_id = self.node_registry.get(strip.uid)
         if not strip_node_id or not strip.device_name: return
-
-        # For physical inputs, we need to link the DEVICE (Source) to the STRIP (if it was virtual)
-        # BUT wait, current architecture:
-        # If Physical Input, we don't create a Virtual Node usually?
-        # Let's check start_engine logic:
-        # if is_source: we find node_id but do NOT create_virtual_node.
-        # So "strip_node_id" IS the physical source ID.
-        # So what are we linking here?
-        
-        # Ah, looking at architecture:
-        # Physical Input -> (Routing) -> Output Strip.
-        # There is no "Inner Strip Node" for Physical Input unless we created an adapter?
-        # In this code version, Physical Input IS the device directly.
-        
-        # So _link_physical_source_to_strip might be redundant or for a different mode?
-        # Let's keep it safe:
-        
-        # If the strip IS the physical source, there is nothing to link TO itself.
         pass
 
     def _find_node_id_by_name(self, node_name: str) -> Optional[int]:
@@ -342,6 +353,10 @@ class AudioEngine:
         return None
 
     def _destroy_node(self, node_id: int):
+        # If created by pactl load-module, we should strictly use 'pactl unload-module'
+        # BUT pipewire handles 'pw-cli destroy' on the node ID gracefully too.
+        # To be safe, let's try to find if it has a module ID?
+        # For simplicity in this hybrid env, pw-cli destroy works 99% of time.
         subprocess.run(['pw-cli', 'destroy', str(node_id)], capture_output=True)
 
     def _get_node_name(self, node_id: int) -> Optional[str]:
@@ -390,9 +405,10 @@ class AudioEngine:
         except Exception:
             return False
 
-    def _auto_link_ports(self, src_name: str, dst_name: str, is_source_input: bool = False) -> List[Tuple[str, str]]:
+    def _auto_link_ports(self, src_name: str, dst_name: str, force_mono: bool = False) -> List[Tuple[str, str]]:
         """
         Helper to find compatible ports and link them. Returns list of linked ports.
+        Supports downmixing to Mono if force_mono is True.
         """
         src_ports = self._get_ports_by_name(src_name, is_input=False)
         dst_ports = self._get_ports_by_name(dst_name, is_input=True)
@@ -403,11 +419,22 @@ class AudioEngine:
         dst_l = next((p for p in dst_ports if 'FL' in p or 'left' in p.lower()), None)
         dst_r = next((p for p in dst_ports if 'FR' in p or 'right' in p.lower()), None)
 
-        if src_l and dst_l: links_to_make.append((src_l, dst_l))
-        if src_r and dst_r: links_to_make.append((src_r, dst_r))
+        if force_mono:
+            # Mix BOTH source channels to BOTH dest channels
+            # L->L, L->R, R->L, R->R
+            if src_l:
+                if dst_l: links_to_make.append((src_l, dst_l))
+                if dst_r: links_to_make.append((src_l, dst_r))
+            if src_r:
+                if dst_l: links_to_make.append((src_r, dst_l))
+                if dst_r: links_to_make.append((src_r, dst_r))
+        else:
+            # Standard Stereo
+            if src_l and dst_l: links_to_make.append((src_l, dst_l))
+            if src_r and dst_r: links_to_make.append((src_r, dst_r))
         
-        # Mono handling
-        if len(src_ports) == 1 and len(dst_ports) >= 2:
+        # Fallback / Special Mono Handling for devices that only have 1 port
+        if len(src_ports) == 1 and len(dst_ports) >= 2 and not force_mono:
              if src_ports:
                 links_to_make.append((src_ports[0], dst_ports[0]))
                 links_to_make.append((src_ports[0], dst_ports[1]))
@@ -430,7 +457,9 @@ class AudioEngine:
         
         if not src_name or not dst_name: return
 
-        created_links = self._auto_link_ports(src_name, dst_name)
+        is_mono = self.mono_registry.get(source_uid, False)
+        created_links = self._auto_link_ports(src_name, dst_name, force_mono=is_mono)
+        
         if created_links:
             self.link_registry[(source_uid, target_uid)] = created_links
 

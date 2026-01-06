@@ -27,18 +27,16 @@ class Strip:
         # Audio State
         self.volume = 1.0       # 0.0 to 1.0 (can go higher)
         self.mute = False       # True = Muted
+        self.is_mono = False    # True = Downmix Stereo to Mono
         
         # Routing Matrix (Only relevant for Input strips)
         # List of Output UIDs this strip sends audio to.
         self.routes = [] 
         
         # Hardware/PipeWire connection details
-        # If kind=OUTPUT & mode=PHYSICAL: The name of the sink (Speakers)
-        # If kind=INPUT & mode=PHYSICAL: The name of the source (Mic) to link FROM
         self.device_name = None 
 
         # Software Assignment (For Inputs)
-        # List of application names (strings) assigned to this strip (e.g. ["Firefox", "Spotify"])
         self.assigned_apps = []
 
         # System Default Sink Flag
@@ -47,6 +45,7 @@ class Strip:
         # MIDI Mapping configuration
         self.midi_volume = None 
         self.midi_mute = None
+        self.midi_mono = None
 
     def to_dict(self):
         """Serialize the object to a dictionary for JSON saving."""
@@ -57,12 +56,14 @@ class Strip:
             'mode': self.mode,
             'volume': self.volume,
             'mute': self.mute,
+            'is_mono': self.is_mono,
             'routes': self.routes,
             'device_name': self.device_name,
             'assigned_apps': self.assigned_apps,
             'is_default': self.is_default,
             'midi_volume': self.midi_volume,
-            'midi_mute': self.midi_mute
+            'midi_mute': self.midi_mute,
+            'midi_mono': self.midi_mono
         }
 
     @classmethod
@@ -76,14 +77,16 @@ class Strip:
         )
         strip.volume = data.get('volume', 1.0)
         strip.mute = data.get('mute', False)
+        strip.is_mono = data.get('is_mono', False)
         strip.routes = data.get('routes', [])
         strip.device_name = data.get('device_name')
         strip.assigned_apps = data.get('assigned_apps', [])
         strip.is_default = data.get('is_default', False)
         strip.midi_volume = data.get('midi_volume')
         strip.midi_mute = data.get('midi_mute')
+        strip.midi_mono = data.get('midi_mono')
         
         return strip
 
     def __repr__(self):
-        return f"<Strip '{self.label}' ({self.kind}) Vol:{self.volume}>"
+        return f"<Strip '{self.label}' ({self.kind}) Vol:{self.volume} Mono:{self.is_mono}>"

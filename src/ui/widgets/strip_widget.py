@@ -52,10 +52,11 @@ class StripWidget(QFrame):
     # Signals to notify the main window
     volume_changed = Signal(str, float) # uid, new_volume
     mute_changed = Signal(str, bool)    # uid, new_mute_state
+    mono_changed = Signal(str, bool)    # uid, new_mono_state
     label_changed = Signal(str, str)    # uid, new_label
     delete_requested = Signal(str)      # uid
     route_changed = Signal(str, str, bool) # source_uid, target_uid, is_active
-    midi_learn_requested = Signal(str, str) # uid, property ("volume" or "mute")
+    midi_learn_requested = Signal(str, str) # uid, property ("volume", "mute", "mono")
     device_changed = Signal(str, str)   # uid, device_name (for Output/Input)
     app_selection_requested = Signal(str) # uid, requests app dialog
     default_changed = Signal(str, bool) # uid, is_default
@@ -82,9 +83,14 @@ class StripWidget(QFrame):
         if self._is_learning:
             bg_color = "#f39c12" # Orange
         elif self.strip.kind == StripType.INPUT:
-            bg_color = "#3daee9" 
-        else:
-            bg_color = "#e93d3d" 
+            bg_color = "#3daee9" # Blue
+        elif self.strip.kind == StripType.OUTPUT:
+            if self.strip.device_name is None:
+                # VIRTUAL OUTPUT (BUS) -> Purple
+                bg_color = "#9b59b6" 
+            else:
+                # PHYSICAL OUTPUT -> Red
+                bg_color = "#e93d3d" 
             
         self.setStyleSheet(f"""
             StripWidget {{
@@ -137,10 +143,11 @@ class StripWidget(QFrame):
         layout.addWidget(self.device_container)
 
         if self.strip.kind == StripType.OUTPUT:
-            lbl_dev = QLabel("DEVICE OUT")
-            lbl_dev.setStyleSheet("font-size: 8px; color: #aaa; margin-top: 5px;")
-            lbl_dev.setAlignment(Qt.AlignCenter)
-            dev_layout.addWidget(lbl_dev)
+            # For outputs, we store this label to update it (DEVICE OUT vs VIRTUAL BUS)
+            self.lbl_dev_type = QLabel("DEVICE OUT")
+            self.lbl_dev_type.setStyleSheet("font-size: 8px; color: #aaa; margin-top: 5px;")
+            self.lbl_dev_type.setAlignment(Qt.AlignCenter)
+            dev_layout.addWidget(self.lbl_dev_type)
 
             self.device_combo = QComboBox()
             self._style_combo(self.device_combo)
@@ -232,13 +239,28 @@ class StripWidget(QFrame):
         
         layout.addLayout(fader_area_layout)
 
-        # --- 5. Mute Button ---
+        # --- 5. Controls (Mute & Mono) ---
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(2)
+        
+        # MONO Button
+        self.btn_mono = QPushButton("MONO")
+        self.btn_mono.setCheckable(True)
+        self.btn_mono.setFixedWidth(45)
+        self.btn_mono.setChecked(self.strip.is_mono)
+        self.btn_mono.toggled.connect(self._on_mono_toggle)
+        self._update_mono_style()
+        controls_layout.addWidget(self.btn_mono)
+
+        # MUTE Button
         self.btn_mute = QPushButton("MUTE")
         self.btn_mute.setCheckable(True)
         self.btn_mute.setChecked(self.strip.mute)
         self.btn_mute.toggled.connect(self._on_mute_toggle)
         self._update_mute_style()
-        layout.addWidget(self.btn_mute)
+        controls_layout.addWidget(self.btn_mute)
+        
+        layout.addLayout(controls_layout)
 
         # --- 6. MIDI Config ---
         self.btn_midi = QPushButton("MIDI")
@@ -250,6 +272,9 @@ class StripWidget(QFrame):
         """)
         self.btn_midi.clicked.connect(self._show_midi_menu)
         layout.addWidget(self.btn_midi)
+        
+        # Post-Init Update (to set correct labels/colors)
+        self._refresh_device_ui_state()
 
     def _style_combo(self, combo):
         combo.setStyleSheet("""
@@ -265,22 +290,25 @@ class StripWidget(QFrame):
 
     def set_device_list(self, devices):
         """
-        Populates the combo box.
-        For Output: 'devices' are Sinks.
-        For Input: 'devices' are Sources.
+        Populates the combo box robustly.
+        If the current strip device is not in the list, it is ADDED as a placeholder
+        instead of defaulting to index 0 (Virtual).
         """
         if not hasattr(self, 'device_combo'): return
         
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
         
-        # Default Item
+        # 1. Default Item (Virtual)
         if self.strip.kind == StripType.INPUT:
             self.device_combo.addItem("Apps / Virtual", None)
         else:
-            self.device_combo.addItem("Virtual Sink", None)
+            self.device_combo.addItem("Virtual Sink (Bus)", None)
         
         selected_index = 0
+        found_current = False
+        
+        # 2. Add available devices
         for i, dev in enumerate(devices):
             name = dev.get('name')
             desc = dev.get('description', name)
@@ -289,20 +317,57 @@ class StripWidget(QFrame):
             self.device_combo.addItem(desc, name)
             
             if self.strip.device_name == name:
-                selected_index = i + 1 
+                selected_index = i + 1  # +1 because of the virtual item at 0
+                found_current = True
+        
+        # 3. Handle missing device (Persistence)
+        # If we have a device set in the model, but it wasn't found in the list,
+        # we ADD it to the combo box so the user sees it's missing but configuration is kept.
+        if self.strip.device_name and not found_current:
+            missing_label = f"{self.strip.device_name} (Not Found)"
+            if len(missing_label) > 15: missing_label = missing_label[:15] + "..."
+            self.device_combo.addItem(missing_label, self.strip.device_name)
+            selected_index = self.device_combo.count() - 1
         
         self.device_combo.setCurrentIndex(selected_index)
         self.device_combo.blockSignals(False)
+        
+        # Update visuals without overwriting model
+        self._refresh_device_ui_state()
+
+    def _refresh_device_ui_state(self):
+        """
+        Updates labels and colors based on the MODEL state.
+        CRITICAL: This method MUST NOT modify self.strip.device_name.
+        It should only reflect the state of self.strip.
+        """
+        # Update Visibility
         self._update_app_btn_visibility()
+        
+        # Update Visuals (Color & Text)
+        self._update_base_style()
+        
+        if self.strip.kind == StripType.OUTPUT and hasattr(self, 'lbl_dev_type'):
+            if self.strip.device_name is None:
+                self.lbl_dev_type.setText("VIRTUAL BUS")
+                self.lbl_dev_type.setStyleSheet("font-size: 8px; color: #dcd0ff; margin-top: 5px; font-weight: bold;")
+            else:
+                self.lbl_dev_type.setText("DEVICE OUT")
+                self.lbl_dev_type.setStyleSheet("font-size: 8px; color: #aaa; margin-top: 5px;")
 
     def _on_device_changed(self, index):
+        """
+        Triggered ONLY by User Interaction.
+        This is the ONLY place allowed to change the Model's device_name.
+        """
         device_name = self.device_combo.itemData(index)
+        self.strip.device_name = device_name
+        
+        # Update visuals immediately
+        self._refresh_device_ui_state()
+        
+        # Notify Controller
         self.device_changed.emit(self.strip.uid, device_name)
-        # Update visibility immediately (though main window might restart engine)
-        if self.strip.kind == StripType.INPUT:
-            # Temporary local update to reflect UI state
-            self.strip.device_name = device_name
-            self._update_app_btn_visibility()
 
     def _on_default_toggled(self, checked):
         # Update model immediately
@@ -314,7 +379,7 @@ class StripWidget(QFrame):
         if hasattr(self, 'btn_apps'):
             # Show "Select Apps" only if NO physical device is selected (Virtual Mode)
             # AND if it's NOT the default strip (Default catches everything, so no need to select)
-            is_virtual = (self.device_combo.currentData() is None)
+            is_virtual = (self.strip.device_name is None)
             is_not_default = not self.strip.is_default
             
             should_show = is_virtual and is_not_default
@@ -359,6 +424,7 @@ class StripWidget(QFrame):
             return
 
         for out_strip in output_strips:
+            # For routing buttons, use the label. If it's a Bus, it will be the Bus Name.
             btn = QPushButton(out_strip.label[:4].upper())
             btn.setCheckable(True)
             btn.setToolTip(f"Send to {out_strip.label}")
@@ -387,10 +453,15 @@ class StripWidget(QFrame):
         act_vol.triggered.connect(lambda: self.midi_learn_requested.emit(self.strip.uid, "volume"))
         act_mute = QAction("Learn Mute", self)
         act_mute.triggered.connect(lambda: self.midi_learn_requested.emit(self.strip.uid, "mute"))
+        act_mono = QAction("Learn Mono", self)
+        act_mono.triggered.connect(lambda: self.midi_learn_requested.emit(self.strip.uid, "mono"))
+        
         act_clear = QAction("Clear Mappings", self)
         act_clear.triggered.connect(self._clear_midi)
+        
         menu.addAction(act_vol)
         menu.addAction(act_mute)
+        menu.addAction(act_mono)
         menu.addSeparator()
         menu.addAction(act_clear)
         menu.exec(self.btn_midi.mapToGlobal(self.btn_midi.rect().bottomLeft()))
@@ -408,6 +479,7 @@ class StripWidget(QFrame):
     def _clear_midi(self):
         self.strip.midi_volume = None
         self.strip.midi_mute = None
+        self.strip.midi_mono = None
         self.mute_changed.emit(self.strip.uid, self.strip.mute)
 
     def _on_slider_move(self, val):
@@ -426,10 +498,16 @@ class StripWidget(QFrame):
         self.slider.blockSignals(True)
         self.slider.setValue(int(self.strip.volume * 100))
         self.slider.blockSignals(False)
+        
         self.btn_mute.blockSignals(True)
         self.btn_mute.setChecked(self.strip.mute)
         self.btn_mute.blockSignals(False)
         self._update_mute_style()
+        
+        self.btn_mono.blockSignals(True)
+        self.btn_mono.setChecked(self.strip.is_mono)
+        self.btn_mono.blockSignals(False)
+        self._update_mono_style()
         
         # Sync Default Checkbox
         if hasattr(self, 'cb_default'):
@@ -446,13 +524,24 @@ class StripWidget(QFrame):
         self._update_mute_style()
         self.mute_changed.emit(self.strip.uid, checked)
 
+    def _on_mono_toggle(self, checked):
+        self.strip.is_mono = checked
+        self._update_mono_style()
+        self.mono_changed.emit(self.strip.uid, checked)
+
     def _update_mute_style(self):
         if self.btn_mute.isChecked():
-            self.btn_mute.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold; border: none; padding: 5px;")
+            self.btn_mute.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold; border: none; border-radius: 3px; font-size: 9px;")
             self.btn_mute.setText("MUTED")
         else:
-            self.btn_mute.setStyleSheet("background-color: #444; color: white; border: none; padding: 5px;")
+            self.btn_mute.setStyleSheet("background-color: #444; color: white; border: none; border-radius: 3px; font-size: 9px;")
             self.btn_mute.setText("MUTE")
+
+    def _update_mono_style(self):
+        if self.btn_mono.isChecked():
+            self.btn_mono.setStyleSheet("background-color: #3daee9; color: white; font-weight: bold; border: none; border-radius: 3px; font-size: 9px;")
+        else:
+            self.btn_mono.setStyleSheet("background-color: #444; color: #888; border: none; border-radius: 3px; font-size: 9px;")
 
     def _on_delete_clicked(self):
         self.delete_requested.emit(self.strip.uid)

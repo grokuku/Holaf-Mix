@@ -120,28 +120,49 @@ class MainWindow(QMainWindow):
     def _rebuild_midi_lookup(self):
         self.midi_lookup.clear()
         for strip in self.strips:
+            # Volume
             if strip.midi_volume:
                 m = strip.midi_volume
                 key = (m['type'], m['channel'], m.get('control') or m.get('note'))
                 self.midi_lookup[key] = (strip.uid, "volume")
+            # Mute
             if strip.midi_mute:
                 m = strip.midi_mute
                 key = (m['type'], m['channel'], m.get('control') or m.get('note'))
                 self.midi_lookup[key] = (strip.uid, "mute")
+            # Mono
+            if strip.midi_mono:
+                m = strip.midi_mono
+                key = (m['type'], m['channel'], m.get('control') or m.get('note'))
+                self.midi_lookup[key] = (strip.uid, "mono")
 
     def on_midi_message_received(self, msg):
         identifier = getattr(msg, 'control', None) if msg.type == 'control_change' else getattr(msg, 'note', None)
         if identifier is None: return
+        
         key = (msg.type, msg.channel, identifier)
         if key in self.midi_lookup:
             uid, prop = self.midi_lookup[key]
             strip = next((s for s in self.strips if s.uid == uid), None)
             if not strip: return
+            
+            # --- ACTION LOGIC ---
             if prop == "volume":
                 strip.volume = msg.value / 127.0
+            
             elif prop == "mute":
                 val = getattr(msg, 'velocity', 127) if hasattr(msg, 'velocity') else msg.value
-                if val > 0: strip.mute = not strip.mute
+                # Toggle only on button press (value > 0), ignore release (value 0)
+                if val > 0: 
+                    strip.mute = not strip.mute
+
+            elif prop == "mono":
+                val = getattr(msg, 'velocity', 127) if hasattr(msg, 'velocity') else msg.value
+                # Toggle only on button press
+                if val > 0:
+                    strip.is_mono = not strip.is_mono
+
+            # Refresh UI
             widget = self.widgets.get(uid)
             if widget:
                 QTimer.singleShot(0, widget.update_ui_from_model)
@@ -149,9 +170,15 @@ class MainWindow(QMainWindow):
     def on_midi_mapping_detected(self, uid, prop, mapping):
         strip = next((s for s in self.strips if s.uid == uid), None)
         if strip:
-            if prop == "volume": strip.midi_volume = mapping
-            else: strip.midi_mute = mapping
+            if prop == "volume": 
+                strip.midi_volume = mapping
+            elif prop == "mute": 
+                strip.midi_mute = mapping
+            elif prop == "mono": 
+                strip.midi_mono = mapping
+                
             settings.save_config(self.strips)
+        
         widget = self.widgets.get(uid)
         if widget: widget.set_learning(False)
         self._rebuild_midi_lookup()
@@ -220,8 +247,10 @@ class MainWindow(QMainWindow):
             widget = StripWidget(strip)
             self.widgets[strip.uid] = widget
             
+            # --- SIGNAL CONNECTIONS ---
             widget.volume_changed.connect(self.on_strip_volume_changed)
             widget.mute_changed.connect(self.on_strip_mute_changed)
+            widget.mono_changed.connect(self.on_strip_mono_changed) # NEW: Fixed Connection
             widget.label_changed.connect(self.on_strip_label_changed)
             widget.delete_requested.connect(self.on_strip_delete_requested)
             widget.route_changed.connect(self.on_strip_route_changed)
@@ -369,6 +398,10 @@ class MainWindow(QMainWindow):
 
     def on_strip_mute_changed(self, uid, is_muted):
         self._run_in_background(self.audio_engine.set_mute, uid, is_muted)
+        settings.save_config(self.strips)
+
+    def on_strip_mono_changed(self, uid, is_mono):
+        self._run_in_background(self.audio_engine.set_mono, uid, is_mono)
         settings.save_config(self.strips)
     
     def on_strip_label_changed(self, uid, new_label):
