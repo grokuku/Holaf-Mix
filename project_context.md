@@ -2,83 +2,106 @@
 
     ## 1. Project Overview
     - **Goal**: Linux audio mixer (Voicemeeter-like) using PipeWire and PySide6.
-    - **Current Phase**: **MIDI INTEGRATION & OPTIMIZATION**.
-    - **Status**: Functional Audio & MIDI Engine. Stable release candidate for core features (Mixing, Routing, MIDI Control).
+    - **Current Phase**: **HARDWARE INTEGRATION & APP ROUTING**.
+    - **Status**: 
+        - functional Audio & MIDI Engine.
+        - Physical Input/Output selection working.
+        - App assignment UI implemented (Backend routing currently under debugging).
 
     ## 2. Architecture (Hybrid MVC)
-    - **Model**: `Strip` class. It is the single source of truth for the state (volume, mute, name).
-    - **View (UI)**: `MainWindow` and `StripWidget`. They reflect the Model state.
+    - **Model**: `Strip` class. Single source of truth (UID, Label, Volume, Mute, Routes, Device Name, Assigned Apps, MIDI Mappings).
+    - **View (UI)**: `MainWindow` and `StripWidget`.
     - **Controller (Backend)**: 
-        - `AudioEngine`: Translates Model state changes into PipeWire commands.
-        - `MidiEngine`: Translates Hardware events into Model state changes.
-    - **Data Flow (Crucial)**: 
+        - `AudioEngine`: Manages PipeWire Graph (Nodes, Links, Volumes).
+        - `MidiEngine`: Handles Hardware MIDI events.
+    - **Data Flow**: 
         - **UI Input**: Slider Move -> Update Model -> Timer (10Hz) -> `AudioEngine` -> PipeWire.
         - **MIDI Input**: MIDI Msg -> `MidiEngine` -> Signal -> Update Model -> Update UI -> Timer (10Hz) -> `AudioEngine` -> PipeWire.
-        - *Note*: MIDI never calls `AudioEngine` directly to prevent lag.
 
     ## 3. Project File Structure (Map & Responsibilities)
 
     ```text
     Holaf_Mix/
-    ├── main.py                     # [ENTRY POINT] Bootstrapper. Initializes Audio/Midi engines, UI, and connects Shutdown signals.
-    ├── pipewire_utils.py           # [LOW-LEVEL] Wrapper for subprocess calls to `pw-cli`, `pw-dump`, `pw-link`. No logic, just execution.
-    ├── config.json                 # [PERSISTENCE] Stores the list of Strips, their volume/mute state, routing, and MIDI mappings.
-    ├── project_context.md          # [MEMORY] This file. The absolute reference for project state and rules.
+    ├── main.py                     # [ENTRY POINT] Bootstrapper.
+    ├── pipewire_utils.py           # [LOW-LEVEL] Wrapper for `pw-cli`, `pw-dump`, `pactl`.
+    │                               # *UPDATED*: Added `get_sink_inputs`, `move_sink_input`.
+    ├── config.json                 # [PERSISTENCE] Stores Strips state, routing, devices, and app assignments.
+    ├── project_context.md          # [MEMORY] Project state and rules.
     ├── requirements.txt            # [DEPENDENCIES] PySide6, mido, python-rtmidi.
     │
     ├── src/
     │   ├── backend/
-    │   │   ├── audio_engine.py     # [CONTROLLER] High-level logic. Manages Nodes creation/destruction, Linking, Volume/Mute logic.
-    │   │   └── midi_engine.py      # [CONTROLLER] Runs a daemon thread listening to MIDI ports. Emits signals on valid messages.
+    │   │   ├── audio_engine.py     # [CONTROLLER] 
+    │   │   │                       # - Creates Virtual Nodes (pw-cli preferred).
+    │   │   │                       # - Links Physical Mics to Virtual Strips.
+    │   │   │                       # - Manages Volume via pactl (Hardware compat).
+    │   │   │                       # - Cleans "Zombie" nodes on startup.
+    │   │   └── midi_engine.py      # [CONTROLLER] MIDI Listener thread.
     │   │
     │   ├── config/
-    │   │   └── settings.py         # [IO] Handles loading/saving `config.json` and deserializing into `Strip` objects.
+    │   │   └── settings.py         # [IO] JSON Serialization.
     │   │
     │   ├── models/
-    │   │   └── strip_model.py      # [MODEL] Data class defining a Strip (UID, Label, Volume, Mute, Routes, MIDI Mappings).
+    │   │   └── strip_model.py      # [MODEL] Added `device_name` (Hardware) and `assigned_apps` (List[str]).
     │   │
     │   └── ui/
-    │       ├── main_window.py      # [VIEW] Main container. Manages the global layout (Inputs/Outputs columns) and MIDI signal dispatching.
+    │       ├── main_window.py      # [VIEW] 
+    │       │                       # - Manages `AppSelectionDialog`.
+    │       │                       # - Orchestrates App Routing (move_sink_input).
     │       └── widgets/
-    │           └── strip_widget.py # [VIEW] The channel strip UI. Contains the Volume Slider, Mute Btn, Routing Btns.
-    │                               # *CRITICAL*: Contains the `QTimer` logic for throttling backend calls (10Hz).
+    │           └── strip_widget.py # [VIEW] 
+    │                               # - Added `QComboBox` for Device Selection.
+    │                               # - Added "Select Apps" button (Input/Virtual mode).
+    │                               # - Added Label Renaming (Double-click).
     ```
 
     ## 4. Technical Implementation Details (State: Jan 06, 2026)
 
     ### Audio Engine Logic
-    - **Virtual Nodes**: Created using `pactl load-module module-null-sink` to ensure they appear correctly in system mixers (KDE/Gnome) with "Post-Fader" behavior (Monitor output reflects sink volume).
-    - **Naming**: Nodes are named `Holaf_Strip_[UID]`. Descriptions are quoted (`"{description}"`) to handle spaces correctly.
-    - **Mute Handling**: 
-        - Uses `pactl set-sink-mute [name] [0|1]` instead of `pw-cli` props. 
-        - This ensures the mute state is visible and synced with the Desktop Environment (OSD).
-    - **Default Sink**: On startup, the engine scans for an Input Strip named "Desktop" and enforces it as the system default sink (`pactl set-default-sink`).
+    - **Node Creation Strategy**:
+        - **Primary**: `pw-cli create-node adapter ...` used to create Null Sinks. This ensures `node.description` is correctly quoted and visible in OS Mixers.
+        - **Fallback**: `pactl load-module module-null-sink` (used previously, kept as backup).
+    - **Cleanup**: On startup, `_clean_zombie_nodes()` scans for any node named `Holaf_Strip_*` and destroys it to prevent duplicates/ghosts.
+    - **Naming**: Nodes are named `Holaf_Strip_[UID]`. Descriptions are formatted as `Holaf: [UserLabel]`.
+    - **Default Sink**: Logic searches for Strip labeled "Desktop" -> then "Default" -> then First Input to set as System Default.
 
-    ### MIDI & Performance Logic
-    - **Decoupling**: The MIDI thread puts data into the Main Thread (via Signals). The Main Thread updates the UI/Model.
-    - **Throttling**: The `StripWidget` has a `QTimer` running at 100ms (10Hz). It only sends a volume command to PipeWire if the Model's volume has changed since the last tick. This absorbs the flood of MIDI messages (often >100/sec).
-    - **MIDI Learn**: Implemented via context menu on the "MIDI" button. Saves mapping (CC or Note) into `config.json`.
+    ### Hardware & Volume Logic
+    - **Volume Control**: moved to `pactl set-sink-volume [name] [N]%`. This ensures that changing volume in Holaf-Mix moves the hardware fader (and OSD) in KDE/Gnome.
+    - **Physical Inputs**: If a Physical Source (Mic) is selected on an Input Strip, the engine creates a `pw-link` from the Mic's ports to the Virtual Strip's inputs.
+
+    ### App Routing Logic
+    - **Detection**: `pipewire_utils.get_sink_inputs()` scans for running audio streams (Firefox, Spotify).
+    - **Assignment**: `Strip` model holds a list of app names (`assigned_apps`).
+    - **Enforcement**: `MainWindow` attempts to move streams using `pactl move-sink-input` when assignments change or periodically.
 
     ## 5. Features Status
     - [x] **Core Audio**: Create/Delete Virtual Strips, Detect Physical Devices.
-    - [x] **Routing**: Matrix routing (Inputs -> Outputs) works reliably.
-    - [x] **Persistence**: State is saved/restored on restart.
-    - [x] **MIDI Control**: Full bidirectional control (UI updates on MIDI input).
-    - [x] **UX/UI**: 
-        - Visual feedback for Routing (Green buttons).
-        - Visual feedback for "Learning Mode" (Orange border).
-        - System Tray / Desktop Integration (Correct names).
+    - [x] **Renaming**: Double-click on strip label to rename.
+    - [x] **Hardware Routing**: 
+        - Output Strips can map to Physical Speakers.
+        - Input Strips can accept Physical Microphones.
+    - [x] **Persistence**: State (including Device selection & App lists) saved/restored.
+    - [x] **MIDI Control**: Full bidirectional control + Learning.
+    - [x] **UI/UX**: 
+        - Device Selector (Combo Box).
+        - App Selection Dialog (Checkboxes).
+    - [ ] **App Routing**: Logic implemented but currently buggy (Apps do not switch sinks effectively).
 
     ## 6. Environment & Dependencies
     - **Python**: 3.10+
-    - **Libraries**: 
-        - `PySide6` (GUI)
-        - `mido` + `python-rtmidi` (MIDI)
-    - **System Tools**: 
-        - `pipewire` (Core audio server)
-        - `pipewire-pulse` (Provides `pactl` compatibility - Required)
-        - `pw-cli` & `pw-link` (WirePlumber/PipeWire tools)
+    - **Libraries**: `PySide6`, `mido`, `python-rtmidi`.
+    - **System Tools**: `pipewire`, `pipewire-pulse`, `pw-cli`, `pactl`, `pw-link`.
 
-    ## 7. Known Considerations
-    - **Hot-Plugging**: Adding/Removing a strip currently triggers a full engine restart (`start_engine`) to ensure the PipeWire graph and internal registries stay in sync.
-    - **Latency**: There is an intentional max delay of 100ms on volume changes reaching the audio engine (due to throttling), which is imperceptible to the user but vital for CPU stability.
+    ## 7. Known Considerations & Issues
+    - **Hot-Plugging**: Adding/Removing a strip triggers a full engine restart.
+    - **Latency**: 100ms UI throttling on volume.
+    - **App Routing Bug**: Selecting an app in the UI does not currently force it to the target strip; it remains on Default.
+
+    ## 8. Roadmap (Next Steps)
+    1.  **Fix App Routing**: Debug `pactl move-sink-input` logic (potential ID mismatch or timing issue).
+    2.  **Default Strip Toggle**: Add a checkbox on Input Strips to explicitly set one as the "System Default".
+        - *Logic*: If checked, disables "Select Apps" for this strip (it catches everything else).
+    3.  **Window Persistence**: Save/Restore Window Size and Position in `config.json`.
+    4.  **Auto-Resize**: 
+        - Automatically adjust Window Width based on the number of active strips.
+        - Disable horizontal manual resizing.

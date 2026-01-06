@@ -2,15 +2,17 @@
     "strips": [
         {
             "uid": "c7c5175e-ad27-484d-adb8-eb34deaf3d3f",
-            "label": "Desktop",
+            "label": "Default",
             "kind": "input",
             "mode": "virtual",
-            "volume": 0.8346456692913385,
+            "volume": 1.0,
             "mute": false,
             "routes": [
-                "4d00edf7-d2d6-428d-b51c-22bc2288db16"
+                "4d00edf7-d2d6-428d-b51c-22bc2288db16",
+                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
             ],
             "device_name": null,
+            "assigned_apps": [],
             "midi_volume": {
                 "channel": 0,
                 "control": 23,
@@ -24,13 +26,14 @@
         },
         {
             "uid": "4d00edf7-d2d6-428d-b51c-22bc2288db16",
-            "label": "Speakers",
+            "label": "HP",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.5196850393700787,
+            "volume": 0.0,
             "mute": false,
             "routes": [],
             "device_name": "alsa_output.usb-C-Media_Electronics_Inc._Hifi_Audio-00.analog-stereo",
+            "assigned_apps": [],
             "midi_volume": {
                 "channel": 0,
                 "control": 62,
@@ -41,6 +44,59 @@
                 "note": 27,
                 "type": "note_on"
             }
+        },
+        {
+            "uid": "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
+            "label": "Casque",
+            "kind": "output",
+            "mode": "physical",
+            "volume": 0.11811023622047244,
+            "mute": false,
+            "routes": [],
+            "device_name": "alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40",
+            "assigned_apps": [],
+            "midi_volume": {
+                "channel": 0,
+                "control": 61,
+                "type": "control_change"
+            },
+            "midi_mute": {
+                "channel": 0,
+                "note": 22,
+                "type": "note_on"
+            }
+        },
+        {
+            "uid": "22eee65f-b74c-4540-a4b4-087a6364b608",
+            "label": "web",
+            "kind": "input",
+            "mode": "virtual",
+            "volume": 1.0,
+            "mute": false,
+            "routes": [
+                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
+            ],
+            "device_name": null,
+            "assigned_apps": [
+                "Firefox"
+            ],
+            "midi_volume": null,
+            "midi_mute": null
+        },
+        {
+            "uid": "8b4b72e6-e0e7-44a1-be0b-69a9400c126c",
+            "label": "Mic",
+            "kind": "input",
+            "mode": "physical",
+            "volume": 1.0,
+            "mute": false,
+            "routes": [
+                "74c7a048-d7f5-4a05-bfb7-ca43b25326ce"
+            ],
+            "device_name": "alsa_input.usb-PreSonus_Studio_26c_01424548-00.analog-stereo",
+            "assigned_apps": [],
+            "midi_volume": null,
+            "midi_mute": null
         }
     ]
 }

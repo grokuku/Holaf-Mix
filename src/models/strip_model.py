@@ -30,16 +30,18 @@ class Strip:
         
         # Routing Matrix (Only relevant for Input strips)
         # List of Output UIDs this strip sends audio to.
-        # Ex: ['uid-of-speakers', 'uid-of-virtual-output-b1']
         self.routes = [] 
         
         # Hardware/PipeWire connection details
-        # If Physical: The name of the hardware device in PipeWire (e.g. "alsa_output...")
-        # If Virtual: The name of the node we created (e.g. "Holaf_Input_Discord")
+        # If kind=OUTPUT & mode=PHYSICAL: The name of the sink (Speakers)
+        # If kind=INPUT & mode=PHYSICAL: The name of the source (Mic) to link FROM
         self.device_name = None 
 
+        # Software Assignment (For Inputs)
+        # List of application names (strings) assigned to this strip (e.g. ["Firefox", "Spotify"])
+        self.assigned_apps = []
+
         # MIDI Mapping configuration
-        # Structure: {'type': 'cc'|'note', 'channel': 0, 'value': 21}
         self.midi_volume = None 
         self.midi_mute = None
 
@@ -54,6 +56,7 @@ class Strip:
             'mute': self.mute,
             'routes': self.routes,
             'device_name': self.device_name,
+            'assigned_apps': self.assigned_apps,
             'midi_volume': self.midi_volume,
             'midi_mute': self.midi_mute
         }
@@ -61,22 +64,21 @@ class Strip:
     @classmethod
     def from_dict(cls, data):
         """Create a Strip object from a dictionary (loading from JSON)."""
-        # Create instance with mandatory fields
         strip = cls(
             label=data['label'],
             kind=data['kind'],
             mode=data.get('mode', StripMode.VIRTUAL),
             uid=data.get('uid')
         )
-        # Restore optional/state fields
         strip.volume = data.get('volume', 1.0)
         strip.mute = data.get('mute', False)
         strip.routes = data.get('routes', [])
         strip.device_name = data.get('device_name')
+        strip.assigned_apps = data.get('assigned_apps', [])
         strip.midi_volume = data.get('midi_volume')
         strip.midi_mute = data.get('midi_mute')
         
         return strip
 
     def __repr__(self):
-        return f"<Strip '{self.label}' ({self.kind}/{self.mode}) Vol:{self.volume}>"
+        return f"<Strip '{self.label}' ({self.kind}) Vol:{self.volume}>"

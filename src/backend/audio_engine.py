@@ -2,7 +2,7 @@ import subprocess
 import time
 import logging
 from typing import Dict, List, Optional, Tuple
-import pipewire_utils  # CORRECTION: Import direct depuis la racine
+import pipewire_utils
 from src.models.strip_model import Strip, StripType, StripMode
 
 # Configuration du logging
@@ -19,28 +19,38 @@ class AudioEngine:
 
     def start_engine(self, strips: List[Strip]):
         logger.info("Starting Audio Engine...")
+        
+        # 0. CLEANUP: Remove leftover nodes from previous crashes/restarts
+        self._clean_zombie_nodes()
+
         self.node_registry.clear()
         self.name_cache.clear()
         self.link_registry.clear()
         
-        # 1. Create/Find Nodes
+        # 1. Create Nodes (Virtual Strips)
         for strip in strips:
             node_id = None
-            if strip.mode == StripMode.VIRTUAL:
-                node_id = self._create_virtual_node(strip)
-            else:
+            if strip.kind == StripType.OUTPUT and strip.mode == StripMode.PHYSICAL:
+                # Direct hardware mapping
                 node_id = self._find_physical_node(strip)
+            else:
+                # Virtual Node creation
+                node_id = self._create_virtual_node(strip)
             
             if node_id:
                 self.node_registry[strip.uid] = node_id
-                # Mise à jour de l'état initial
                 self.set_volume(strip.uid, strip.volume)
                 self.set_mute(strip.uid, strip.mute)
             else:
                 logger.warning(f"Could not initialize node for strip: {strip.label}")
 
-        # 2. Restore Routing
+        # 2. Input Logic: Link Physical Sources -> Input Strips
         input_strips = [s for s in strips if s.kind == StripType.INPUT]
+        for inp in input_strips:
+            if inp.mode == StripMode.PHYSICAL and inp.device_name:
+                self._link_physical_source_to_strip(inp)
+
+        # 3. Routing Logic: Input Strips -> Output Strips
         for inp in input_strips:
             source_uid = inp.uid
             if source_uid not in self.node_registry:
@@ -49,11 +59,15 @@ class AudioEngine:
                 if target_uid in self.node_registry:
                     self.update_routing(source_uid, target_uid, active=True)
 
-        # 3. Set Default Sink (Feature Request)
-        # We look for a strip labeled "Desktop" to set as system default
-        desktop_strip = next((s for s in strips if s.label.lower() == "desktop" and s.kind == StripType.INPUT), None)
-        if desktop_strip and desktop_strip.uid in self.node_registry:
-            node_name = self.name_cache.get(self.node_registry[desktop_strip.uid])
+        # 4. Set Default Sink Strategy
+        target_strip = next((s for s in strips if s.label.lower() == "desktop" and s.kind == StripType.INPUT), None)
+        if not target_strip:
+            target_strip = next((s for s in strips if s.label.lower() == "default" and s.kind == StripType.INPUT), None)
+        if not target_strip:
+            target_strip = next((s for s in strips if s.kind == StripType.INPUT), None)
+
+        if target_strip and target_strip.uid in self.node_registry:
+            node_name = self.name_cache.get(self.node_registry[target_strip.uid])
             if node_name:
                 self._set_system_default_sink(node_name)
 
@@ -71,32 +85,33 @@ class AudioEngine:
 
     def set_volume(self, strip_uid: str, volume: float):
         node_id = self.node_registry.get(strip_uid)
-        if node_id:
-            pipewire_utils.set_node_volume(node_id, volume)
+        if not node_id: return
+
+        node_name = self.name_cache.get(node_id)
+        if node_name:
+            vol_pct = f"{int(volume * 100)}%"
+            try:
+                subprocess.run(['pactl', 'set-sink-volume', node_name, vol_pct], check=True, capture_output=True)
+                return
+            except subprocess.CalledProcessError:
+                pass 
+        pipewire_utils.set_node_volume(node_id, volume)
 
     def set_mute(self, strip_uid: str, muted: bool):
         node_id = self.node_registry.get(strip_uid)
         if not node_id: return
 
-        # FIX: Use pactl for named nodes (more reliable for KDE/Pulse clients)
         node_name = self.name_cache.get(node_id)
         if node_name:
-            # pactl set-sink-mute works for both sinks and sources usually if named correctly,
-            # but let's be specific or fallback.
-            # "0" for unmute, "1" for mute
             val = "1" if muted else "0"
             try:
-                # Try sink first
                 subprocess.run(['pactl', 'set-sink-mute', node_name, val], check=True, capture_output=True)
             except subprocess.CalledProcessError:
                 try:
-                    # Try source if sink failed
                     subprocess.run(['pactl', 'set-source-mute', node_name, val], check=True, capture_output=True)
                 except subprocess.CalledProcessError:
-                    # Fallback to low-level pw-cli
                     pipewire_utils.toggle_node_mute(node_id, muted)
         else:
-            # Fallback for unnamed nodes
             pipewire_utils.toggle_node_mute(node_id, muted)
 
     def update_routing(self, source_uid: str, target_uid: str, active: bool):
@@ -107,8 +122,22 @@ class AudioEngine:
 
     # --- Internal Logic ---
 
+    def _clean_zombie_nodes(self):
+        """Scans for existing Holaf nodes from previous sessions and destroys them."""
+        logger.info("Cleaning up zombie nodes...")
+        nodes = pipewire_utils.get_audio_nodes()
+        count = 0
+        for node in nodes:
+            # Check for our signature in the name
+            if "Holaf_Strip_" in node.get('name', ''):
+                self._destroy_node(node['id'])
+                count += 1
+        if count > 0:
+            logger.info(f"Cleaned {count} zombie nodes.")
+            # Give PipeWire a moment to process deletions
+            time.sleep(0.2)
+
     def _set_system_default_sink(self, node_name: str):
-        """Sets the given node name as the default system audio output."""
         try:
             subprocess.run(['pactl', 'set-default-sink', node_name], check=True, capture_output=True)
             logger.info(f"System default sink set to: {node_name}")
@@ -119,31 +148,11 @@ class AudioEngine:
         node_name = f"Holaf_Strip_{strip.uid}"
         description = f"Holaf: {strip.label}"
         
-        # --- STRATEGY 1: pactl (PulseAudio Compatibility) ---
-        cmd_pactl = [
-            'pactl', 'load-module', 'module-null-sink',
-            f'sink_name={node_name}',
-            f'sink_properties=device.description="{description}"' 
-        ]
-        
-        try:
-            subprocess.run(cmd_pactl, check=True, capture_output=True)
-            time.sleep(0.2)
-            
-            node_id = self._find_node_id_by_name(node_name)
-            if node_id:
-                self.created_nodes.append(node_id)
-                self.name_cache[node_id] = node_name
-                logger.info(f"Created virtual node '{strip.label}' via pactl (ID: {node_id})")
-                return node_id
-                
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            logger.warning("pactl failed or not found. Falling back to pw-cli.")
-
-        # --- STRATEGY 2: pw-cli (Native PipeWire) ---
+        # --- STRATEGY 1: pw-cli (Native PipeWire) - PRIMARY ---
+        # We use this first because it handles strings/descriptions way better than pactl
         props = (
             f"{{ factory.name=support.null-audio-sink, "
-            f"node.name={node_name}, "
+            f"node.name=\"{node_name}\", "
             f"node.description=\"{description}\", "
             f"media.class=Audio/Sink, "
             f"object.linger=true, "
@@ -161,11 +170,65 @@ class AudioEngine:
                 self.name_cache[node_id] = node_name
                 logger.info(f"Created virtual node '{strip.label}' via pw-cli (ID: {node_id})")
                 return node_id
-
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create node for {strip.label}: {e}")
+            logger.warning(f"pw-cli failed ({e}), trying pactl fallback...")
+
+        # --- STRATEGY 2: pactl (PulseAudio Compatibility) - FALLBACK ---
+        # Note: Quoting descriptions with spaces is tricky here.
+        cmd_pactl = [
+            'pactl', 'load-module', 'module-null-sink',
+            f'sink_name={node_name}',
+            f'sink_properties=device.description="{description}"' 
+        ]
+        
+        try:
+            subprocess.run(cmd_pactl, check=True, capture_output=True)
+            time.sleep(0.2)
+            
+            node_id = self._find_node_id_by_name(node_name)
+            if node_id:
+                self.created_nodes.append(node_id)
+                self.name_cache[node_id] = node_name
+                logger.info(f"Created virtual node '{strip.label}' via pactl (ID: {node_id})")
+                return node_id
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.error("Both pw-cli and pactl strategies failed.")
         
         return None
+
+    def _link_physical_source_to_strip(self, strip: Strip):
+        strip_node_id = self.node_registry.get(strip.uid)
+        if not strip_node_id or not strip.device_name: return
+
+        source_id = self._find_node_id_by_name(strip.device_name)
+        if not source_id:
+            logger.warning(f"Could not find physical source: {strip.device_name}")
+            return
+            
+        src_name = self._get_node_name(source_id)
+        dst_name = self._get_node_name(strip_node_id)
+        
+        if src_name and dst_name:
+             src_ports = self._get_ports_by_name(src_name, is_input=False)
+             dst_ports = self._get_ports_by_name(dst_name, is_input=True)
+             
+             links_to_make = []
+             
+             src_l = next((p for p in src_ports if 'FL' in p or 'left' in p.lower()), None)
+             src_r = next((p for p in src_ports if 'FR' in p or 'right' in p.lower()), None)
+             dst_l = next((p for p in dst_ports if 'FL' in p or 'left' in p.lower()), None)
+             dst_r = next((p for p in dst_ports if 'FR' in p or 'right' in p.lower()), None)
+             
+             if src_l and dst_l: links_to_make.append((src_l, dst_l))
+             if src_r and dst_r: links_to_make.append((src_r, dst_r))
+             
+             if len(src_ports) == 1 and len(dst_ports) >= 2:
+                 if src_ports:
+                    links_to_make.append((src_ports[0], dst_ports[0]))
+                    links_to_make.append((src_ports[0], dst_ports[1]))
+                 
+             for p_src, p_dst in links_to_make:
+                 self._pw_link(p_src, p_dst)
 
     def _find_node_id_by_name(self, node_name: str) -> Optional[int]:
         nodes = pipewire_utils.get_audio_nodes()
@@ -179,20 +242,11 @@ class AudioEngine:
         target_class = "Audio/Sink" if strip.kind == StripType.OUTPUT else "Audio/Source"
         candidates = [n for n in nodes if n['media_class'] == target_class]
 
-        # 1. Exact Match
         if strip.device_name:
             for node in candidates:
                 if node['name'] == strip.device_name:
                     self.name_cache[node['id']] = node['name']
                     return node['id']
-        
-        # 2. Heuristic Match
-        for node in candidates:
-            if "Holaf_Strip" not in node['name']:
-                logger.info(f"Auto-assigned physical device '{node['description']}'")
-                strip.device_name = node['name']
-                self.name_cache[node['id']] = node['name']
-                return node['id']
         return None
 
     def _destroy_node(self, node_id: int):
@@ -218,8 +272,7 @@ class AudioEngine:
             prefix = f"{node_name}:"
             matched_ports = [p for p in all_ports if p.startswith(prefix)]
             return matched_ports
-        except Exception as e:
-            logger.error(f"Error listing ports: {e}")
+        except Exception:
             return []
 
     def _pw_link(self, port_src: str, port_dst: str) -> bool:
@@ -236,37 +289,23 @@ class AudioEngine:
         if not src_id or not dst_id: return
         if (source_uid, target_uid) in self.link_registry: return
 
-        # 1. Récupérer les Noms
         src_name = self._get_node_name(src_id)
         dst_name = self._get_node_name(dst_id)
         
-        if not src_name or not dst_name:
-            logger.error(f"Cannot link: Could not resolve node names for IDs {src_id}->{dst_id}")
-            return
+        if not src_name or not dst_name: return
 
-        # 2. Récupérer les Ports par NOM
         src_ports = self._get_ports_by_name(src_name, is_input=False)
         dst_ports = self._get_ports_by_name(dst_name, is_input=True)
 
-        logger.info(f"Linking {src_name} -> {dst_name}")
-
-        # 3. Matching
+        links_to_make = []
         src_l = next((p for p in src_ports if 'FL' in p or 'left' in p.lower()), None)
         src_r = next((p for p in src_ports if 'FR' in p or 'right' in p.lower()), None)
         dst_l = next((p for p in dst_ports if 'FL' in p or 'left' in p.lower()), None)
         dst_r = next((p for p in dst_ports if 'FR' in p or 'right' in p.lower()), None)
 
-        links_to_make = []
-
         if src_l and dst_l: links_to_make.append((src_l, dst_l))
         if src_r and dst_r: links_to_make.append((src_r, dst_r))
         
-        # Fallback Index
-        if not links_to_make and src_ports and dst_ports:
-            min_len = min(len(src_ports), len(dst_ports))
-            for i in range(min_len):
-                links_to_make.append((src_ports[i], dst_ports[i]))
-
         created_links = []
         for p_src, p_dst in links_to_make:
             if self._pw_link(p_src, p_dst):
@@ -274,16 +313,8 @@ class AudioEngine:
                 
         if created_links:
             self.link_registry[(source_uid, target_uid)] = created_links
-            logger.info(f"Successfully linked: {created_links}")
-        else:
-            logger.error("Failed to link strips. No matching ports.")
 
     def _destroy_link(self, source_uid: str, target_uid: str):
         links = self.link_registry.pop((source_uid, target_uid), [])
         for (p_src, p_dst) in links:
              subprocess.run(['pw-link', '-d', p_src, p_dst], capture_output=True)
-        if links:
-            logger.info(f"Unlinked {source_uid} -> {target_uid}")
-
-if __name__ == "__main__":
-    print("Audio Engine Module.")
