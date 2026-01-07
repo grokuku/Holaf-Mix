@@ -1,86 +1,79 @@
-# Holaf-Mix Project
+# Holaf-Mix
 
-## 1. Project Goal
+**A Voicemeeter-like Audio Mixer for Linux (PipeWire) + MIDI Support.**
 
-The primary objective of this project is to create a user-friendly audio routing and mixing application for Linux, inspired by Voicemeeter. The application allows a user to control system audio sources (applications, microphones) and sinks using a MIDI controller, specifically the Akai Midimix.
+> ⚠️ **DISCLAIMER: EXPERIMENTAL / PERSONAL PROJECT**
+> 
+> This entire codebase was **generated 100% by an AI Assistant**. 
+> It was built to solve a specific need on a specific hardware configuration. 
+> 
+> *   **NO SUPPORT** will be provided.
+> *   **NO GUARANTEE** that it will work on your machine.
+> *   Use it at your own risk.
 
-## 2. Technical Approach
+## Overview
 
-- **Audio Engine**: The application leverages the modern **PipeWire** audio server on Linux for all audio management tasks (detecting sources/sinks, controlling volume, routing). The application does not implement its own audio logic but rather sends commands to PipeWire.
-- **Control Application**: A **Python** application serves as the bridge between the MIDI controller and PipeWire.
-- **User Interface**: A native desktop GUI built with **PySide6 (the official Python bindings for the Qt framework)** provides an interface for configuration and monitoring. This choice was made to ensure the application integrates well with the user's KDE Plasma desktop environment.
-- **MIDI Communication**: The `mido` and `python-rtmidi` libraries are used for MIDI communication.
-- **Configuration**: Mappings between MIDI controls and PipeWire nodes are stored in a `config.json` file, which allows for dynamic and persistent user configurations.
+Holaf-Mix is a Python-based audio mixer designed for Linux systems running **PipeWire**. It mimics the workflow of software like Voicemeeter, allowing you to route applications to virtual strips, mix them, and send them to physical outputs or communication apps (Discord, TeamSpeak, etc.).
 
-## 3. Current Status (As of Jan 05, 2026)
+It features a persistent UI, robust routing logic, and full **MIDI Bidirectional Support** (specifically tested with Akai MIDImix).
 
-The project has successfully moved from initial proof-of-concept to a functional core application. The following has been achieved:
+## Features
 
-- **Python Environment**: A virtual environment (`venv`) is set up with all necessary dependencies.
-- **MIDI Communication**: Communication with MIDI devices is functional. The application can list devices and listen for messages.
-- **PipeWire Integration**: A utility module, `pipewire_utils.py`, has been created to interface with PipeWire. It can:
-  - List all relevant audio nodes (sinks, sources, and application streams) by parsing the output of `pw-dump`.
-  - Programmatically set the volume and mute state of any given node using `pw-cli`.
-- **GUI Application**:
-  - A basic GUI window using PySide6 has been created (`main.py`).
-  - The UI dynamically lists available MIDI input devices and PipeWire audio nodes.
-- **Dynamic MIDI Mapping**:
-  - A "MIDI Learn" feature has been implemented. The user can click a "Detect" button for a specific control (volume or mute) and the application will listen for the next MIDI message and save the mapping.
-  - Mappings are correctly saved to and loaded from `config.json`.
-- **Live Control**:
-  - The application listens for MIDI messages in a background thread.
-  - Mapped `control_change` messages (from faders/knobs) correctly control the volume of the corresponding PipeWire nodes in real-time.
-  - Mapped `note_on` or `control_change` messages (from buttons) correctly toggle the mute state of the corresponding nodes.
+*   **Virtual Strips**: Create unlimited Input/Output strips.
+*   **PipeWire Routing**: 
+    *   Route specific apps (Firefox, Spotify, Games) to specific strips.
+    *   Route virtual strips to physical hardware (Speakers, Headphones).
+    *   Create Virtual Busses (B1, B2) that appear as Microphones in other apps.
+*   **Mono Toggle**: Downmix stereo sources to mono with a single click.
+*   **MIDI Control & Feedback**:
+    *   "MIDI Learn" mode for Volume faders, Mute buttons, and Mono toggles.
+    *   **LED Feedback**: Updates your controller's LEDs (Mute/Mono) when changed in the UI.
+*   **System Integration**:
+    *   Minimizes to System Tray.
+    *   "Always on Top" mode.
+    *   Saves window position and strip configuration on exit.
+*   **Visuals**: Real-time VU Meters (20fps).
 
-## 4. Project Structure
+## Tech Stack
 
-- `main.py`: The main entry point for the application. Contains the PySide6 UI code, the MIDI listener thread, and the main application logic that ties everything together.
-- `pipewire_utils.py`: A module for all interactions with PipeWire. It contains functions to get audio nodes and their properties, and to set volume/mute.
-- `config.py`: A module to handle loading and saving the application's configuration from/to `config.json`.
-- `config.json`: The configuration file where MIDI device selection and mappings are stored.
-- `requirements.txt`: A list of all Python dependencies required for the project.
-- `run_holaf_mix.sh`: An executable shell script to easily launch the main application.
-- `midi_test.py` / `run_midi_test.sh`: Initial test scripts used to validate MIDI communication. Can be used for debugging.
+*   **Language**: Python 3.10+
+*   **GUI**: PySide6 (Qt)
+*   **Audio Backend**: PipeWire (via `pw-cli` and `pw-dump` wrappers) + `sounddevice` (for VU meters)
+*   **MIDI**: `mido` + `python-rtmidi`
 
-## 5. How to Set Up and Run
+## Installation
 
-To get the project running on a new machine (assuming Linux with PipeWire):
+**Note**: This assumes you are on Linux and have **PipeWire** installed and active.
 
-1.  **Clone/copy the project files.**
-2.  **Navigate to the project directory:**
+1.  **Clone the repository**:
     ```bash
-    cd /path/to/Holaf_Mix
+    git clone https://github.com/your-username/holaf-mix.git
+    cd holaf-mix
     ```
-3.  **Create a Python virtual environment:**
-    ```bash
-    python3 -m venv venv
-    ```
-4.  **Activate the virtual environment:**
-    ```bash
-    source venv/bin/activate
-    ```
-5.  **Install the required dependencies:**
+
+2.  **Install dependencies**:
     ```bash
     pip install -r requirements.txt
     ```
-6.  **Run the application:**
+
+3.  **Run the application**:
     ```bash
-    ./run_holaf_mix.sh
+    python main.py
     ```
 
-## 6. Next Steps for the Project
+## Usage
 
-The core functionality is in place, but there are several areas for improvement and new features:
+1.  **Add Strips**: Click the `+` button in the Inputs or Outputs section.
+2.  **Assign Devices**:
+    *   For **Inputs**: Select a physical source or "Apps / Virtual". If Virtual, click "Select Apps" to choose which running programs are routed here.
+    *   For **Outputs**: Select your physical speakers/headphones.
+3.  **Route**: Click the buttons (e.g., `OUT1`, `OUT2`) on an Input strip to send audio to that Output strip.
+4.  **MIDI Learn**:
+    *   Click the `MIDI` button on a strip.
+    *   Select "Learn Volume/Mute/Mono".
+    *   Move a fader or press a button on your controller.
+    *   The mapping is saved automatically.
 
-- **UI/UX Refinement**:
-  - The current UI is functional but very basic. It could be redesigned to be more intuitive and visually appealing.
-  - Improve the visual feedback during and after the "MIDI learn" process.
-- **Robustness**:
-  - Improve error handling (e.g., when a MIDI device is disconnected).
-  - The mute toggle logic relies on reading the state before toggling. While functional, this could be optimized if PipeWire offers a direct "toggle" command (which is unlikely, so the current approach is standard).
-- **New Features**:
-  - **Master Volume**: Implement a master volume control that maps a fader to the main system output sink.
-  - **Routing**: Add functionality to change the routing of audio streams (e.g., link an application's output to a different audio device). This would involve using `pw-cli create-link` and `pw-cli destroy <link_id>`.
-  - **More Mappings**: Allow mapping of other MIDI controls (e.g., knobs) and other PipeWire parameters.
+## License
 
-This document should provide a solid foundation for the next developer or LLM to continue the project.
+This project is provided "as-is" without any warranty. feel free to fork and modify it for your own needs.
