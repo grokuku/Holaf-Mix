@@ -5,7 +5,7 @@
             "label": "Casque",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.5354330708661418,
+            "volume": 0.0,
             "mute": false,
             "is_mono": false,
             "routes": [],
@@ -19,10 +19,14 @@
             },
             "midi_mute": {
                 "channel": 0,
-                "note": 22,
+                "note": 24,
                 "type": "note_on"
             },
-            "midi_mono": null
+            "midi_mono": {
+                "channel": 0,
+                "note": 22,
+                "type": "note_on"
+            }
         },
         {
             "uid": "74c7a048-d7f5-4a05-bfb7-ca43b25326ce",
@@ -43,10 +47,14 @@
             },
             "midi_mute": {
                 "channel": 0,
-                "note": 27,
+                "note": 26,
                 "type": "note_on"
             },
-            "midi_mono": null
+            "midi_mono": {
+                "channel": 0,
+                "note": 27,
+                "type": "note_on"
+            }
         },
         {
             "uid": "22eee65f-b74c-4540-a4b4-087a6364b608",
@@ -69,12 +77,12 @@
             },
             "midi_mute": {
                 "channel": 0,
-                "note": 1,
+                "note": 3,
                 "type": "note_on"
             },
             "midi_mono": {
                 "channel": 0,
-                "note": 3,
+                "note": 1,
                 "type": "note_on"
             }
         },
@@ -100,12 +108,12 @@
             },
             "midi_mute": {
                 "channel": 0,
-                "note": 4,
+                "note": 6,
                 "type": "note_on"
             },
             "midi_mono": {
                 "channel": 0,
-                "note": 6,
+                "note": 4,
                 "type": "note_on"
             }
         },
@@ -133,12 +141,12 @@
             },
             "midi_mute": {
                 "channel": 0,
-                "note": 7,
+                "note": 9,
                 "type": "note_on"
             },
             "midi_mono": {
                 "channel": 0,
-                "note": 9,
+                "note": 7,
                 "type": "note_on"
             }
         },
@@ -166,12 +174,12 @@
             },
             "midi_mute": {
                 "channel": 0,
-                "note": 10,
+                "note": 12,
                 "type": "note_on"
             },
             "midi_mono": {
                 "channel": 0,
-                "note": 12,
+                "note": 10,
                 "type": "note_on"
             }
         },
@@ -182,7 +190,7 @@
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
-            "is_mono": false,
+            "is_mono": true,
             "routes": [],
             "device_name": null,
             "assigned_apps": [],
@@ -198,7 +206,7 @@
         "height": 423,
         "maximized": false
     },
-    "window_geometry": "01d9d0cb0003000000000a000000000000000d190000023200000a000000000000000d190000023200000000000000000a0000000a000000000000000d1900000232",
+    "window_geometry": "01d9d0cb00030000000000000000000000000319000001f1000000000000000000000319000001f100000001000000000a00000000000000000000000319000001f1",
     "window_state": {
         "x": 2560,
         "y": 0,

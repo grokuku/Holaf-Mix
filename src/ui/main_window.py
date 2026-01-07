@@ -181,7 +181,28 @@ class MainWindow(QMainWindow):
         ports = self.midi_engine.get_input_names()
         if ports:
             target = next((p for p in ports if "mix" in p.lower()), ports[0])
-            self.midi_engine.open_port(target)
+            if self.midi_engine.open_port(target):
+                 # Wait a tiny bit then sync LEDs on startup
+                 QTimer.singleShot(200, self._sync_initial_midi_leds)
+
+    def _sync_initial_midi_leds(self):
+        """Updates controller LEDs to match current app state."""
+        for strip in self.strips:
+            self._send_midi_feedback(strip, "mute", strip.mute)
+            self._send_midi_feedback(strip, "mono", strip.is_mono)
+
+    def _send_midi_feedback(self, strip, prop_name, is_active):
+        """Helper to send feedback to the controller."""
+        if not self.midi_engine: return
+        
+        mapping = None
+        if prop_name == "mute":
+            mapping = strip.midi_mute
+        elif prop_name == "mono":
+            mapping = strip.midi_mono
+            
+        if mapping:
+            self.midi_engine.send_feedback(mapping, is_active)
 
     def _rebuild_midi_lookup(self):
         self.midi_lookup.clear()
@@ -221,16 +242,16 @@ class MainWindow(QMainWindow):
                 # Toggle only on button press (value > 0), ignore release (value 0)
                 if val > 0: 
                     strip.mute = not strip.mute
-                    # BUGFIX: Ensure backend is notified!
                     self._run_in_background(self.audio_engine.set_mute, strip.uid, strip.mute)
+                    self._send_midi_feedback(strip, "mute", strip.mute)
 
             elif prop == "mono":
                 val = getattr(msg, 'velocity', 127) if hasattr(msg, 'velocity') else msg.value
                 # Toggle only on button press
                 if val > 0:
                     strip.is_mono = not strip.is_mono
-                    # BUGFIX: Ensure backend is notified!
                     self._run_in_background(self.audio_engine.set_mono, strip.uid, strip.is_mono)
+                    self._send_midi_feedback(strip, "mono", strip.is_mono)
 
             # Refresh UI
             widget = self.widgets.get(uid)
@@ -244,8 +265,12 @@ class MainWindow(QMainWindow):
                 strip.midi_volume = mapping
             elif prop == "mute": 
                 strip.midi_mute = mapping
+                # Sync LED immediately
+                self._send_midi_feedback(strip, "mute", strip.mute)
             elif prop == "mono": 
                 strip.midi_mono = mapping
+                # Sync LED immediately
+                self._send_midi_feedback(strip, "mono", strip.is_mono)
                 
             self._save_state()
         
@@ -468,11 +493,18 @@ class MainWindow(QMainWindow):
 
     def on_strip_mute_changed(self, uid, is_muted):
         self._run_in_background(self.audio_engine.set_mute, uid, is_muted)
-        # Note: We don't save explicitly here to avoid lag, saved on exit.
+        # Update Controller LEDs
+        strip = next((s for s in self.strips if s.uid == uid), None)
+        if strip:
+            self._send_midi_feedback(strip, "mute", is_muted)
 
     def on_strip_mono_changed(self, uid, is_mono):
         self._run_in_background(self.audio_engine.set_mono, uid, is_mono)
         self._save_state()
+        # Update Controller LEDs
+        strip = next((s for s in self.strips if s.uid == uid), None)
+        if strip:
+            self._send_midi_feedback(strip, "mono", is_mono)
     
     def on_strip_label_changed(self, uid, new_label):
         self._save_state()

@@ -8,7 +8,7 @@ logger = logging.getLogger("MidiEngine")
 class MidiEngine(QObject):
     """
     Handles MIDI input, mapping detection (Learn mode), and message processing.
-    Runs a background thread to listen to mido ports without blocking the UI.
+    Also handles MIDI Feedback (Output) to light up LEDs on controllers (e.g., Akai MIDImix).
     """
     # Signals to communicate with the UI
     message_received = Signal(object)  # Emitted for every message
@@ -17,6 +17,7 @@ class MidiEngine(QObject):
     def __init__(self):
         super().__init__()
         self.inport = None
+        self.outport = None  # Added for LED feedback
         self.listening = False
         self.thread = None
         
@@ -34,11 +35,20 @@ class MidiEngine(QObject):
     def open_port(self, port_name):
         self.close_port()
         try:
+            # Open Input
             self.inport = mido.open_input(port_name)
             self.listening = True
+            
+            # Try to open Output (usually same name) for LED feedback
+            try:
+                self.outport = mido.open_output(port_name)
+                logger.info(f"Opened MIDI Output port: {port_name}")
+            except Exception as out_e:
+                logger.warning(f"Could not open MIDI Output for {port_name} (LEDs won't work): {out_e}")
+
             self.thread = threading.Thread(target=self._listen_loop, daemon=True)
             self.thread.start()
-            logger.info(f"Opened MIDI port: {port_name}")
+            logger.info(f"Opened MIDI Input port: {port_name}")
             return True
         except Exception as e:
             logger.error(f"Failed to open MIDI port {port_name}: {e}")
@@ -49,6 +59,11 @@ class MidiEngine(QObject):
         if self.inport:
             self.inport.close()
             self.inport = None
+        
+        if self.outport:
+            self.outport.close()
+            self.outport = None
+            
         if self.thread:
             # We don't strictly join here to avoid UI hang if thread is blocked,
             # but daemon=True handles cleanup on exit.
@@ -61,6 +76,37 @@ class MidiEngine(QObject):
         self.learning_mode = True
         self.learning_context = {"uid": strip_uid, "property": property_name}
         logger.info(f"MIDI Learning started for {strip_uid} - {property_name}")
+
+    def send_feedback(self, mapping_data, active):
+        """
+        Sends a MIDI message back to the controller to update LEDs.
+        active: True = LED ON (Velocity 127), False = LED OFF (Velocity 0).
+        """
+        if not self.outport or not mapping_data:
+            return
+
+        try:
+            velocity = 127 if active else 0
+            msg = None
+
+            if mapping_data['type'] == 'note_on':
+                # Akai MIDImix expects NoteOn for buttons
+                msg = mido.Message('note_on', 
+                                   channel=mapping_data['channel'], 
+                                   note=mapping_data['note'], 
+                                   velocity=velocity)
+            elif mapping_data['type'] == 'control_change':
+                # Some controllers use CC for LEDs
+                msg = mido.Message('control_change', 
+                                   channel=mapping_data['channel'], 
+                                   control=mapping_data['control'], 
+                                   value=velocity)
+
+            if msg:
+                self.outport.send(msg)
+                
+        except Exception as e:
+            logger.error(f"Error sending MIDI feedback: {e}")
 
     def _listen_loop(self):
         """Background thread listening for MIDI messages."""
