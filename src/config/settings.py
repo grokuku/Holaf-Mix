@@ -43,33 +43,43 @@ def _save_raw_json(data):
 def load_config():
     """
     Loads the configuration from config.json.
+    Returns a tuple: (list_of_strips, window_geometry_bytes_or_None)
     """
     data = _load_raw_json()
-    if not data:
-        defaults = create_default_config()
-        save_config(defaults)
-        return defaults
     
-    strips_data = data.get('strips', [])
-    if not strips_data and 'strips' not in data: 
-         defaults = create_default_config()
-         save_config(defaults)
-         return defaults
-
+    # 1. Load Strips
     strips = []
-    for s_dict in strips_data:
-        try:
-            strip = Strip.from_dict(s_dict)
-            strips.append(strip)
-        except Exception as e:
-            print(f"Error loading a strip: {e}. Skipping.")
-            
-    return strips
+    strips_data = data.get('strips', [])
+    
+    if not strips_data and 'strips' not in data: 
+         strips = create_default_config()
+         # We don't save immediately here to avoid partial file writes, 
+         # but the app calls save eventually.
+    else:
+        for s_dict in strips_data:
+            try:
+                strip = Strip.from_dict(s_dict)
+                strips.append(strip)
+            except Exception as e:
+                print(f"Error loading a strip: {e}. Skipping.")
+    
+    if not strips:
+        strips = create_default_config()
 
-def save_config(strips):
+    # 2. Load Window Geometry (hex string)
+    window_geo = data.get('window_geometry')
+    
+    return strips, window_geo
+
+def save_config(strips, window_geometry_hex=None):
     """
-    Saves the list of Strip objects to config.json.
+    Saves the list of Strip objects and window state to config.json.
     """
     data = _load_raw_json()
+    
     data['strips'] = [s.to_dict() for s in strips]
+    
+    if window_geometry_hex:
+        data['window_geometry'] = window_geometry_hex
+        
     _save_raw_json(data)

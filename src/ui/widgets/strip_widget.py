@@ -47,7 +47,6 @@ class VUMeterWidget(QWidget):
 class StripWidget(QFrame):
     """
     A specific widget representing one audio strip (Input or Output).
-    Includes throttling logic for the volume slider to prevent UI freeze.
     """
     # Signals to notify the main window
     volume_changed = Signal(str, float) # uid, new_volume
@@ -69,7 +68,7 @@ class StripWidget(QFrame):
         # --- Throttling Mechanism ---
         self.last_sent_vol = self.strip.volume
         self.update_timer = QTimer(self)
-        self.update_timer.setInterval(100) # 10Hz limit
+        self.update_timer.setInterval(50) # 20Hz limit (Requested change)
         self.update_timer.timeout.connect(self._check_and_send_volume)
         self.update_timer.start()
 
@@ -180,6 +179,12 @@ class StripWidget(QFrame):
                 QPushButton:hover { background-color: #777; }
             """)
             self.btn_apps.clicked.connect(lambda: self.app_selection_requested.emit(self.strip.uid))
+            
+            # --- ALIGNMENT FIX: Retain space when hidden (Placeholder effect) ---
+            sp = self.btn_apps.sizePolicy()
+            sp.setRetainSizeWhenHidden(True)
+            self.btn_apps.setSizePolicy(sp)
+            
             dev_layout.addWidget(self.btn_apps)
             
             self._update_app_btn_visibility()
@@ -291,8 +296,6 @@ class StripWidget(QFrame):
     def set_device_list(self, devices):
         """
         Populates the combo box robustly.
-        If the current strip device is not in the list, it is ADDED as a placeholder
-        instead of defaulting to index 0 (Virtual).
         """
         if not hasattr(self, 'device_combo'): return
         
@@ -321,8 +324,6 @@ class StripWidget(QFrame):
                 found_current = True
         
         # 3. Handle missing device (Persistence)
-        # If we have a device set in the model, but it wasn't found in the list,
-        # we ADD it to the combo box so the user sees it's missing but configuration is kept.
         if self.strip.device_name and not found_current:
             missing_label = f"{self.strip.device_name} (Not Found)"
             if len(missing_label) > 15: missing_label = missing_label[:15] + "..."
@@ -332,19 +333,10 @@ class StripWidget(QFrame):
         self.device_combo.setCurrentIndex(selected_index)
         self.device_combo.blockSignals(False)
         
-        # Update visuals without overwriting model
         self._refresh_device_ui_state()
 
     def _refresh_device_ui_state(self):
-        """
-        Updates labels and colors based on the MODEL state.
-        CRITICAL: This method MUST NOT modify self.strip.device_name.
-        It should only reflect the state of self.strip.
-        """
-        # Update Visibility
         self._update_app_btn_visibility()
-        
-        # Update Visuals (Color & Text)
         self._update_base_style()
         
         if self.strip.kind == StripType.OUTPUT and hasattr(self, 'lbl_dev_type'):
@@ -356,32 +348,20 @@ class StripWidget(QFrame):
                 self.lbl_dev_type.setStyleSheet("font-size: 8px; color: #aaa; margin-top: 5px;")
 
     def _on_device_changed(self, index):
-        """
-        Triggered ONLY by User Interaction.
-        This is the ONLY place allowed to change the Model's device_name.
-        """
         device_name = self.device_combo.itemData(index)
         self.strip.device_name = device_name
-        
-        # Update visuals immediately
         self._refresh_device_ui_state()
-        
-        # Notify Controller
         self.device_changed.emit(self.strip.uid, device_name)
 
     def _on_default_toggled(self, checked):
-        # Update model immediately
         self.strip.is_default = checked
         self._update_app_btn_visibility()
         self.default_changed.emit(self.strip.uid, checked)
 
     def _update_app_btn_visibility(self):
         if hasattr(self, 'btn_apps'):
-            # Show "Select Apps" only if NO physical device is selected (Virtual Mode)
-            # AND if it's NOT the default strip (Default catches everything, so no need to select)
             is_virtual = (self.strip.device_name is None)
             is_not_default = not self.strip.is_default
-            
             should_show = is_virtual and is_not_default
             self.btn_apps.setVisible(should_show)
 
@@ -424,7 +404,6 @@ class StripWidget(QFrame):
             return
 
         for out_strip in output_strips:
-            # For routing buttons, use the label. If it's a Bus, it will be the Bus Name.
             btn = QPushButton(out_strip.label[:4].upper())
             btn.setCheckable(True)
             btn.setToolTip(f"Send to {out_strip.label}")
@@ -486,7 +465,6 @@ class StripWidget(QFrame):
         self.strip.volume = val / 100.0
 
     def set_default_state(self, is_default: bool):
-        """Allows external setting of default state without triggering signal loops."""
         if hasattr(self, 'cb_default'):
             self.cb_default.blockSignals(True)
             self.cb_default.setChecked(is_default)
@@ -509,7 +487,6 @@ class StripWidget(QFrame):
         self.btn_mono.blockSignals(False)
         self._update_mono_style()
         
-        # Sync Default Checkbox
         if hasattr(self, 'cb_default'):
             self.set_default_state(self.strip.is_default)
 
@@ -548,6 +525,15 @@ class StripWidget(QFrame):
 
     def update_vumeter(self, left, right):
         """Called by main window to update visual levels."""
+        
+        # --- MONO METER FIX ---
+        if self.strip.is_mono:
+            # If mono is active, we display the max signal on both bars
+            # to visually confirm the signal is present and balanced.
+            mono_val = max(left, right)
+            left = mono_val
+            right = mono_val
+
         if hasattr(self, 'vu_left'):
             self.vu_left.set_level(left)
         if hasattr(self, 'vu_right'):

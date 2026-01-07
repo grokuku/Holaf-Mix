@@ -254,6 +254,11 @@ class AudioEngine:
             if "Holaf_Strip_" in node.get('name', ''):
                 self._destroy_node(node['id'])
                 count += 1
+            # Also clean up our remapped sources
+            if "_remap" in node.get('name', '') and "Holaf_Strip" in node.get('name', ''):
+                self._destroy_node(node['id'])
+                count += 1
+                
         if count > 0:
             logger.info(f"Cleaned {count} zombie nodes.")
             time.sleep(0.2)
@@ -284,7 +289,7 @@ class AudioEngine:
             proc = subprocess.run(cmd_pactl, capture_output=True, text=True)
             if proc.returncode != 0:
                 logger.warning(f"pactl failed: {proc.stderr}")
-                # Retry logic or fallback could go here, but pactl is usually robust.
+                return None
             else:
                 logger.info(f"Created virtual sink via pactl: {node_name}")
             
@@ -296,20 +301,42 @@ class AudioEngine:
                 self.name_cache[node_id] = node_name
                 
                 # Retrieve the AUTO-GENERATED monitor name
-                # pactl creates it, PipeWire maps it.
-                # It is usually just node_name + .monitor, BUT let's fetch it safely if possible
-                # or fallback to standard convention.
-                
-                # Try to get the real monitor name from the node properties if available
                 node_info = pipewire_utils.get_node_info(node_id)
-                monitor_prop = None
+                monitor_name = None
                 if node_info and 'info' in node_info:
-                    monitor_prop = node_info.get('monitor_source_name') 
+                    monitor_name = node_info.get('monitor_source_name') 
                 
-                if monitor_prop:
-                    self.monitor_cache[node_id] = monitor_prop
-                else:
-                    self.monitor_cache[node_id] = f"{node_name}.monitor"
+                if not monitor_name:
+                    monitor_name = f"{node_name}.monitor"
+                    
+                self.monitor_cache[node_id] = monitor_name
+                
+                # --- EXPOSE TO APPS LOGIC (Remap Source) ---
+                # Only for Virtual Outputs (Busses) or potentially all virtual strips
+                # For now, we apply to OUTPUTS (Busses) to solve the user issue directly.
+                if strip.kind == StripType.OUTPUT and strip.mode == StripMode.VIRTUAL:
+                    remap_name = f"{node_name}_remap"
+                    remap_desc = f"Holaf Output ({strip.label})"
+                    
+                    cmd_remap = [
+                        'pactl', 'load-module', 'module-remap-source',
+                        f'master={monitor_name}',
+                        f'source_name={remap_name}',
+                        f'source_properties=device.description="{remap_desc}"'
+                    ]
+                    
+                    remap_proc = subprocess.run(cmd_remap, capture_output=True, text=True)
+                    if remap_proc.returncode == 0:
+                        logger.info(f"Created remapped source: {remap_desc}")
+                        
+                        # We also need to track this node to destroy it later
+                        # Wait a bit for it to appear
+                        time.sleep(0.1)
+                        remap_id = self._find_node_id_by_name(remap_name)
+                        if remap_id:
+                            self.created_nodes.append(remap_id)
+                    else:
+                        logger.warning(f"Failed to create remapped source: {remap_proc.stderr}")
 
                 return node_id
                 

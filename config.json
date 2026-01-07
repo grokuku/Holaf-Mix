@@ -5,7 +5,7 @@
             "label": "Casque",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.5039370078740157,
+            "volume": 0.5354330708661418,
             "mute": false,
             "is_mono": false,
             "routes": [],
@@ -114,7 +114,7 @@
             "label": "Web",
             "kind": "input",
             "mode": "virtual",
-            "volume": 0.4881889763779528,
+            "volume": 1.0,
             "mute": false,
             "is_mono": false,
             "routes": [
@@ -198,7 +198,7 @@
         "height": 423,
         "maximized": false
     },
-    "window_geometry": "01d9d0cb00030000000000000000000000000243000002c8000000000000000000000243000002c800000001000000000a00000000000000000000000243000002c8",
+    "window_geometry": "01d9d0cb0003000000000a000000000000000d190000023200000a000000000000000d190000023200000000000000000a0000000a000000000000000d1900000232",
     "window_state": {
         "x": 2560,
         "y": 0,

@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QLabel, QScrollArea, QFrame, QPushButton, QInputDialog, QMessageBox,
-                               QDialog, QCheckBox, QDialogButtonBox, QSizePolicy)
-from PySide6.QtCore import Qt, QThreadPool, QRunnable, Slot, QTimer
+                               QDialog, QCheckBox, QDialogButtonBox, QSizePolicy, QSystemTrayIcon, QMenu, QApplication, QStyle)
+from PySide6.QtCore import Qt, QThreadPool, QRunnable, Slot, QTimer, QByteArray
+from PySide6.QtGui import QAction, QIcon
 from src.config import settings
 from src.models.strip_model import Strip, StripType, StripMode
 from src.ui.widgets.strip_widget import StripWidget
@@ -70,6 +71,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Holaf-Mix")
         
+        # --- WINDOW FLAGS (Always on Top) ---
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        
         self.audio_engine = audio_engine
         self.midi_engine = midi_engine
         self.thread_pool = QThreadPool()
@@ -78,7 +82,11 @@ class MainWindow(QMainWindow):
         self.midi_lookup = {}
         self.widgets = {}
         
-        self.strips = settings.load_config()
+        # --- Load Config (Strips + Geometry) ---
+        self.strips, window_geo_hex = settings.load_config()
+        if window_geo_hex:
+            self.restoreGeometry(QByteArray.fromHex(window_geo_hex.encode()))
+
         self._rebuild_midi_lookup()
         
         self.central_widget = QWidget()
@@ -96,6 +104,7 @@ class MainWindow(QMainWindow):
         
         self.refresh_ui()
         self._init_midi()
+        self._init_tray_icon()
 
         # Timer for routing enforcement
         self.enforce_timer = QTimer(self)
@@ -107,6 +116,63 @@ class MainWindow(QMainWindow):
         self.meter_timer.setInterval(40) # 40ms = 25 FPS
         self.meter_timer.timeout.connect(self._update_meters)
         self.meter_timer.start()
+
+    def _init_tray_icon(self):
+        """Sets up the System Tray Icon for minimize/restore behavior."""
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        # We need an icon. Using standard system icon.
+        style = QApplication.style()
+        # FIX: Access SP_MediaVolume via QStyle class, not instance
+        icon = style.standardIcon(QStyle.SP_MediaVolume)
+        self.tray_icon.setIcon(icon)
+        
+        # Tray Menu
+        tray_menu = QMenu()
+        restore_action = QAction("Show/Hide", self)
+        restore_action.triggered.connect(self._toggle_window)
+        tray_menu.addAction(restore_action)
+        
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self._force_quit)
+        tray_menu.addAction(quit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _toggle_window(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.showNormal()
+            self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self._toggle_window()
+
+    def _force_quit(self):
+        """Actually close the app."""
+        self._save_state()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        """
+        Override close event to minimize instead of quitting,
+        BUT save state just in case.
+        """
+        self._save_state()
+        if self.tray_icon.isVisible():
+            self.hide()
+            event.ignore()
+        else:
+            event.accept()
+
+    def _save_state(self):
+        """Saves current strips config and window geometry."""
+        geo_hex = self.saveGeometry().toHex().data().decode()
+        settings.save_config(self.strips, geo_hex)
 
     def _init_midi(self):
         if not self.midi_engine: return
@@ -155,12 +221,16 @@ class MainWindow(QMainWindow):
                 # Toggle only on button press (value > 0), ignore release (value 0)
                 if val > 0: 
                     strip.mute = not strip.mute
+                    # BUGFIX: Ensure backend is notified!
+                    self._run_in_background(self.audio_engine.set_mute, strip.uid, strip.mute)
 
             elif prop == "mono":
                 val = getattr(msg, 'velocity', 127) if hasattr(msg, 'velocity') else msg.value
                 # Toggle only on button press
                 if val > 0:
                     strip.is_mono = not strip.is_mono
+                    # BUGFIX: Ensure backend is notified!
+                    self._run_in_background(self.audio_engine.set_mono, strip.uid, strip.is_mono)
 
             # Refresh UI
             widget = self.widgets.get(uid)
@@ -177,7 +247,7 @@ class MainWindow(QMainWindow):
             elif prop == "mono": 
                 strip.midi_mono = mapping
                 
-            settings.save_config(self.strips)
+            self._save_state()
         
         widget = self.widgets.get(uid)
         if widget: widget.set_learning(False)
@@ -250,7 +320,7 @@ class MainWindow(QMainWindow):
             # --- SIGNAL CONNECTIONS ---
             widget.volume_changed.connect(self.on_strip_volume_changed)
             widget.mute_changed.connect(self.on_strip_mute_changed)
-            widget.mono_changed.connect(self.on_strip_mono_changed) # NEW: Fixed Connection
+            widget.mono_changed.connect(self.on_strip_mono_changed) 
             widget.label_changed.connect(self.on_strip_label_changed)
             widget.delete_requested.connect(self.on_strip_delete_requested)
             widget.route_changed.connect(self.on_strip_route_changed)
@@ -336,7 +406,7 @@ class MainWindow(QMainWindow):
         if ok and name:
             new_strip = Strip(label=name, kind=kind, mode=StripMode.VIRTUAL)
             self.strips.append(new_strip)
-            settings.save_config(self.strips)
+            self._save_state()
             if self.audio_engine:
                 self._run_in_background(self.audio_engine.start_engine, self.strips)
             self.refresh_ui()
@@ -353,7 +423,7 @@ class MainWindow(QMainWindow):
                 for s in self.strips:
                     if s.kind == StripType.INPUT and strip_to_remove.uid in s.routes:
                         s.routes.remove(strip_to_remove.uid)
-            settings.save_config(self.strips)
+            self._save_state()
             if self.audio_engine:
                 def reload():
                     self.audio_engine.shutdown() 
@@ -369,7 +439,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             selected = dlg.get_selected_apps()
             strip.assigned_apps = selected
-            settings.save_config(self.strips)
+            self._save_state()
             self._move_apps_to_strip(strip, running_apps)
 
     def _move_apps_to_strip(self, strip, running_apps=None):
@@ -398,18 +468,18 @@ class MainWindow(QMainWindow):
 
     def on_strip_mute_changed(self, uid, is_muted):
         self._run_in_background(self.audio_engine.set_mute, uid, is_muted)
-        settings.save_config(self.strips)
+        # Note: We don't save explicitly here to avoid lag, saved on exit.
 
     def on_strip_mono_changed(self, uid, is_mono):
         self._run_in_background(self.audio_engine.set_mono, uid, is_mono)
-        settings.save_config(self.strips)
+        self._save_state()
     
     def on_strip_label_changed(self, uid, new_label):
-        settings.save_config(self.strips)
+        self._save_state()
 
     def on_strip_route_changed(self, source_uid, target_uid, active):
         self._run_in_background(self.audio_engine.update_routing, source_uid, target_uid, active)
-        settings.save_config(self.strips)
+        self._save_state()
 
     def on_strip_device_changed(self, uid, device_name):
         strip = next((s for s in self.strips if s.uid == uid), None)
@@ -420,7 +490,7 @@ class MainWindow(QMainWindow):
         else:
             strip.mode = StripMode.VIRTUAL
             strip.device_name = None
-        settings.save_config(self.strips)
+        self._save_state()
         
         if self.audio_engine:
             def reload():
@@ -437,6 +507,6 @@ class MainWindow(QMainWindow):
                     if w: w.set_default_state(False)
             target = next((s for s in self.strips if s.uid == uid), None)
             if target: target.is_default = True
-            settings.save_config(self.strips)
+            self._save_state()
             if self.audio_engine:
                 self._run_in_background(self.audio_engine.set_system_default, uid)
