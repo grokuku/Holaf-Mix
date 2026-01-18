@@ -1,8 +1,10 @@
 from PySide6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QPushButton, 
-                               QSlider, QLabel, QWidget, QMenu, QInputDialog, QComboBox, QCheckBox, QSizePolicy)
+                                QSlider, QLabel, QWidget, QMenu, QInputDialog, QComboBox, QCheckBox, QSizePolicy)
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QRect
 from PySide6.QtGui import QAction, QPainter, QColor, QLinearGradient, QBrush
 from src.models.strip_model import StripType, StripMode
+# NEW IMPORT
+from src.ui.dialogs.effect_settings_dialog import EffectSettingsDialog
 
 class VUMeterWidget(QWidget):
     """
@@ -59,6 +61,8 @@ class StripWidget(QFrame):
     device_changed = Signal(str, str)   # uid, device_name (for Output/Input)
     app_selection_requested = Signal(str) # uid, requests app dialog
     default_changed = Signal(str, bool) # uid, is_default
+    effect_toggled = Signal(str, str, bool) # uid, effect_name, is_active
+    effect_params_changed = Signal(str, str) # uid, effect_name (implies params updated in model)
     
     def __init__(self, strip_model, parent=None):
         super().__init__(parent)
@@ -133,7 +137,6 @@ class StripWidget(QFrame):
         layout.addLayout(header_layout)
 
         # --- 2. Source / Device Selector ---
-        # Container for inputs (Source) or outputs (Device)
         self.device_container = QFrame()
         self.device_container.setStyleSheet("background: transparent;")
         dev_layout = QVBoxLayout(self.device_container)
@@ -142,7 +145,6 @@ class StripWidget(QFrame):
         layout.addWidget(self.device_container)
 
         if self.strip.kind == StripType.OUTPUT:
-            # For outputs, we store this label to update it (DEVICE OUT vs VIRTUAL BUS)
             self.lbl_dev_type = QLabel("DEVICE OUT")
             self.lbl_dev_type.setStyleSheet("font-size: 8px; color: #aaa; margin-top: 5px;")
             self.lbl_dev_type.setAlignment(Qt.AlignCenter)
@@ -166,12 +168,10 @@ class StripWidget(QFrame):
 
             # Default Checkbox
             self.cb_default = QCheckBox("Default Sink")
-            self.cb_default.setToolTip("Set as system default output (catches all unassigned audio)")
             self.cb_default.setChecked(self.strip.is_default)
             self.cb_default.toggled.connect(self._on_default_toggled)
             dev_layout.addWidget(self.cb_default)
 
-            # Button for Apps (Only visible if Virtual Mode)
             self.btn_apps = QPushButton("SELECT APPS")
             self.btn_apps.setCursor(Qt.PointingHandCursor)
             self.btn_apps.setStyleSheet("""
@@ -180,13 +180,14 @@ class StripWidget(QFrame):
             """)
             self.btn_apps.clicked.connect(lambda: self.app_selection_requested.emit(self.strip.uid))
             
-            # --- ALIGNMENT FIX: Retain space when hidden (Placeholder effect) ---
             sp = self.btn_apps.sizePolicy()
             sp.setRetainSizeWhenHidden(True)
             self.btn_apps.setSizePolicy(sp)
-            
             dev_layout.addWidget(self.btn_apps)
             
+            # --- EFFECTS SECTION ---
+            self._init_fx_section(dev_layout)
+
             self._update_app_btn_visibility()
 
         # --- 3. Routing Area ---
@@ -210,45 +211,31 @@ class StripWidget(QFrame):
 
         # --- 4. Volume Fader & VU Meters ---
         fader_area_layout = QHBoxLayout()
-        fader_area_layout.setSpacing(4) # Space between meter and slider
+        fader_area_layout.setSpacing(4)
         
-        # Left VU Meter
         self.vu_left = VUMeterWidget()
         fader_area_layout.addWidget(self.vu_left)
         
-        # Slider
         self.slider = QSlider(Qt.Vertical)
         self.slider.setRange(0, 100)
         self.slider.setValue(int(self.strip.volume * 100))
         self.slider.setStyleSheet("""
-            QSlider::groove:vertical {
-                background: #222;
-                width: 6px;
-                border-radius: 2px;
-            }
-            QSlider::handle:vertical {
-                background: white;
-                height: 14px;
-                margin: 0 -4px;
-                border-radius: 3px;
-            }
+            QSlider::groove:vertical { background: #222; width: 6px; border-radius: 2px; }
+            QSlider::handle:vertical { background: white; height: 14px; margin: 0 -4px; border-radius: 3px; }
             QSlider::add-page:vertical { background: #555; }
             QSlider::sub-page:vertical { background: #222; }
         """)
         self.slider.valueChanged.connect(self._on_slider_move)
         fader_area_layout.addWidget(self.slider)
 
-        # Right VU Meter
         self.vu_right = VUMeterWidget()
         fader_area_layout.addWidget(self.vu_right)
-        
         layout.addLayout(fader_area_layout)
 
         # --- 5. Controls (Mute & Mono) ---
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(2)
         
-        # MONO Button
         self.btn_mono = QPushButton("MONO")
         self.btn_mono.setCheckable(True)
         self.btn_mono.setFixedWidth(45)
@@ -257,14 +244,12 @@ class StripWidget(QFrame):
         self._update_mono_style()
         controls_layout.addWidget(self.btn_mono)
 
-        # MUTE Button
         self.btn_mute = QPushButton("MUTE")
         self.btn_mute.setCheckable(True)
         self.btn_mute.setChecked(self.strip.mute)
         self.btn_mute.toggled.connect(self._on_mute_toggle)
         self._update_mute_style()
         controls_layout.addWidget(self.btn_mute)
-        
         layout.addLayout(controls_layout)
 
         # --- 6. MIDI Config ---
@@ -278,67 +263,125 @@ class StripWidget(QFrame):
         self.btn_midi.clicked.connect(self._show_midi_menu)
         layout.addWidget(self.btn_midi)
         
-        # Post-Init Update (to set correct labels/colors)
         self._refresh_device_ui_state()
+
+    def _init_fx_section(self, parent_layout):
+        """Initializes the FX toggle buttons for input strips."""
+        fx_frame = QFrame()
+        fx_layout = QHBoxLayout(fx_frame)
+        fx_layout.setContentsMargins(0, 5, 0, 5)
+        fx_layout.setSpacing(2)
+        
+        self.fx_buttons = {}
+        effects = [
+            ("gate", "GT", "Noise Gate"),
+            ("noise_cancel", "RN", "RNNoise (IA)"),
+            ("eq", "EQ", "Equalizer"),
+            ("compressor", "CP", "Compressor")
+        ]
+        
+        for key, label, tooltip in effects:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedSize(22, 18)
+            btn.setToolTip(f"{tooltip} (Right-Click to configure)")
+            btn.setCursor(Qt.PointingHandCursor)
+            
+            # Context Menu for Settings
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            # Use lambda to capture the key for this specific button
+            btn.customContextMenuRequested.connect(lambda pos, k=key: self._on_fx_context_menu(k, pos))
+            
+            # Initial state from model (Handling new structure)
+            fx_data = self.strip.effects.get(key, {})
+            # Should be a dict now, but safely handle if it was bool
+            is_active = fx_data.get('active', False) if isinstance(fx_data, dict) else fx_data
+            
+            btn.setChecked(is_active)
+            self._update_fx_button_style(btn, is_active)
+            
+            btn.toggled.connect(lambda checked, k=key, b=btn: self._on_fx_toggled(k, checked, b))
+            
+            fx_layout.addWidget(btn)
+            self.fx_buttons[key] = btn
+            
+        parent_layout.addWidget(fx_frame)
+
+    def _on_fx_context_menu(self, effect_key, pos):
+        """Opens the configuration dialog for the effect."""
+        fx_data = self.strip.effects.get(effect_key)
+        if not fx_data or not isinstance(fx_data, dict):
+            return # Should not happen with new model
+            
+        params = fx_data.get('params', {})
+        if not params:
+            return # No parameters to configure (e.g. maybe RNNoise)
+            
+        dlg = EffectSettingsDialog(effect_key, params, self)
+        # When user tweaks a slider, we update the model AND emit signal to engine
+        dlg.params_changed.connect(lambda p, v: self.effect_params_changed.emit(self.strip.uid, effect_key))
+        dlg.exec()
+
+    def _on_fx_toggled(self, effect_key, checked, button):
+        # Update Model (Structure is now {active: bool, params: dict})
+        if effect_key in self.strip.effects:
+            if isinstance(self.strip.effects[effect_key], dict):
+                self.strip.effects[effect_key]['active'] = checked
+            else:
+                # Fallback safety
+                self.strip.effects[effect_key] = checked
+                
+        self._update_fx_button_style(button, checked)
+        self.effect_toggled.emit(self.strip.uid, effect_key, checked)
+
+    def _update_fx_button_style(self, button, active):
+        if active:
+            button.setStyleSheet("""
+                QPushButton { background-color: #2ecc71; color: white; border-radius: 2px; font-size: 8px; font-weight: bold; border: none; }
+            """)
+        else:
+            button.setStyleSheet("""
+                QPushButton { background-color: #333; color: #666; border-radius: 2px; font-size: 8px; border: 1px solid #444; }
+                QPushButton:hover { background-color: #444; color: #999; }
+            """)
 
     def _style_combo(self, combo):
         combo.setStyleSheet("""
-            QComboBox {
-                background-color: #222; color: white; border: 1px solid #444; 
-                border-radius: 3px; font-size: 9px; padding: 2px;
-            }
+            QComboBox { background-color: #222; color: white; border: 1px solid #444; border-radius: 3px; font-size: 9px; padding: 2px; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView { background-color: #222; selection-background-color: #444; }
         """)
 
-    # --- Populating Data ---
-
     def set_device_list(self, devices):
-        """
-        Populates the combo box robustly.
-        """
         if not hasattr(self, 'device_combo'): return
-        
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        
-        # 1. Default Item (Virtual)
         if self.strip.kind == StripType.INPUT:
             self.device_combo.addItem("Apps / Virtual", None)
         else:
             self.device_combo.addItem("Virtual Sink (Bus)", None)
-        
         selected_index = 0
         found_current = False
-        
-        # 2. Add available devices
         for i, dev in enumerate(devices):
             name = dev.get('name')
             desc = dev.get('description', name)
             if len(desc) > 15: desc = desc[:15] + "..."
-            
             self.device_combo.addItem(desc, name)
-            
             if self.strip.device_name == name:
-                selected_index = i + 1  # +1 because of the virtual item at 0
+                selected_index = i + 1
                 found_current = True
-        
-        # 3. Handle missing device (Persistence)
         if self.strip.device_name and not found_current:
             missing_label = f"{self.strip.device_name} (Not Found)"
             if len(missing_label) > 15: missing_label = missing_label[:15] + "..."
             self.device_combo.addItem(missing_label, self.strip.device_name)
             selected_index = self.device_combo.count() - 1
-        
         self.device_combo.setCurrentIndex(selected_index)
         self.device_combo.blockSignals(False)
-        
         self._refresh_device_ui_state()
 
     def _refresh_device_ui_state(self):
         self._update_app_btn_visibility()
         self._update_base_style()
-        
         if self.strip.kind == StripType.OUTPUT and hasattr(self, 'lbl_dev_type'):
             if self.strip.device_name is None:
                 self.lbl_dev_type.setText("VIRTUAL BUS")
@@ -365,7 +408,6 @@ class StripWidget(QFrame):
             should_show = is_virtual and is_not_default
             self.btn_apps.setVisible(should_show)
 
-    # --- Renaming Logic ---
     def eventFilter(self, obj, event):
         if obj == self.lbl_name and event.type() == QEvent.MouseButtonDblClick:
             self._rename_strip()
@@ -380,10 +422,7 @@ class StripWidget(QFrame):
         menu.exec(self.lbl_name.mapToGlobal(pos))
 
     def _rename_strip(self):
-        new_name, ok = QInputDialog.getText(
-            self, "Rename Strip", "New Name:", 
-            text=self.strip.label
-        )
+        new_name, ok = QInputDialog.getText(self, "Rename Strip", "New Name:", text=self.strip.label)
         if ok and new_name:
             new_name = new_name.strip()
             if new_name:
@@ -391,25 +430,19 @@ class StripWidget(QFrame):
                 self.lbl_name.setText(new_name)
                 self.label_changed.emit(self.strip.uid, new_name)
 
-    # --- Routing ---
     def set_routing_targets(self, output_strips):
         if self.strip.kind != StripType.INPUT: return
-
         while self.routing_layout.count():
             item = self.routing_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-
         if not output_strips:
             self.routing_layout.addWidget(self.lbl_no_route)
             return
-
         for out_strip in output_strips:
             btn = QPushButton(out_strip.label[:4].upper())
             btn.setCheckable(True)
-            btn.setToolTip(f"Send to {out_strip.label}")
             btn.setFixedHeight(20)
-            is_active = out_strip.uid in self.strip.routes
-            btn.setChecked(is_active)
+            btn.setChecked(out_strip.uid in self.strip.routes)
             btn.setStyleSheet(f"""
                 QPushButton {{ background-color: #333; color: #888; border: 1px solid #444; border-radius: 3px; font-size: 9px; }}
                 QPushButton:checked {{ background-color: #4caf50; color: white; border: 1px solid #4caf50; }}
@@ -425,7 +458,6 @@ class StripWidget(QFrame):
             if target_uid in self.strip.routes: self.strip.routes.remove(target_uid)
         self.route_changed.emit(self.strip.uid, target_uid, checked)
 
-    # --- Standard Logic ---
     def _show_midi_menu(self):
         menu = QMenu(self)
         act_vol = QAction("Learn Volume", self)
@@ -434,10 +466,8 @@ class StripWidget(QFrame):
         act_mute.triggered.connect(lambda: self.midi_learn_requested.emit(self.strip.uid, "mute"))
         act_mono = QAction("Learn Mono", self)
         act_mono.triggered.connect(lambda: self.midi_learn_requested.emit(self.strip.uid, "mono"))
-        
         act_clear = QAction("Clear Mappings", self)
         act_clear.triggered.connect(self._clear_midi)
-        
         menu.addAction(act_vol)
         menu.addAction(act_mute)
         menu.addAction(act_mono)
@@ -476,19 +506,28 @@ class StripWidget(QFrame):
         self.slider.blockSignals(True)
         self.slider.setValue(int(self.strip.volume * 100))
         self.slider.blockSignals(False)
-        
         self.btn_mute.blockSignals(True)
         self.btn_mute.setChecked(self.strip.mute)
         self.btn_mute.blockSignals(False)
         self._update_mute_style()
-        
         self.btn_mono.blockSignals(True)
         self.btn_mono.setChecked(self.strip.is_mono)
         self.btn_mono.blockSignals(False)
         self._update_mono_style()
-        
         if hasattr(self, 'cb_default'):
             self.set_default_state(self.strip.is_default)
+            
+        # Update FX buttons
+        if hasattr(self, 'fx_buttons'):
+            for key, btn in self.fx_buttons.items():
+                # Handle dictionary structure
+                fx_data = self.strip.effects.get(key, {})
+                active = fx_data.get('active', False) if isinstance(fx_data, dict) else fx_data
+                
+                btn.blockSignals(True)
+                btn.setChecked(active)
+                self._update_fx_button_style(btn, active)
+                btn.blockSignals(False)
 
     def _check_and_send_volume(self):
         current_vol = round(self.strip.volume, 2)
@@ -524,17 +563,8 @@ class StripWidget(QFrame):
         self.delete_requested.emit(self.strip.uid)
 
     def update_vumeter(self, left, right):
-        """Called by main window to update visual levels."""
-        
-        # --- MONO METER FIX ---
         if self.strip.is_mono:
-            # If mono is active, we display the max signal on both bars
-            # to visually confirm the signal is present and balanced.
             mono_val = max(left, right)
-            left = mono_val
-            right = mono_val
-
-        if hasattr(self, 'vu_left'):
-            self.vu_left.set_level(left)
-        if hasattr(self, 'vu_right'):
-            self.vu_right.set_level(right)
+            left = right = mono_val
+        if hasattr(self, 'vu_left'): self.vu_left.set_level(left)
+        if hasattr(self, 'vu_right'): self.vu_right.set_level(right)

@@ -1,110 +1,95 @@
-## 1. Project Overview
+# PROJECT CONTEXT - HOLAF MIX
+
+    ## 1. Project Overview
     - **Goal**: Linux audio mixer (Voicemeeter-like) using PipeWire and PySide6.
-    - **Current Phase**: **STABILIZATION & FEATURE COMPLETION**.
+    - **Target Platform**: CachyOS / Arch Linux.
+    - **Current Phase**: **STABILIZATION & TUNING**.
     - **Status**: 
-        - Functional Audio & MIDI Engine.
-        - Reliable App Routing & Hardware Volume control.
-        - **STABLE**: VU Meters work for Inputs, Virtual strips, and Physical Outputs.
-        - **SOLVED**: Virtual Output Busses (B1/B2) are now exposed as proper Input Devices to third-party apps (Discord/TeamSpeak) via `module-remap-source`.
-        - **POLISHED**: Window geometry persistence, "Always on Top" mode, and System Tray integration.
-        - **NEW**: MIDI Feedback (Controller LEDs light up for Mute/Mono states).
+        - **Core Audio**: Functional (Virtual Strips, Physical Routing, Exclusive Source Logic).
+        - **UI**: Functional (VU Meters, Faders, Buttons, Right-Click FX Settings).
+        - **FX Engine**: **FUNCTIONAL**. Node creation works, parameters are dynamic, specific effects (RNNoise) confirmed working.
+        - **Discovery**: `pw-dump` via `pipewire_utils.py` (Stable).
 
     ## 2. Architecture (Hybrid MVC)
-    - **Model**: `Strip` class. Single source of truth. Includes `is_mono` state and persistence data.
-    - **View (UI)**: `MainWindow` (System Tray, Geometry Management) and `StripWidget`.
-    - **Controller (Backend)**: 
-        - `AudioEngine`: Manages PipeWire Graph, Routing, Mute/Volume logic, Mono Downmixing, and **Remapping Sources**.
-        - `MidiEngine`: Handles Hardware MIDI events (Notes & CC) AND **Feedback (Output)**.
-        - `MeteringEngine`: **Async & Thread-Safe**.
-    - **Data Flow**: 
-        - **UI Input**: Slider/Button -> Update Model -> Signal -> `MainWindow` -> `AudioEngine` -> PipeWire.
-        - **MIDI Input**: Controller -> `MidiEngine` -> Signal -> `MainWindow` -> UI & AudioEngine.
-        - **MIDI Output**: UI Change -> `MainWindow` -> `MidiEngine.send_feedback()` -> Controller LED.
-        - **Meters**: PipeWire -> `sounddevice` -> Threaded Callback -> UI Timer (20FPS).
+    - **Model**: `Strip` class.
+        - **Update**: Effects are now stored as dictionaries `{'active': bool, 'params': {key: value}}` instead of simple booleans.
+        - **Migration**: `from_dict` automatically converts old config files.
+    - **Controller**: `AudioEngine` (Backend).
+        - **FX Hosting**: Uses a persistent `subprocess.Popen(['pw-cli'], stdin=PIPE)`.
+        - **Routing**: **Exclusive Source Strategy**. When switching between Raw and FX sources, the engine explicitly disconnects (`_unlink_nodes`) the unused source to prevent signal doubling (Anti-Gate issue).
+        - **Param Parsing**: Converts Model parameters into SPA-JSON for `filter-chain`.
+    - **View**: `MainWindow` -> `StripWidget`.
+        - **New**: `EffectSettingsDialog` (Dynamic slider generation based on effect type).
 
-    ## 3. Project File Structure (Map & Responsibilities)
-
+    ## 3. Project File Structure
     ```text
     Holaf_Mix/
-    ├── main.py                     # [ENTRY POINT] Bootstrapper.
-    ├── pipewire_utils.py           # [LOW-LEVEL] Wrapper for `pw-cli`, `pw-dump`.
-    ├── config.json                 # [PERSISTENCE] Stores Strips state & Window Geometry.
-    ├── project_context.md          # [MEMORY] Project state and rules.
-    ├── requirements.txt            # [DEPENDENCIES] PySide6, mido, python-rtmidi, sounddevice, numpy.
+    ├── main.py                     # [ENTRY POINT]
+    ├── config.json                 # [PERSISTENCE]
+    ├── project_context.md          # [MEMORY]
+    ├── requirements.txt            # [DEPENDENCIES]
     │
     ├── src/
     │   ├── backend/
-    │   │   ├── audio_engine.py     # [CONTROLLER] Manages Nodes, Links, Mono logic & Source Remapping.
-    │   │   ├── midi_engine.py      # [CONTROLLER] MIDI I/O. Handles Learn Mode & LED Feedback.
-    │   │   └── metering.py         # [CONTROLLER] Async Sounddevice engine.
+    │   │   ├── audio_engine.py     # [CORE] Routing Logic, FX Graph Generation (SPA-JSON).
+    │   │   ├── midi_engine.py      # [MIDI] Hardware integration.
+    │   │   ├── metering.py         # [METERING] Threaded peak detection.
+    │   │   └── pipewire_utils.py   # [LOW-LEVEL] `pw-dump` wrapper & regex parsing.
     │   │
     │   ├── config/
-    │   │   └── settings.py         # [IO] JSON Serialization (Strips + Window State).
+    │   │   └── settings.py         # [IO]
     │   │
     │   ├── models/
-    │   │   └── strip_model.py      # [MODEL] Data structure (added is_mono, midi_mono).
+    │   │   └── strip_model.py      # [MODEL] Includes new Effect Parameter structure.
     │   │
     │   └── ui/
-    │       ├── main_window.py      # [VIEW] Orchestrates UI, System Tray, Window Flags, MIDI Sync.
+    │       ├── main_window.py      # [VIEW] Main container.
+    │       ├── dialogs/
+    │       │   └── effect_settings_dialog.py # [VIEW] Dynamic sliders for FX parameters.
     │       └── widgets/
-    │           └── strip_widget.py # [VIEW] Visual VUMeterWidget. Includes Throttling & Alignment logic.
+    │           └── strip_widget.py # [VIEW] Strip controls & Right-click context menu.
     ```
 
-    ## 4. Technical Implementation Details (State: Jan 07, 2026)
+    ## 4. Technical Implementation Details
 
-    ### Audio Engine Logic
-    - **Virtual Bus Creation**: 
-        1. Creates `module-null-sink`.
-        2. Identifies the auto-generated monitor.
-        3. Creates a **`module-remap-source`** pointing to that monitor. This "blanches" the stream so apps see it as a microphone, not a monitor.
-    - **Routing & Mono**: 
-        - Standard Stereo: FL->FL, FR->FR.
-        - Mono Mode: Cross-links all source channels to all destination channels.
-    - **Mute Logic**: Muting a Sink also mutes its Monitor.
+    ### Native Effect Engine
+    - **Method**: "Persistent Host" (pw-cli).
+    - **Format**: SPA-JSON generated dynamically from Python dictionaries.
+    - **Graph**: Stereo (Dual Mono). Creates `Node_L` and `Node_R` for each LADSPA plugin.
+    - **Parameter Handling**:
+        - **Gate**: Threshold, Attack, Release, Hold.
+        - **Compressor**: Threshold, Ratio, Attack, Release, Makeup Gain.
+        - **EQ**: 15-Band Graphic EQ (mbeq).
+        - **RNNoise**: VAD Threshold (Placeholder).
 
-    ### MIDI Logic
-    - **Learning Mode**: Can learn Volume (Axis/Fader), Mute (Button), and Mono (Button).
-    - **Differentiation**: 
-        - Volume uses raw value (0-127).
-        - Buttons (Mute/Mono) toggle on NoteOn/ControlChange with velocity > 0.
-    - **Feedback (LEDs)**:
-        - Uses `mido.open_output` on the same port name.
-        - Sends `NoteOn` with Velocity 127 (ON) or 0 (OFF).
-        - Synced on App Startup & UI interaction.
+    ### Audio Routing Strategy (Refined)
+    - **Virtual Strips**: `module-null-sink`.
+    - **Exclusive Linking**: 
+        - Before connecting `FX_Output -> Bus`, the engine **MUST** disconnect `Physical_Source -> Bus`.
+        - Before connecting `Physical_Source -> Bus`, the engine **MUST** disconnect `FX_Output -> Bus`.
+    - **Mono**: 
+        - Uses `_unlink_nodes` to clear Stereo links before applying Mono logic (`L->L, L->R`).
+        - Robust Regex `r"(?:[\d]+:\s*)?(?:[\|\-><\s]+)?(" + re.escape(node_name) + r":\S+)"` handles `pw-link` tree output.
 
-    ### UI Logic
-    - **Window Behavior**: 
-        - Always on Top.
-        - Close button (X) minimizes to System Tray.
-        - Position and Size are saved/restored on restart.
-    - **Visuals**:
-        - VU Meters refresh at 20Hz.
-        - Mono Mode forces VU meters to display the max signal on both bars.
-        - Buttons are properly aligned using `RetainSizeWhenHidden` policies.
+    ## 5. Resolved Issues (History)
 
-    ## 5. Features Status
-    - [x] **Core Audio**: Create/Delete Virtual Strips, Detect Physical Devices.
-    - [x] **Hardware Routing**: Mics to Inputs, Outputs to Speakers.
-    - [x] **Volume/Mute Control**: Syncs UI, Sink, and Hardware Monitor.
-    - [x] **App Routing**: Apps strictly follow their assigned strip.
-    - [x] **Default Sink**: Checkbox to define system-wide default output.
-    - [x] **Virtual Busses**: Creation logic & UI feedback.
-    - [x] **Mono Mode**: UI, Audio Engine, and MIDI support.
-    - [x] **Exposure to Apps**: Virtual Bus Monitors are remapped and visible in Discord/TeamSpeak.
-    - [x] **Persistence**: Strips state and Window geometry saved.
-    - [x] **System Tray**: App runs in background, minimizes to tray.
-    - [x] **MIDI Feedback**: Buttons on controller light up to reflect Mute/Mono state.
+    ### A. The "Anti-Gate" (RESOLVED)
+    - **Symptom**: Dry signal persisted when Gate was ON.
+    - **Fix**: Implemented `_unlink_nodes` in `_create_link` to enforce exclusive signal path (Dry OR Wet, never both).
 
-    ## 6. Known Considerations & Issues
-    - **ALSA Latency**: On system load, opening a stream might take seconds (Handled by async metering).
-    - **System Tray**: Requires a desktop environment that supports Status Notifiers (Gnome, KDE, XFCE support this well).
+    ### B. Mono Behavior (RESOLVED)
+    - **Symptom**: "Left Only" sound when Mono enabled on FX.
+    - **Fix**: Improved `_auto_link_ports` regex to detect non-standard port names and force cleanup of old links.
 
-    ## 7. Roadmap (Next Steps)
-    1.  **Refactoring**: Clean up redundant code in `audio_engine.py` (optimize node lookup).
-    2.  **Visual Polish**: Improve Routing buttons styling (make them more distinct).
-    3.  **Packaging**: Prepare for standalone distribution (PyInstaller).
+    ### C. Link Detection False Negatives (RESOLVED)
+    - **Symptom**: Engine retrying links endlessly.
+    - **Fix**: Added support for French locale error message ("Le fichier existe") in `_pw_link`.
 
-    ## 8. Project Identity & Disclaimer
-    - **AI Generated**: 100% of this codebase was generated by an AI assistant.
-    - **Personal Tool**: Built for a specific hardware configuration.
-    - **No Support**: No guarantee of compatibility with other systems. Use at your own risk.
+    ### D. Effect Logic Crash (RESOLVED)
+    - **Symptom**: All effects trying to load simultaneously even if disabled.
+    - **Fix**: Corrected Python "Truthiness" check. `if strip.effects['gate']` became `if strip.effects['gate']['active']`.
+
+    ## 6. Next Steps / TODO
+    - **Parameter Tuning**: Default values for EQ and Compressor need testing to avoid saturation (Current defaults set to safe values: EQ Flat, Gain 0dB).
+    - **Real-time Updates**: Currently, changing a parameter requires reloading the FX chain (Logic pending in `update_fx_params`).
+    - **Visual Feedback**: Add Gain Reduction metering for Compressor/Gate (Advanced).

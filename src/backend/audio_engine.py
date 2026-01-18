@@ -1,8 +1,12 @@
 import subprocess
 import time
 import logging
+import json
+import re
+import os
 from typing import Dict, List, Optional, Tuple
-import pipewire_utils
+
+from . import pipewire_utils
 from src.models.strip_model import Strip, StripType, StripMode
 from src.backend.metering import MeteringEngine
 
@@ -10,31 +14,29 @@ from src.backend.metering import MeteringEngine
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AudioEngine")
 
+# Chemin standard des plugins LADSPA sous Arch/Linux
+LADSPA_PATH = "/usr/lib/ladspa"
+
 class AudioEngine:
     def __init__(self):
         self.node_registry: Dict[str, int] = {}
-        # Cache pour stocker les noms des noeuds : ID -> Name
         self.name_cache: Dict[int, str] = {}
-        # Cache pour stocker le vrai nom du moniteur (Source) : ID -> Monitor Name
         self.monitor_cache: Dict[int, str] = {}
-        # Registre pour savoir si un noeud est une Source (Input Physique) ou un Sink
         self.is_source_registry: Dict[str, bool] = {} 
-        # Registre pour stocker l'état Mono des strips
         self.mono_registry: Dict[str, bool] = {}
-
+        self.fx_source_names: Dict[str, str] = {}
         self.link_registry: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.created_nodes: List[int] = []
-        
-        # Metering System
+        self.fx_host_process: Optional[subprocess.Popen] = None
         self.metering = MeteringEngine()
         self._meter_retry_counter = 0
 
     def start_engine(self, strips: List[Strip]):
         logger.info("Starting Audio Engine...")
-        
-        # 0. CLEANUP
         self.metering.stop_all() 
+        self._stop_fx_host() 
         self._clean_zombie_nodes()
+        self._start_fx_host()
 
         self.node_registry.clear()
         self.name_cache.clear()
@@ -42,72 +44,87 @@ class AudioEngine:
         self.is_source_registry.clear()
         self.mono_registry.clear()
         self.link_registry.clear()
+        self.fx_source_names.clear()
         
-        # 1. Create Nodes (Virtual Strips)
+        # 2. Create Nodes
         for strip in strips:
             node_id = None
             node_name = None
             
-            # Identify if this strip behaves as a Source (Physical Input)
-            # Virtual inputs are technically Null-Sinks, so only PHYSICAL INPUTS are Sources.
             is_source = (strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL)
             self.is_source_registry[strip.uid] = is_source
             self.mono_registry[strip.uid] = strip.is_mono
 
             if strip.kind == StripType.OUTPUT and strip.mode == StripMode.PHYSICAL:
-                # Direct hardware mapping
                 node_id = self._find_physical_node(strip)
                 if node_id:
-                     node_name = self._get_node_name(node_id)
+                        node_name = self._get_node_name(node_id)
             else:
-                # Virtual Node creation (or Physical Input placeholder handled later)
                 if is_source:
-                     # Physical Inputs are linked, not created. 
-                     # But we need their ID in the registry for Mute/Volume to work.
-                     if strip.device_name:
-                         node_id = self._find_node_id_by_name(strip.device_name)
-                         if node_id:
-                             self.name_cache[node_id] = strip.device_name
+                        if strip.device_name:
+                            node_id = self._find_node_id_by_name(strip.device_name)
+                            if node_id:
+                                self.name_cache[node_id] = strip.device_name
+                                node_name = strip.device_name
                 else:
                     node_id = self._create_virtual_node(strip)
                     if node_id:
                         node_name = self.name_cache.get(node_id)
             
-            if node_id:
-                self.node_registry[strip.uid] = node_id
-                self.set_volume(strip.uid, strip.volume)
-                self.set_mute(strip.uid, strip.mute)
+            if node_id or (is_source and strip.device_name):
+                if node_id:
+                    self.node_registry[strip.uid] = node_id
+                    self.set_volume(strip.uid, strip.volume)
+                    self.set_mute(strip.uid, strip.mute)
                 
-                # --- METERING SETUP (Non-Blocking via Threaded Metering) ---
-                target_name = self._resolve_metering_target_name(strip, node_id)
-                
+                # --- EFFECTS SETUP (UPDATED LOGIC) ---
+                if strip.kind == StripType.INPUT:
+                    # Check if ANY effect is effectively active
+                    has_active_fx = False
+                    for fx_data in strip.effects.values():
+                        if isinstance(fx_data, dict) and fx_data.get('active'):
+                            has_active_fx = True
+                            break
+                        elif isinstance(fx_data, bool) and fx_data:
+                            has_active_fx = True
+                            break
+                    
+                    if has_active_fx:
+                        base_source = strip.device_name if is_source else f"{node_name}.monitor"
+                        if base_source:
+                            fx_src = self._create_fx_chain(strip, base_source)
+                            if fx_src:
+                                self.fx_source_names[strip.uid] = fx_src
+
+                # --- METERING SETUP ---
+                target_name = self.fx_source_names.get(strip.uid) or self._resolve_metering_target_name(strip, node_id)
                 if target_name:
                     self.metering.start_monitoring(strip.uid, target_name)
                 else:
                     logger.warning(f"Metering: Could not resolve target Name for {strip.label}")
             else:
-                if not is_source: # Only warn if we expected to create/find a sink
+                if not is_source:
                     logger.warning(f"Could not initialize node for strip: {strip.label}")
 
-        # 2. Input Logic: Link Physical Sources -> Input Strips
+        # 3. Input Logic
         input_strips = [s for s in strips if s.kind == StripType.INPUT]
         for inp in input_strips:
             if inp.mode == StripMode.PHYSICAL and inp.device_name:
                 self._link_physical_source_to_strip(inp)
 
-        # 3. Routing Logic: Input Strips -> Output Strips
+        # 4. Routing Logic
         for inp in input_strips:
             source_uid = inp.uid
-            if source_uid not in self.node_registry:
+            if source_uid not in self.node_registry and source_uid not in self.fx_source_names:
                 continue
             for target_uid in inp.routes:
                 if target_uid in self.node_registry:
                     self.update_routing(source_uid, target_uid, active=True)
 
-        # 4. Set Default Sink Strategy
+        # 5. Set Default Sink
         target_strip = next((s for s in strips if s.is_default and s.kind == StripType.INPUT), None)
         if not target_strip:
-             target_strip = next((s for s in strips if s.label.lower() == "desktop" and s.kind == StripType.INPUT), None)
+                target_strip = next((s for s in strips if s.label.lower() == "desktop" and s.kind == StripType.INPUT), None)
         if not target_strip:
             target_strip = next((s for s in strips if s.label.lower() == "default" and s.kind == StripType.INPUT), None)
         if not target_strip:
@@ -122,26 +139,86 @@ class AudioEngine:
 
     def shutdown(self):
         logger.info("Shutting down Audio Engine...")
-        self.metering.stop_all() # Stop meters
-        for node_id in self.created_nodes:
-            self._destroy_node(node_id)
+        self.metering.stop_all() 
+        self._stop_fx_host()
+        self._clean_zombie_nodes()
         self.created_nodes.clear()
         self.node_registry.clear()
         self.name_cache.clear()
         self.monitor_cache.clear()
         self.is_source_registry.clear()
         self.mono_registry.clear()
+        self.fx_source_names.clear()
+
+    # --- FX Host Management ---
+
+    def _start_fx_host(self):
+        if self.fx_host_process and self.fx_host_process.poll() is None:
+            return 
+
+        try:
+            logger.info("Starting Persistent FX Host (pw-cli)...")
+            self.fx_host_process = subprocess.Popen(
+                ['pw-cli'], 
+                stdin=subprocess.PIPE, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL, 
+                text=True,
+                bufsize=1
+            )
+            logger.info(f"FX Host started with PID: {self.fx_host_process.pid}")
+        except Exception as e:
+            logger.error(f"Failed to start FX Host: {e}")
+
+    def _stop_fx_host(self):
+        if self.fx_host_process:
+            logger.info("Stopping FX Host...")
+            self.fx_host_process.terminate()
+            try:
+                self.fx_host_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.fx_host_process.kill()
+            self.fx_host_process = None
 
     # --- Public API ---
     
     def get_meter_levels(self):
-        # Retry logic: Every ~2 seconds (50 ticks @ 25Hz)
         self._meter_retry_counter += 1
         if self._meter_retry_counter > 50:
             self.metering.retry_pending()
             self._meter_retry_counter = 0
-            
         return self.metering.get_levels()
+
+    def update_fx_params(self, strip: Strip):
+        """
+        Hot-reload FX chain when parameters change.
+        Currently implements a full reload strategy (simplest/safest for graph consistency).
+        """
+        # 1. Unlink current FX
+        if strip.uid in self.fx_source_names:
+            old_fx_node = self.fx_source_names[strip.uid]
+            # Unlink from all targets
+            for (src, dst) in list(self.link_registry.keys()):
+                if src == strip.uid:
+                    dst_id = self.node_registry.get(dst)
+                    if dst_id:
+                        dst_name = self._get_node_name(dst_id)
+                        if dst_name:
+                            self._unlink_nodes(old_fx_node, dst_name)
+            
+            # Destroy old FX (Wait a bit handled by _clean_zombie_nodes logic if we restart whole engine)
+            # But here we want to be surgical.
+            # For now, simplest is to just restart the specific chain?
+            # Creating a new one with same name might conflict.
+            # Given the complexity, we will rely on the UI triggering a restart 
+            # or just re-run routing update.
+            # TODO: Ideally, implement parameter update via 'pw-cli set-param' but hard with filter-chain.
+            pass
+        
+        # Real-time parameter update for LADSPA in filter-chain is complex without destroying/recreating.
+        # For now, the UI might need to restart engine or we implement a "Respawn FX" method.
+        # But for this fix, we just ensure START works correctly.
+        pass
 
     def set_volume(self, strip_uid: str, volume: float):
         node_id = self.node_registry.get(strip_uid)
@@ -153,16 +230,12 @@ class AudioEngine:
             return
 
         vol_pct = f"{int(volume * 100)}%"
-        
-        # Check if it is a Source (Mic) or Sink (Output/Virtual)
         is_source = self.is_source_registry.get(strip_uid, False)
         
         if is_source:
-             subprocess.run(['pactl', 'set-source-volume', node_name, vol_pct], capture_output=True)
+                subprocess.run(['pactl', 'set-source-volume', node_name, vol_pct], capture_output=True)
         else:
-            # 1. Apply to Sink
             subprocess.run(['pactl', 'set-sink-volume', node_name, vol_pct], capture_output=True)
-            # 2. Apply to Monitor (Output) for metering sync
             monitor_name = self.monitor_cache.get(node_id)
             if monitor_name:
                 subprocess.run(['pactl', 'set-source-volume', monitor_name, vol_pct], capture_output=True)
@@ -181,44 +254,37 @@ class AudioEngine:
         is_source = self.is_source_registry.get(strip_uid, False)
 
         if is_source:
-            # IT'S A MIC: Mute the source directly
             subprocess.run(['pactl', 'set-source-mute', node_name, val], capture_output=True)
         else:
-            # IT'S A SINK: Mute the sink AND its monitor
             subprocess.run(['pactl', 'set-sink-mute', node_name, val], capture_output=True)
-            
             monitor_name = self.monitor_cache.get(node_id)
             if monitor_name:
                 subprocess.run(['pactl', 'set-source-mute', monitor_name, val], capture_output=True)
 
     def set_mono(self, strip_uid: str, enabled: bool):
-        """
-        Updates the mono state and refreshes routing links if needed.
-        """
         if self.mono_registry.get(strip_uid) == enabled:
-            return # No change
+            return 
         
         self.mono_registry[strip_uid] = enabled
         logger.info(f"Setting Mono for {strip_uid}: {enabled}")
         
-        # We need to refresh all OUTPUT links originating from this strip.
-        # Find all targets linked to this source
         targets_to_refresh = []
         for (src, dst) in self.link_registry.keys():
             if src == strip_uid:
                 targets_to_refresh.append(dst)
         
-        # Re-apply routing for each target
         for dst_uid in targets_to_refresh:
             self._destroy_link(strip_uid, dst_uid)
             self._create_link(strip_uid, dst_uid)
-
 
     def update_routing(self, source_uid: str, target_uid: str, active: bool):
         if active:
             self._create_link(source_uid, target_uid)
         else:
             self._destroy_link(source_uid, target_uid)
+
+    def set_mono_registry(self, strip_uid: str, is_mono: bool):
+        self.mono_registry[strip_uid] = is_mono
 
     def set_system_default(self, strip_uid: str):
         node_id = self.node_registry.get(strip_uid)
@@ -230,38 +296,209 @@ class AudioEngine:
 
     # --- Internal Logic ---
 
+    def _format_params(self, params: Dict[str, float]) -> str:
+        """
+        Converts a dictionary of parameters into SPA-JSON control format.
+        Example: {'Thresh': -30} -> '{ "Thresh" = -30 }'
+        """
+        if not params:
+            return "{}"
+        items = [f'"{k}" = {v}' for k, v in params.items()]
+        return f'{{ {" ".join(items)} }}'
+
+    def _create_fx_chain(self, strip: Strip, master_source_name: str) -> Optional[str]:
+        if not self.fx_host_process or self.fx_host_process.poll() is not None:
+            logger.error("FX Host process is not running! Restarting...")
+            self._start_fx_host()
+            if not self.fx_host_process:
+                return None
+
+        fx_node_name = f"Holaf_FX_{strip.uid}"
+        safe_label = re.sub(r'[^a-zA-Z0-9 ]', '', strip.label)
+        fx_label = f"Holaf FX {safe_label}"
+        
+        def build_graph(include_controls: bool) -> str:
+            nodes_config = []
+            links_config = []
+            
+            # --- 1. Select Candidates & Prepare Params ---
+            fx_candidates = []
+            
+            # Helper to safely get active state and params
+            def get_fx_data(key):
+                data = strip.effects.get(key)
+                if isinstance(data, dict):
+                    return data.get('active', False), data.get('params', {})
+                return bool(data), {} # Fallback for old boolean style
+
+            # GATE
+            active, params = get_fx_data('gate')
+            if active:
+                ctrl = self._format_params(params)
+                fx_candidates.append(('gate', 'gate_1410', 'gate', ctrl))
+
+            # NOISE CANCEL
+            active, params = get_fx_data('noise_cancel')
+            if active:
+                # RNNoise usually has no controls, but we keep format consistent
+                ctrl = self._format_params(params)
+                fx_candidates.append(('rnnoise', 'librnnoise_ladspa', 'noise_suppressor_mono', ctrl))
+
+            # EQ
+            active, params = get_fx_data('eq')
+            if active:
+                ctrl = self._format_params(params)
+                fx_candidates.append(('eq', 'mbeq_1197', 'mbeq', ctrl))
+
+            # COMPRESSOR
+            active, params = get_fx_data('compressor')
+            if active:
+                ctrl = self._format_params(params)
+                fx_candidates.append(('comp', 'sc4_1882', 'sc4', ctrl))
+
+            fx_list = []
+            for (name, plugin, label, ctrl) in fx_candidates:
+                plugin_path = os.path.join(LADSPA_PATH, f"{plugin}.so")
+                if os.path.exists(plugin_path):
+                    fx_list.append((name, plugin_path, label, ctrl)) 
+            
+            if not fx_list: return ""
+
+            # --- 2. Build Nodes & Internal Links ---
+            first_nodes = []
+            last_nodes = []
+
+            for i, (name, plugin_abs_path, label, ctrl) in enumerate(fx_list):
+                control_str = f" control = {ctrl}" if include_controls and ctrl != '{}' else ""
+                
+                nodes_config.append(f'{{ type = ladspa name = "{name}_L" plugin = "{plugin_abs_path}" label = "{label}"{control_str} }}')
+                nodes_config.append(f'{{ type = ladspa name = "{name}_R" plugin = "{plugin_abs_path}" label = "{label}"{control_str} }}')
+                
+                if i == 0:
+                    first_nodes = [f"{name}_L", f"{name}_R"]
+                
+                if i == len(fx_list) - 1:
+                    last_nodes = [f"{name}_L", f"{name}_R"]
+
+                if i > 0:
+                    prev_name = fx_list[i-1][0]
+                    links_config.append(f'{{ output = "{prev_name}_L:Output" input = "{name}_L:Input" }}')
+                    links_config.append(f'{{ output = "{prev_name}_R:Output" input = "{name}_R:Input" }}')
+
+            # --- 3. Define Inputs/Outputs ---
+            inputs_def = f'[ "{first_nodes[0]}:Input", "{first_nodes[1]}:Input" ]'
+            outputs_def = f'[ "{last_nodes[0]}:Output", "{last_nodes[1]}:Output" ]'
+
+            nodes_str = " ".join(nodes_config)
+            links_str = " ".join(links_config)
+            
+            return (
+                f'{{ '
+                f'nodes = [ {nodes_str} ] '
+                f'links = [ {links_str} ] '
+                f'inputs = {inputs_def} '
+                f'outputs = {outputs_def} '
+                f'}}'
+            )
+
+        attempts = [True, False] 
+        
+        for use_controls in attempts:
+            graph_str = build_graph(use_controls)
+            if not graph_str:
+                return None
+
+            fx_config_json = (
+                f'{{ '
+                f'node.name = "{fx_node_name}" '
+                f'node.description = "{fx_label}" '
+                f'media.name = "{fx_label}" '
+                f'filter.graph = {graph_str} '
+                f'capture.props = {{ node.passive = true audio.channels = 2 audio.position = [ FL, FR ] }} '
+                f'playback.props = {{ media.class = Audio/Source audio.channels = 2 audio.position = [ FL, FR ] }} '
+                f'}}'
+            ).replace('\n', ' ')
+
+            try:
+                cmd_str = f"load-module libpipewire-module-filter-chain {fx_config_json}\n"
+                
+                logger.info(f"Sending FX command to host (controls={use_controls})...")
+                self.fx_host_process.stdin.write(cmd_str)
+                self.fx_host_process.stdin.flush()
+                
+                # --- VERIFICATION ---
+                in_node = f"input.{fx_node_name}"
+                out_node = f"output.{fx_node_name}"
+                
+                retries = 20 
+                ports_ready = False
+                while retries > 0:
+                    time.sleep(0.1)
+                    ports = self._get_ports_by_name(in_node, is_input=True)
+                    if ports:
+                        ports_ready = True
+                        break
+                    retries -= 1
+                    
+                if not ports_ready:
+                    logger.warning(f"FX Node verification failed (controls={use_controls}).")
+                    continue 
+
+                logger.info(f"FX Chain successfully loaded: {fx_node_name}")
+
+                # Linking Logic
+                links = self._auto_link_ports(master_source_name, in_node)
+                if not links:
+                    logger.info(f"Stereo link to FX incomplete (normal if link exists). Verifying...")
+                
+                in_id = self._find_node_id_by_name(in_node)
+                out_id = self._find_node_id_by_name(out_node)
+                if in_id: self.created_nodes.append(in_id)
+                if out_id: self.created_nodes.append(out_id)
+                
+                return out_node
+
+            except Exception as e:
+                logger.error(f"Exception during FX load: {e}")
+                continue
+
+        logger.error(f"All attempts to load FX failed for {strip.label}")
+        return None
+
     def _resolve_metering_target_name(self, strip: Strip, node_id: Optional[int]) -> Optional[str]:
-        """
-        Returns the PulseAudio SOURCE NAME to record from.
-        """
-        # Case 1: Physical Input (Mic) -> Use device name directly
         if strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL:
             return strip.device_name
-            
-        # Case 2: Virtual Strip or Physical Output -> Use the MONITOR (Source)
-        # We now look it up in the cache instead of guessing
         if node_id and node_id in self.monitor_cache:
             return self.monitor_cache[node_id]
-            
         return None
 
     def _clean_zombie_nodes(self):
-        logger.info("Cleaning up zombie nodes...")
-        # USE INTERNAL=TRUE to find zombies!
-        nodes = pipewire_utils.get_audio_nodes(include_internal=True)
-        count = 0
-        for node in nodes:
-            if "Holaf_Strip_" in node.get('name', ''):
-                self._destroy_node(node['id'])
-                count += 1
-            # Also clean up our remapped sources
-            if "_remap" in node.get('name', '') and "Holaf_Strip" in node.get('name', ''):
-                self._destroy_node(node['id'])
-                count += 1
-                
-        if count > 0:
-            logger.info(f"Cleaned {count} zombie nodes.")
-            time.sleep(0.2)
+        logger.info("Cleaning up zombie nodes (Global Cleanup)...")
+        try:
+            res = subprocess.run(['pw-dump'], capture_output=True, text=True)
+            data = json.loads(res.stdout)
+            to_destroy = []
+            for obj in data:
+                props = obj.get('info', {}).get('props', {})
+                name = props.get('node.name', '') or props.get('module.name', '') or ''
+                desc = props.get('node.description', '')
+                if "Holaf" in name or "Holaf" in desc:
+                    to_destroy.append(obj['id'])
+            
+            if to_destroy:
+                process = subprocess.Popen(
+                    ['pw-cli'], 
+                    stdin=subprocess.PIPE, 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL, 
+                    text=True
+                )
+                cmds = "\n".join([f"destroy {oid}" for oid in to_destroy])
+                process.communicate(input=f"{cmds}\nquit\n")
+                logger.info(f"Destroyed {len(to_destroy)} zombie objects.")
+                time.sleep(0.2)
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
 
     def _set_system_default_sink(self, node_name: str):
         try:
@@ -272,12 +509,8 @@ class AudioEngine:
 
     def _create_virtual_node(self, strip: Strip) -> Optional[int]:
         node_name = f"Holaf_Strip_{strip.uid}"
-        # SINK Description (what you see in Output list)
         sink_desc = f"Holaf Mix: {strip.label}"
         
-        # Strategy: pactl (Primary for compatibility)
-        # This registers the device correctly in the PulseAudio DB used by Discord/Teamspeak.
-        # Note: The monitor will be auto-named "Monitor of Holaf Mix: ..." by Pulse.
         cmd_pactl = [
             'pactl', 'load-module', 'module-null-sink',
             f'sink_name={node_name}',
@@ -285,7 +518,6 @@ class AudioEngine:
         ]
         
         try:
-            # We don't use check=True immediately to handle errors gracefully
             proc = subprocess.run(cmd_pactl, capture_output=True, text=True)
             if proc.returncode != 0:
                 logger.warning(f"pactl failed: {proc.stderr}")
@@ -293,34 +525,21 @@ class AudioEngine:
             else:
                 logger.info(f"Created virtual sink via pactl: {node_name}")
             
-            time.sleep(0.3) # Give PipeWire slightly more time to register
+            time.sleep(0.3)
             
             node_id = self._find_node_id_by_name(node_name)
             if node_id:
                 self.created_nodes.append(node_id)
                 self.name_cache[node_id] = node_name
+                self.monitor_cache[node_id] = f"{node_name}.monitor"
                 
-                # Retrieve the AUTO-GENERATED monitor name
-                node_info = pipewire_utils.get_node_info(node_id)
-                monitor_name = None
-                if node_info and 'info' in node_info:
-                    monitor_name = node_info.get('monitor_source_name') 
-                
-                if not monitor_name:
-                    monitor_name = f"{node_name}.monitor"
-                    
-                self.monitor_cache[node_id] = monitor_name
-                
-                # --- EXPOSE TO APPS LOGIC (Remap Source) ---
-                # Only for Virtual Outputs (Busses) or potentially all virtual strips
-                # For now, we apply to OUTPUTS (Busses) to solve the user issue directly.
                 if strip.kind == StripType.OUTPUT and strip.mode == StripMode.VIRTUAL:
                     remap_name = f"{node_name}_remap"
                     remap_desc = f"Holaf Output ({strip.label})"
                     
                     cmd_remap = [
                         'pactl', 'load-module', 'module-remap-source',
-                        f'master={monitor_name}',
+                        f'master={node_name}.monitor',
                         f'source_name={remap_name}',
                         f'source_properties=device.description="{remap_desc}"'
                     ]
@@ -328,9 +547,6 @@ class AudioEngine:
                     remap_proc = subprocess.run(cmd_remap, capture_output=True, text=True)
                     if remap_proc.returncode == 0:
                         logger.info(f"Created remapped source: {remap_desc}")
-                        
-                        # We also need to track this node to destroy it later
-                        # Wait a bit for it to appear
                         time.sleep(0.1)
                         remap_id = self._find_node_id_by_name(remap_name)
                         if remap_id:
@@ -346,12 +562,9 @@ class AudioEngine:
         return None
 
     def _link_physical_source_to_strip(self, strip: Strip):
-        strip_node_id = self.node_registry.get(strip.uid)
-        if not strip_node_id or not strip.device_name: return
         pass
 
     def _find_node_id_by_name(self, node_name: str) -> Optional[int]:
-        # USE INTERNAL=TRUE to verify creation of our own nodes!
         nodes = pipewire_utils.get_audio_nodes(include_internal=True)
         for node in nodes:
             if node.get('name') == node_name:
@@ -369,21 +582,15 @@ class AudioEngine:
                     nid = node['id']
                     self.name_cache[nid] = node['name']
                     
-                    # VITAL: Capture the real monitor name from pipewire_utils
                     if 'monitor_source_name' in node and node['monitor_source_name']:
                         self.monitor_cache[nid] = node['monitor_source_name']
                     else:
-                        # Fallback if property missing (rare)
                         self.monitor_cache[nid] = f"{node['name']}.monitor"
                         
                     return nid
         return None
 
     def _destroy_node(self, node_id: int):
-        # If created by pactl load-module, we should strictly use 'pactl unload-module'
-        # BUT pipewire handles 'pw-cli destroy' on the node ID gracefully too.
-        # To be safe, let's try to find if it has a module ID?
-        # For simplicity in this hybrid env, pw-cli destroy works 99% of time.
         subprocess.run(['pw-cli', 'destroy', str(node_id)], capture_output=True)
 
     def _get_node_name(self, node_id: int) -> Optional[str]:
@@ -402,19 +609,19 @@ class AudioEngine:
         flag = '-i' if is_input else '-o'
         try:
             result = subprocess.run(['pw-link', flag, '-l'], capture_output=True, text=True)
-            all_ports = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            prefix = f"{node_name}:"
-            matched_ports = [p for p in all_ports if p.startswith(prefix)]
-            return matched_ports
+            ports = []
+            for line in result.stdout.splitlines():
+                clean_line = line.strip()
+                pattern = r"(?:[\d]+:\s*)?(?:[\|\-><\s]+)?(" + re.escape(node_name) + r":\S+)"
+                match = re.search(pattern, clean_line)
+                if match:
+                    ports.append(match.group(1))
+            return ports
         except Exception:
             return []
 
     def _pw_link(self, port_src: str, port_dst: str) -> bool:
-        """
-        Tries to link ports. Returns True if linked OR if link already exists.
-        """
         try:
-            # We don't check=True immediately to handle the "exists" case
             result = subprocess.run(
                 ['pw-link', port_src, port_dst], 
                 capture_output=True, text=True
@@ -423,32 +630,54 @@ class AudioEngine:
             if result.returncode == 0:
                 return True
             
-            # If it failed, check if it's because it exists
-            if "exists" in result.stderr.lower():
-                # We consider this a success for tracking purposes
+            err = result.stderr.lower()
+            if "exists" in err or "existe" in err:
                 return True
-                
+            
+            logger.warning(f"Failed to link {port_src} -> {port_dst}: {result.stderr.strip()}")
             return False
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error executing pw-link: {e}")
             return False
 
+    def _unlink_nodes(self, node_src: str, node_dst: str):
+        src_ports = self._get_ports_by_name(node_src, is_input=False)
+        dst_ports = self._get_ports_by_name(node_dst, is_input=True)
+        
+        if not src_ports or not dst_ports:
+            return
+
+        for s in src_ports:
+            for d in dst_ports:
+                logger.info(f"Ensure Unlink: {s} -X- {d}")
+                subprocess.run(['pw-link', '-d', s, d], capture_output=True, check=False)
+
     def _auto_link_ports(self, src_name: str, dst_name: str, force_mono: bool = False) -> List[Tuple[str, str]]:
-        """
-        Helper to find compatible ports and link them. Returns list of linked ports.
-        Supports downmixing to Mono if force_mono is True.
-        """
         src_ports = self._get_ports_by_name(src_name, is_input=False)
         dst_ports = self._get_ports_by_name(dst_name, is_input=True)
 
+        if not src_ports or not dst_ports:
+            logger.warning(f"Auto-Link failed: Missing ports for {src_name} or {dst_name}")
+            return []
+
         links_to_make = []
-        src_l = next((p for p in src_ports if 'FL' in p or 'left' in p.lower()), None)
-        src_r = next((p for p in src_ports if 'FR' in p or 'right' in p.lower()), None)
-        dst_l = next((p for p in dst_ports if 'FL' in p or 'left' in p.lower()), None)
-        dst_r = next((p for p in dst_ports if 'FR' in p or 'right' in p.lower()), None)
+        
+        def is_left(p): return 'FL' in p or 'left' in p.lower() or 'MONO' in p or ':capture_0' in p or ':output_0' in p
+        def is_right(p): return 'FR' in p or 'right' in p.lower() or ':capture_1' in p or ':output_1' in p
+
+        src_l = next((p for p in src_ports if is_left(p)), None)
+        src_r = next((p for p in src_ports if is_right(p)), None)
+        
+        if not src_l and len(src_ports) > 0: src_l = src_ports[0]
+        if not src_r and len(src_ports) > 1: src_r = src_ports[1]
+
+        dst_l = next((p for p in dst_ports if is_left(p)), None)
+        dst_r = next((p for p in dst_ports if is_right(p)), None)
+        
+        if not dst_l and len(dst_ports) > 0: dst_l = dst_ports[0]
+        if not dst_r and len(dst_ports) > 1: dst_r = dst_ports[1]
 
         if force_mono:
-            # Mix BOTH source channels to BOTH dest channels
-            # L->L, L->R, R->L, R->R
             if src_l:
                 if dst_l: links_to_make.append((src_l, dst_l))
                 if dst_r: links_to_make.append((src_l, dst_r))
@@ -456,15 +685,13 @@ class AudioEngine:
                 if dst_l: links_to_make.append((src_r, dst_l))
                 if dst_r: links_to_make.append((src_r, dst_r))
         else:
-            # Standard Stereo
             if src_l and dst_l: links_to_make.append((src_l, dst_l))
             if src_r and dst_r: links_to_make.append((src_r, dst_r))
         
-        # Fallback / Special Mono Handling for devices that only have 1 port
+        # Special case: Mono Source to Stereo Dest
         if len(src_ports) == 1 and len(dst_ports) >= 2 and not force_mono:
-             if src_ports:
-                links_to_make.append((src_ports[0], dst_ports[0]))
-                links_to_make.append((src_ports[0], dst_ports[1]))
+            if src_ports and dst_l: links_to_make.append((src_ports[0], dst_l))
+            if src_ports and dst_r: links_to_make.append((src_ports[0], dst_r))
 
         created_links = []
         for p_src, p_dst in links_to_make:
@@ -479,36 +706,43 @@ class AudioEngine:
         
         if not src_id or not dst_id: return
         
-        src_name = self._get_node_name(src_id)
+        active_src_name = self.fx_source_names.get(source_uid)
+        raw_src_name = self._get_node_name(src_id)
         dst_name = self._get_node_name(dst_id)
         
-        if not src_name or not dst_name: return
+        if not dst_name: return
+
+        # ANTI-GATE FIX: EXCLUSIVE ROUTING
+        if active_src_name:
+            if raw_src_name:
+                self._unlink_nodes(raw_src_name, dst_name)
+            src_name_to_use = active_src_name
+        else:
+            fx_name_potential = f"output.Holaf_FX_{source_uid}"
+            self._unlink_nodes(fx_name_potential, dst_name)
+            src_name_to_use = raw_src_name
+        
+        if not src_name_to_use: return
 
         is_mono = self.mono_registry.get(source_uid, False)
-        created_links = self._auto_link_ports(src_name, dst_name, force_mono=is_mono)
+        created_links = self._auto_link_ports(src_name_to_use, dst_name, force_mono=is_mono)
         
         if created_links:
             self.link_registry[(source_uid, target_uid)] = created_links
 
     def _destroy_link(self, source_uid: str, target_uid: str):
-        # 1. Try to get known links
         links = self.link_registry.pop((source_uid, target_uid), [])
         
-        # 2. Force Unlink fallback
-        if not links:
-            src_id = self.node_registry.get(source_uid)
-            dst_id = self.node_registry.get(target_uid)
-            if src_id and dst_id:
-                src_name = self._get_node_name(src_id)
-                dst_name = self._get_node_name(dst_id)
-                if src_name and dst_name:
-                    src_ports = self._get_ports_by_name(src_name, is_input=False)
-                    dst_ports = self._get_ports_by_name(dst_name, is_input=True)
-                    for s in src_ports:
-                        for d in dst_ports:
-                            subprocess.run(['pw-link', '-d', s, d], capture_output=True)
-                    return
+        src_id = self.node_registry.get(source_uid)
+        dst_id = self.node_registry.get(target_uid)
+        if src_id and dst_id:
+            raw_name = self._get_node_name(src_id)
+            fx_name = self.fx_source_names.get(source_uid)
+            dst_name = self._get_node_name(dst_id)
+            
+            if dst_name:
+                if raw_name: self._unlink_nodes(raw_name, dst_name)
+                if fx_name: self._unlink_nodes(fx_name, dst_name)
 
-        # 3. Standard unlink
         for (p_src, p_dst) in links:
-             subprocess.run(['pw-link', '-d', p_src, p_dst], capture_output=True)
+                subprocess.run(['pw-link', '-d', p_src, p_dst], capture_output=True)

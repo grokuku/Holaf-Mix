@@ -1,4 +1,5 @@
 import uuid
+import copy
 
 class StripType:
     """Constants to define if the strip is an Input or an Output."""
@@ -13,6 +14,32 @@ class StripMode:
     """
     PHYSICAL = "physical"
     VIRTUAL = "virtual"
+
+# Default parameters to avoid saturation (EQ) and provide usable starting points
+DEFAULT_EFFECT_PARAMS = {
+    "gate": {
+        "Threshold (dB)": -30.0,
+        "Attack (ms)": 5.0,
+        "Release (ms)": 200.0,
+        "Hold (ms)": 50.0
+    },
+    "compressor": {
+        "Threshold (dB)": -15.0, # Less aggressive start
+        "Ratio (1:n)": 4.0,
+        "Attack (ms)": 20.0,
+        "Release (ms)": 300.0,
+        "Makeup Gain (dB)": 0.0  # Crucial: 0dB default to avoid blasting volume
+    },
+    "eq": {
+        # MBEQ_1197 15 bands - Default to FLAT (0.0) to prevent saturation
+        "50Hz": 0.0, "100Hz": 0.0, "156Hz": 0.0, "220Hz": 0.0, "311Hz": 0.0,
+        "440Hz": 0.0, "622Hz": 0.0, "880Hz": 0.0, "1250Hz": 0.0, "1750Hz": 0.0,
+        "2500Hz": 0.0, "3500Hz": 0.0, "5000Hz": 0.0, "10000Hz": 0.0, "20000Hz": 0.0
+    },
+    "noise_cancel": {
+        "Model": 0.0 # Placeholder if we add VAD threshold later
+    }
+}
 
 class Strip:
     def __init__(self, label, kind, mode=StripMode.VIRTUAL, uid=None):
@@ -47,6 +74,15 @@ class Strip:
         self.midi_mute = None
         self.midi_mono = None
 
+        # Effects Configuration (Only for Inputs)
+        # Structure: { "effect_name": { "active": bool, "params": { ... } } }
+        self.effects = {
+            "gate": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["gate"])},
+            "noise_cancel": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["noise_cancel"])},
+            "eq": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["eq"])},
+            "compressor": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["compressor"])}
+        }
+
     def to_dict(self):
         """Serialize the object to a dictionary for JSON saving."""
         return {
@@ -63,7 +99,8 @@ class Strip:
             'is_default': self.is_default,
             'midi_volume': self.midi_volume,
             'midi_mute': self.midi_mute,
-            'midi_mono': self.midi_mono
+            'midi_mono': self.midi_mono,
+            'effects': self.effects
         }
 
     @classmethod
@@ -85,6 +122,42 @@ class Strip:
         strip.midi_volume = data.get('midi_volume')
         strip.midi_mute = data.get('midi_mute')
         strip.midi_mono = data.get('midi_mono')
+        
+        # Migration Logic for Effects (Boolean -> Object)
+        raw_effects = data.get('effects', {})
+        normalized_effects = {}
+        
+        # Defined keys to look for
+        known_keys = ["gate", "noise_cancel", "eq", "compressor"]
+        
+        for key in known_keys:
+            val = raw_effects.get(key, False)
+            default_p = copy.deepcopy(DEFAULT_EFFECT_PARAMS.get(key, {}))
+            
+            if isinstance(val, bool):
+                # OLD FORMAT: Convert boolean to object
+                normalized_effects[key] = {
+                    "active": val,
+                    "params": default_p
+                }
+            elif isinstance(val, dict):
+                # NEW FORMAT: Validate structure
+                active = val.get("active", False)
+                params = val.get("params", default_p)
+                # Ensure missing params are filled with defaults (e.g. if we added new controls)
+                for p_key, p_val in default_p.items():
+                    if p_key not in params:
+                        params[p_key] = p_val
+                        
+                normalized_effects[key] = {
+                    "active": active,
+                    "params": params
+                }
+            else:
+                # Fallback
+                normalized_effects[key] = {"active": False, "params": default_p}
+                
+        strip.effects = normalized_effects
         
         return strip
 

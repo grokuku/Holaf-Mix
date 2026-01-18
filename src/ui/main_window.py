@@ -1,12 +1,14 @@
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                               QLabel, QScrollArea, QFrame, QPushButton, QInputDialog, QMessageBox,
-                               QDialog, QCheckBox, QDialogButtonBox, QSizePolicy, QSystemTrayIcon, QMenu, QApplication, QStyle)
+                                QLabel, QScrollArea, QFrame, QPushButton, QInputDialog, QMessageBox,
+                                QDialog, QCheckBox, QDialogButtonBox, QSizePolicy, QSystemTrayIcon, QMenu, QApplication, QStyle)
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, Slot, QTimer, QByteArray
 from PySide6.QtGui import QAction, QIcon
 from src.config import settings
 from src.models.strip_model import Strip, StripType, StripMode
 from src.ui.widgets.strip_widget import StripWidget
-import pipewire_utils 
+
+# Updated import: pipewire_utils is now located in src.backend
+from src.backend import pipewire_utils 
 
 # --- Custom Dialog for App Selection ---
 class AppSelectionDialog(QDialog):
@@ -182,8 +184,8 @@ class MainWindow(QMainWindow):
         if ports:
             target = next((p for p in ports if "mix" in p.lower()), ports[0])
             if self.midi_engine.open_port(target):
-                 # Wait a tiny bit then sync LEDs on startup
-                 QTimer.singleShot(200, self._sync_initial_midi_leds)
+                    # Wait a tiny bit then sync LEDs on startup
+                    QTimer.singleShot(200, self._sync_initial_midi_leds)
 
     def _sync_initial_midi_leds(self):
         """Updates controller LEDs to match current app state."""
@@ -353,6 +355,7 @@ class MainWindow(QMainWindow):
             widget.device_changed.connect(self.on_strip_device_changed)
             widget.app_selection_requested.connect(self.on_app_selection_requested)
             widget.default_changed.connect(self.on_strip_default_changed) 
+            widget.effect_toggled.connect(self.on_strip_effect_toggled)
             
             if strip.kind == StripType.INPUT:
                 widget.set_routing_targets(output_strips)
@@ -479,8 +482,8 @@ class MainWindow(QMainWindow):
         running_apps = pipewire_utils.get_sink_inputs()
         for strip in self.strips:
             if strip.kind == StripType.INPUT and strip.mode == StripMode.VIRTUAL:
-                 if strip.assigned_apps and not strip.is_default:
-                     self._move_apps_to_strip(strip, running_apps)
+                    if strip.assigned_apps and not strip.is_default:
+                        self._move_apps_to_strip(strip, running_apps)
 
     # --- Backend Interfacing ---
     def _run_in_background(self, func, *args):
@@ -542,3 +545,12 @@ class MainWindow(QMainWindow):
             self._save_state()
             if self.audio_engine:
                 self._run_in_background(self.audio_engine.set_system_default, uid)
+
+    def on_strip_effect_toggled(self, uid, effect_name, is_active):
+        """Called when an FX button is clicked."""
+        self._save_state()
+        if self.audio_engine:
+            def reload():
+                self.audio_engine.shutdown()
+                self.audio_engine.start_engine(self.strips)
+            self._run_in_background(reload)

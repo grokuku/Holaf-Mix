@@ -5,7 +5,7 @@
             "label": "Casque",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.0,
+            "volume": 0.4881889763779528,
             "mute": false,
             "is_mono": false,
             "routes": [],
@@ -26,6 +26,53 @@
                 "channel": 0,
                 "note": 22,
                 "type": "note_on"
+            },
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": false,
+                    "params": {
+                        "Model": 0.0
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": 0.0,
+                        "220Hz": 0.0,
+                        "311Hz": 0.0,
+                        "440Hz": 0.0,
+                        "622Hz": 0.0,
+                        "880Hz": 0.0,
+                        "1250Hz": 0.0,
+                        "1750Hz": 0.0,
+                        "2500Hz": 0.0,
+                        "3500Hz": 0.0,
+                        "5000Hz": 0.0,
+                        "10000Hz": 0.0,
+                        "20000Hz": 0.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
             }
         },
         {
@@ -54,6 +101,53 @@
                 "channel": 0,
                 "note": 27,
                 "type": "note_on"
+            },
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": false,
+                    "params": {
+                        "Model": 0.0
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": 0.0,
+                        "220Hz": 0.0,
+                        "311Hz": 0.0,
+                        "440Hz": 0.0,
+                        "622Hz": 0.0,
+                        "880Hz": 0.0,
+                        "1250Hz": 0.0,
+                        "1750Hz": 0.0,
+                        "2500Hz": 0.0,
+                        "3500Hz": 0.0,
+                        "5000Hz": 0.0,
+                        "10000Hz": 0.0,
+                        "20000Hz": 0.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
             }
         },
         {
@@ -62,7 +156,7 @@
             "kind": "input",
             "mode": "physical",
             "volume": 1.0,
-            "mute": false,
+            "mute": true,
             "is_mono": true,
             "routes": [
                 "5f2928d1-499c-41b6-961d-27926b51a70c"
@@ -84,6 +178,53 @@
                 "channel": 0,
                 "note": 1,
                 "type": "note_on"
+            },
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": true,
+                    "params": {
+                        "Model": 5.1
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": -30.0,
+                        "220Hz": -30.0,
+                        "311Hz": -30.0,
+                        "440Hz": -30.0,
+                        "622Hz": -30.0,
+                        "880Hz": -30.0,
+                        "1250Hz": -30.0,
+                        "1750Hz": -30.0,
+                        "2500Hz": -30.0,
+                        "3500Hz": -30.0,
+                        "5000Hz": -30.0,
+                        "10000Hz": -30.0,
+                        "20000Hz": -30.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
             }
         },
         {
@@ -115,6 +256,53 @@
                 "channel": 0,
                 "note": 4,
                 "type": "note_on"
+            },
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": false,
+                    "params": {
+                        "Model": 0.0
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": 0.0,
+                        "220Hz": 0.0,
+                        "311Hz": 0.0,
+                        "440Hz": 0.0,
+                        "622Hz": 0.0,
+                        "880Hz": 0.0,
+                        "1250Hz": 0.0,
+                        "1750Hz": 0.0,
+                        "2500Hz": 0.0,
+                        "3500Hz": 0.0,
+                        "5000Hz": 0.0,
+                        "10000Hz": 0.0,
+                        "20000Hz": 0.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
             }
         },
         {
@@ -131,7 +319,8 @@
             ],
             "device_name": null,
             "assigned_apps": [
-                "Firefox"
+                "Firefox",
+                "Floorp"
             ],
             "is_default": false,
             "midi_volume": {
@@ -148,6 +337,53 @@
                 "channel": 0,
                 "note": 7,
                 "type": "note_on"
+            },
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": false,
+                    "params": {
+                        "Model": 5.0
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": 0.0,
+                        "220Hz": 0.0,
+                        "311Hz": 0.0,
+                        "440Hz": 0.0,
+                        "622Hz": 0.0,
+                        "880Hz": 0.0,
+                        "1250Hz": 0.0,
+                        "1750Hz": 0.0,
+                        "2500Hz": 0.0,
+                        "3500Hz": 0.0,
+                        "5000Hz": 0.0,
+                        "10000Hz": 0.0,
+                        "20000Hz": 0.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
             }
         },
         {
@@ -164,7 +400,9 @@
             ],
             "device_name": null,
             "assigned_apps": [
-                "TeamSpeak"
+                "Chromium",
+                "TeamSpeak",
+                "WEBRTC VoiceEngine"
             ],
             "is_default": false,
             "midi_volume": {
@@ -181,6 +419,53 @@
                 "channel": 0,
                 "note": 10,
                 "type": "note_on"
+            },
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": false,
+                    "params": {
+                        "Model": 0.0
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": 0.0,
+                        "220Hz": 0.0,
+                        "311Hz": 0.0,
+                        "440Hz": 0.0,
+                        "622Hz": 0.0,
+                        "880Hz": 0.0,
+                        "1250Hz": 0.0,
+                        "1750Hz": 0.0,
+                        "2500Hz": 0.0,
+                        "3500Hz": 0.0,
+                        "5000Hz": 0.0,
+                        "10000Hz": 0.0,
+                        "20000Hz": 0.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
             }
         },
         {
@@ -190,14 +475,61 @@
             "mode": "virtual",
             "volume": 1.0,
             "mute": false,
-            "is_mono": true,
+            "is_mono": false,
             "routes": [],
             "device_name": null,
             "assigned_apps": [],
             "is_default": false,
             "midi_volume": null,
             "midi_mute": null,
-            "midi_mono": null
+            "midi_mono": null,
+            "effects": {
+                "gate": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -30.0,
+                        "Attack (ms)": 5.0,
+                        "Release (ms)": 200.0,
+                        "Hold (ms)": 50.0
+                    }
+                },
+                "noise_cancel": {
+                    "active": false,
+                    "params": {
+                        "Model": 0.0
+                    }
+                },
+                "eq": {
+                    "active": false,
+                    "params": {
+                        "50Hz": 0.0,
+                        "100Hz": 0.0,
+                        "156Hz": 0.0,
+                        "220Hz": 0.0,
+                        "311Hz": 0.0,
+                        "440Hz": 0.0,
+                        "622Hz": 0.0,
+                        "880Hz": 0.0,
+                        "1250Hz": 0.0,
+                        "1750Hz": 0.0,
+                        "2500Hz": 0.0,
+                        "3500Hz": 0.0,
+                        "5000Hz": 0.0,
+                        "10000Hz": 0.0,
+                        "20000Hz": 0.0
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Threshold (dB)": -15.0,
+                        "Ratio (1:n)": 4.0,
+                        "Attack (ms)": 20.0,
+                        "Release (ms)": 300.0,
+                        "Makeup Gain (dB)": 0.0
+                    }
+                }
+            }
         }
     ],
     "window": {
@@ -206,7 +538,7 @@
         "height": 423,
         "maximized": false
     },
-    "window_geometry": "01d9d0cb00030000000000000000000000000319000001f1000000000000000000000319000001f100000001000000000a00000000000000000000000319000001f1",
+    "window_geometry": "01d9d0cb0003000000000a000000000000000d190000025300000a000000000000000d190000025300000000000000000a0000000a000000000000000d1900000253",
     "window_state": {
         "x": 2560,
         "y": 0,
