@@ -678,12 +678,17 @@ class AudioEngine:
         if not dst_r and len(dst_ports) > 1: dst_r = dst_ports[1]
 
         if force_mono:
+            # Mono downmix: take left channel, copy to both outputs.
+            # Do NOT link src_r to dst_l/dst_r, as PipeWire SUMS linked inputs,
+            # which would add +6dB for correlated (mono) signals causing saturation.
             if src_l:
                 if dst_l: links_to_make.append((src_l, dst_l))
                 if dst_r: links_to_make.append((src_l, dst_r))
-            if src_r:
-                if dst_l: links_to_make.append((src_r, dst_l))
-                if dst_r: links_to_make.append((src_r, dst_r))
+            else:
+                # Fallback if no left channel found: use right for both
+                if src_r:
+                    if dst_l: links_to_make.append((src_r, dst_l))
+                    if dst_r: links_to_make.append((src_r, dst_r))
         else:
             if src_l and dst_l: links_to_make.append((src_l, dst_l))
             if src_r and dst_r: links_to_make.append((src_r, dst_r))

@@ -5,7 +5,7 @@
             "label": "Casque",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.4881889763779528,
+            "volume": 0.0,
             "mute": false,
             "is_mono": false,
             "routes": [],
@@ -80,7 +80,7 @@
             "label": "HP",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.0,
+            "volume": 0.33070866141732286,
             "mute": false,
             "is_mono": false,
             "routes": [],
@@ -196,7 +196,7 @@
                     }
                 },
                 "eq": {
-                    "active": false,
+                    "active": true,
                     "params": {
                         "50Hz": 0.0,
                         "100Hz": 0.0,
@@ -401,8 +401,7 @@
             "device_name": null,
             "assigned_apps": [
                 "Chromium",
-                "TeamSpeak",
-                "WEBRTC VoiceEngine"
+                "TeamSpeak"
             ],
             "is_default": false,
             "midi_volume": {
@@ -538,7 +537,7 @@
         "height": 423,
         "maximized": false
     },
-    "window_geometry": "01d9d0cb0003000000000a000000000000000d190000025300000a000000000000000d190000025300000000000000000a0000000a000000000000000d1900000253",
+    "window_geometry": "01d9d0cb00030000000000000000000000000319000002530000000000000000000003190000025300000001000000000a0000000000000000000000031900000253",
     "window_state": {
         "x": 2560,
         "y": 0,
