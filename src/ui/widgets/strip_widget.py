@@ -318,9 +318,10 @@ class StripWidget(QFrame):
             return # No parameters to configure (e.g. maybe RNNoise)
             
         dlg = EffectSettingsDialog(effect_key, params, self)
-        # When user tweaks a slider, we update the model AND emit signal to engine
-        dlg.params_changed.connect(lambda p, v: self.effect_params_changed.emit(self.strip.uid, effect_key))
+        # Dialog modifies params in-place via shared dict reference.
+        # On close, emit once to notify main_window (save + engine restart if active).
         dlg.exec()
+        self.effect_params_changed.emit(self.strip.uid, effect_key)
 
     def _on_fx_toggled(self, effect_key, checked, button):
         # Update Model (Structure is now {active: bool, params: dict})

@@ -442,6 +442,8 @@ class AudioEngine:
                     
                 if not ports_ready:
                     logger.warning(f"FX Node verification failed (controls={use_controls}).")
+                    # Clean up partially-created nodes before next attempt
+                    self._destroy_nodes_by_name_substring(fx_node_name)
                     continue 
 
                 logger.info(f"FX Chain successfully loaded: {fx_node_name}")
@@ -486,19 +488,26 @@ class AudioEngine:
                     to_destroy.append(obj['id'])
             
             if to_destroy:
-                process = subprocess.Popen(
-                    ['pw-cli'], 
-                    stdin=subprocess.PIPE, 
-                    stdout=subprocess.DEVNULL, 
-                    stderr=subprocess.DEVNULL, 
-                    text=True
-                )
-                cmds = "\n".join([f"destroy {oid}" for oid in to_destroy])
-                process.communicate(input=f"{cmds}\nquit\n")
+                for oid in to_destroy:
+                    subprocess.run(['pw-cli', 'destroy', str(oid)], capture_output=True)
                 logger.info(f"Destroyed {len(to_destroy)} zombie objects.")
                 time.sleep(0.2)
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
+
+    def _destroy_nodes_by_name_substring(self, name_substring: str):
+        """Destroy all PipeWire nodes whose node.name contains the given substring."""
+        try:
+            res = subprocess.run(['pw-dump'], capture_output=True, text=True)
+            data = json.loads(res.stdout)
+            for obj in data:
+                props = obj.get('info', {}).get('props', {})
+                name = props.get('node.name', '')
+                if name_substring in name:
+                    subprocess.run(['pw-cli', 'destroy', str(obj['id'])], capture_output=True)
+            time.sleep(0.2)
+        except Exception as e:
+            logger.error(f"Targeted node destruction failed for '{name_substring}': {e}")
 
     def _set_system_default_sink(self, node_name: str):
         try:

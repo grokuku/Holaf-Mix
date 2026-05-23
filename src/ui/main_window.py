@@ -81,6 +81,13 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(4)
         
+        # Engine restart coalescing (prevents stacking multiple restarts)
+        self._restart_pending = False
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.setInterval(200)  # 200ms debounce
+        self._restart_timer.timeout.connect(self._do_engine_restart)
+        
         self.midi_lookup = {}
         self.widgets = {}
         
@@ -356,6 +363,7 @@ class MainWindow(QMainWindow):
             widget.app_selection_requested.connect(self.on_app_selection_requested)
             widget.default_changed.connect(self.on_strip_default_changed) 
             widget.effect_toggled.connect(self.on_strip_effect_toggled)
+            widget.effect_params_changed.connect(self.on_strip_effect_params_changed)
             
             if strip.kind == StripType.INPUT:
                 widget.set_routing_targets(output_strips)
@@ -452,11 +460,7 @@ class MainWindow(QMainWindow):
                     if s.kind == StripType.INPUT and strip_to_remove.uid in s.routes:
                         s.routes.remove(strip_to_remove.uid)
             self._save_state()
-            if self.audio_engine:
-                def reload():
-                    self.audio_engine.shutdown() 
-                    self.audio_engine.start_engine(self.strips)
-                self._run_in_background(reload)
+            self._schedule_engine_restart()
             self.refresh_ui()
 
     def on_app_selection_requested(self, uid):
@@ -490,6 +494,23 @@ class MainWindow(QMainWindow):
         if self.audio_engine:
             worker = BackendWorker(func, *args)
             self.thread_pool.start(worker)
+
+    def _schedule_engine_restart(self):
+        """Coalesce engine restarts: if one is already pending, skip."""
+        if self._restart_pending:
+            return
+        self._restart_pending = True
+        self._restart_timer.start()
+
+    def _do_engine_restart(self):
+        """Execute a single engine restart after debounce period."""
+        self._restart_pending = False
+        if not self.audio_engine:
+            return
+        def reload():
+            self.audio_engine.shutdown()
+            self.audio_engine.start_engine(self.strips)
+        self._run_in_background(reload)
 
     def on_strip_volume_changed(self, uid, new_vol):
         self._run_in_background(self.audio_engine.set_volume, uid, new_vol)
@@ -526,12 +547,7 @@ class MainWindow(QMainWindow):
             strip.mode = StripMode.VIRTUAL
             strip.device_name = None
         self._save_state()
-        
-        if self.audio_engine:
-            def reload():
-                self.audio_engine.shutdown()
-                self.audio_engine.start_engine(self.strips)
-            self._run_in_background(reload)
+        self._schedule_engine_restart()
 
     def on_strip_default_changed(self, uid, is_default):
         if is_default:
@@ -549,8 +565,16 @@ class MainWindow(QMainWindow):
     def on_strip_effect_toggled(self, uid, effect_name, is_active):
         """Called when an FX button is clicked."""
         self._save_state()
-        if self.audio_engine:
-            def reload():
-                self.audio_engine.shutdown()
-                self.audio_engine.start_engine(self.strips)
-            self._run_in_background(reload)
+        self._schedule_engine_restart()
+
+    def on_strip_effect_params_changed(self, uid, effect_name):
+        """Called when FX params are modified via the settings dialog."""
+        self._save_state()
+        strip = next((s for s in self.strips if s.uid == uid), None)
+        if not strip or not self.audio_engine:
+            return
+        # Only restart engine if the modified effect is currently active
+        fx_data = strip.effects.get(effect_name, {})
+        is_active = fx_data.get('active', False) if isinstance(fx_data, dict) else bool(fx_data)
+        if is_active:
+            self._schedule_engine_restart()
