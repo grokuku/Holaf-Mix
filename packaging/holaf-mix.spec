@@ -86,7 +86,12 @@ a = Analysis(
     hiddenimports=_hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    # Runtime hooks run BEFORE main.py. The hook-email.py script
+    # force-imports the `email` stdlib package and its submodules,
+    # working around a PyInstaller bug on Python 3.12+ where the
+    # `email` parent package isn't created even though its submodules
+    # are bundled.
+    runtime_hooks=[str(SPEC_DIR / 'hooks-runtime' / 'hook-email.py')],
     # Exclude unused stdlib to shrink the bundle
     excludes=[
         'tkinter',
