@@ -55,7 +55,14 @@ a = Analysis(
     # Note: hiddenimports entries MUST be valid Python import paths
     # (e.g. "package.module"), not filesystem paths. "UNIX_JACK" in the
     # mido backend path is an internal compiler symbol, not a module.
+    #
+    # The "email.*" entries are needed because mido/setuptools use
+    # importlib.metadata which dynamically imports the email package to
+    # parse PKG-INFO files. On Python 3.12+, this import is dynamic and
+    # PyInstaller's static analysis misses it. See:
+    # https://github.com/pyinstaller/pyinstaller/issues/7713
     hiddenimports=[
+        # Audio / MIDI deps
         'sounddevice',
         '_sounddevice',
         'sounddevice._portaudio',
@@ -63,6 +70,20 @@ a = Analysis(
         'mido.backends.rtmidi',
         'rtmidi',
         '_rtmidi',
+        # Stdlib that PyInstaller's static analysis misses (Python 3.12+)
+        'email',
+        'email.message',
+        'email.parser',
+        'email.feedparser',
+        'email._policybase',
+        'email.contentmanager',
+        'email.header',
+        'email.charset',
+        'email.encoders',
+        'email.errors',
+        'email.utils',
+        'email._encoded_words',
+        'email._header_value_parser',
     ],
     hookspath=[],
     hooksconfig={},
