@@ -18,6 +18,8 @@
 from pathlib import Path
 import sys
 
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
 
 # --- Paths -------------------------------------------------------------------
@@ -37,6 +39,30 @@ ROOT = SPEC_DIR.parent
 MAIN_PY = ROOT / 'main.py'
 ICON_PNG = ROOT / 'dist' / 'icons' / 'holaf-mix-256.png'
 
+# --- Hidden imports ---------------------------------------------------------
+# mido/setuptools use importlib.metadata which dynamically imports the
+# `email` stdlib package to parse PKG-INFO files. On Python 3.12+, this
+# import is dynamic and PyInstaller's static analysis misses it. Worse,
+# the setuptools vendored copy (setuptools._vendor.importlib_metadata)
+# ALSO needs its own resolvable submodules, so we recursively include
+# every submodule via collect_submodules.
+# See: https://github.com/pyinstaller/pyinstaller/issues/7713
+_hiddenimports = [
+    # Audio / MIDI deps
+    'sounddevice',
+    '_sounddevice',
+    'sounddevice._portaudio',
+    'mido',
+    'mido.backends.rtmidi',
+    'rtmidi',
+    '_rtmidi',
+    # Stdlib `email` and all its submodules (Python 3.12+ workaround)
+    'email',
+    *collect_submodules('email'),
+    # setuptools vendored importlib_metadata used by mido for version
+    *collect_submodules('setuptools._vendor.importlib_metadata'),
+]
+
 # --- Analysis ----------------------------------------------------------------
 a = Analysis(
     [str(MAIN_PY)],
@@ -52,39 +78,12 @@ a = Analysis(
     # python-rtmidi has a dynamic backend. These hidden imports force
     # PyInstaller to include the .so modules explicitly.
     #
-    # Note: hiddenimports entries MUST be valid Python import paths
-    # (e.g. "package.module"), not filesystem paths. "UNIX_JACK" in the
-    # mido backend path is an internal compiler symbol, not a module.
-    #
-    # The "email.*" entries are needed because mido/setuptools use
-    # importlib.metadata which dynamically imports the email package to
-    # parse PKG-INFO files. On Python 3.12+, this import is dynamic and
-    # PyInstaller's static analysis misses it. See:
-    # https://github.com/pyinstaller/pyinstaller/issues/7713
-    hiddenimports=[
-        # Audio / MIDI deps
-        'sounddevice',
-        '_sounddevice',
-        'sounddevice._portaudio',
-        'mido',
-        'mido.backends.rtmidi',
-        'rtmidi',
-        '_rtmidi',
-        # Stdlib that PyInstaller's static analysis misses (Python 3.12+)
-        'email',
-        'email.message',
-        'email.parser',
-        'email.feedparser',
-        'email._policybase',
-        'email.contentmanager',
-        'email.header',
-        'email.charset',
-        'email.encoders',
-        'email.errors',
-        'email.utils',
-        'email._encoded_words',
-        'email._header_value_parser',
-    ],
+    # Note: entries MUST be valid Python import paths (e.g. "package.module"),
+    # not filesystem paths. The actual list is computed above via
+    # collect_submodules() to recursively include all submodules of `email`
+    # and setuptools._vendor.importlib_metadata (needed for mido version
+    # detection on Python 3.12+).
+    hiddenimports=_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
