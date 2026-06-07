@@ -121,8 +121,22 @@ jobs:
           python3 --version
 
       - name: Install Python build dependencies
+        # Use a venv instead of --break-system-packages. On Arch, the
+        # system `python3` and the system `pip` (from python-pip) can
+        # drift apart in subtle ways; a venv guarantees that imports
+        # work in the same interpreter that pip wrote to.
         run: |
-          python3 -m pip install --break-system-packages --no-cache-dir \
+          set -e
+          python3 -m venv /opt/holaf-venv
+          # shellcheck disable=SC1091
+          source /opt/holaf-venv/bin/activate
+
+          # Sanity: venv python should be the one we're using
+          echo "Using: $(which python3) ($(python3 --version))"
+          echo "Site-packages: $(python3 -c 'import site; print(site.getsitepackages())')"
+
+          python3 -m pip install --no-cache-dir --upgrade pip
+          python3 -m pip install --no-cache-dir \
             pyinstaller \
             PySide6 \
             sounddevice \
@@ -130,15 +144,35 @@ jobs:
             mido \
             python-rtmidi
 
+          # Verify all packages import in THIS venv. If this passes,
+          # build.sh's check_deps will pass too.
+          echo "::group::Verifying imports"
+          python3 -c "
+          import importlib
+          for mod in ('PySide6', 'sounddevice', 'numpy', 'mido', 'rtmidi', 'PyInstaller'):
+              try:
+                  importlib.import_module(mod)
+                  print(f'  OK   {mod}')
+              except ImportError as e:
+                  print(f'  FAIL {mod}: {e}')
+                  raise SystemExit(1)
+          "
+          echo "::endgroup::"
+
       # ------------------------------------------------------------------
       # 2. Build (using the project's own build.sh, with safety bypass)
       # ------------------------------------------------------------------
       - name: Build (onefile)
         if: ${{ github.event.inputs.mode != 'onedir' && github.event.inputs.mode != 'both' || github.event.inputs.mode == '' }}
         run: |
+          # Activate the venv so the same python3 that has the packages
+          # is the one build.sh calls.
+          # shellcheck disable=SC1091
+          source /opt/holaf-venv/bin/activate
           chmod +x build.sh assets/icons/build_icons.sh
           ./build.sh --tarball
         env:
+          # Build inside the CI container: bypass the host-install guards.
           HOLAF_BUILD_INSTALL_DEPS: '1'
 
       - name: Build (onedir, fast launch)
