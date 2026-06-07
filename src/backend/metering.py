@@ -80,8 +80,14 @@ class MeteringEngine:
         success = False
 
         # --- CRITICAL SECTION: STREAM CREATION ---
-        # We hold the creation_lock to ensure 'PULSE_SOURCE' belongs to US 
+        # We hold the creation_lock to ensure 'PULSE_SOURCE' belongs to US
         # for the entire duration of the stream initialization.
+        # NOTE: os.environ is process-wide mutable state. The creation_lock
+        # serializes *our* workers, but any *other* thread in the process
+        # that reads os.environ between our set/del may see a transient
+        # wrong PULSE_SOURCE. The lock minimizes the window but cannot
+        # eliminate it. A proper fix would use pulsectl or the PortAudio
+        # host API directly to bypass env-var-based source selection.
         with self.creation_lock:
             try:
                 # 1. Set Target
@@ -125,12 +131,15 @@ class MeteringEngine:
         """
         with self.data_lock:
             items_to_retry = list(self.pending_retries.items())
-        
+            # Clear them; _worker_start_stream re-adds on failure.
+            # This way, ALL pending items retry in the same cycle instead of
+            # waiting 2.5s per item (50 cycles * 50ms).
+            self.pending_retries.clear()
+
         if not items_to_retry: return
 
-        # Retry logic: gently retry one item
-        uid, source = items_to_retry[0]
-        self.start_monitoring(uid, source)
+        for uid, source in items_to_retry:
+            self.start_monitoring(uid, source)
 
     def stop_monitoring(self, strip_uid: str):
         stream = None

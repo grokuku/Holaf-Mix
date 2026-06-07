@@ -8,7 +8,22 @@ from src.models.strip_model import Strip, StripType, StripMode
 from src.ui.widgets.strip_widget import StripWidget
 
 # Updated import: pipewire_utils is now located in src.backend
-from src.backend import pipewire_utils 
+from src.backend import pipewire_utils
+
+# --- UI timing constants ---
+# Debounce window for engine restarts: rapid FX toggles are coalesced into one
+# restart if they happen within this window.
+DEBOUNCE_ENGINE_RESTART_MS = 200
+# VU meter refresh rate: 40ms = 25 FPS, smooth without overloading the CPU.
+METER_POLL_INTERVAL_MS = 40
+# How often the app re-asserts app→strip routing, to catch apps started after
+# the last enforcement or whose routing was changed externally.
+ENFORCE_ROUTING_INTERVAL_MS = 5000
+# Background thread pool size for backend tasks.
+THREAD_POOL_MAX_WORKERS = 4
+# Initial MIDI feedback settle time after port open (controllers need this
+# before they'll accept LED update messages).
+MIDI_FEEDBACK_SETTLE_MS = 200
 
 # --- Custom Dialog for App Selection ---
 class AppSelectionDialog(QDialog):
@@ -79,13 +94,13 @@ class MainWindow(QMainWindow):
         self.audio_engine = audio_engine
         self.midi_engine = midi_engine
         self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(4)
-        
+        self.thread_pool.setMaxThreadCount(THREAD_POOL_MAX_WORKERS)
+
         # Engine restart coalescing (prevents stacking multiple restarts)
         self._restart_pending = False
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
-        self._restart_timer.setInterval(200)  # 200ms debounce
+        self._restart_timer.setInterval(DEBOUNCE_ENGINE_RESTART_MS)
         self._restart_timer.timeout.connect(self._do_engine_restart)
         
         self.midi_lookup = {}
@@ -118,11 +133,11 @@ class MainWindow(QMainWindow):
         # Timer for routing enforcement
         self.enforce_timer = QTimer(self)
         self.enforce_timer.timeout.connect(self._enforce_app_routing)
-        self.enforce_timer.start(5000) 
-        
+        self.enforce_timer.start(ENFORCE_ROUTING_INTERVAL_MS)
+
         # Timer for VU Meters (High frequency)
         self.meter_timer = QTimer(self)
-        self.meter_timer.setInterval(40) # 40ms = 25 FPS
+        self.meter_timer.setInterval(METER_POLL_INTERVAL_MS)
         self.meter_timer.timeout.connect(self._update_meters)
         self.meter_timer.start()
 
@@ -192,7 +207,7 @@ class MainWindow(QMainWindow):
             target = next((p for p in ports if "mix" in p.lower()), ports[0])
             if self.midi_engine.open_port(target):
                     # Wait a tiny bit then sync LEDs on startup
-                    QTimer.singleShot(200, self._sync_initial_midi_leds)
+                    QTimer.singleShot(MIDI_FEEDBACK_SETTLE_MS, self._sync_initial_midi_leds)
 
     def _sync_initial_midi_leds(self):
         """Updates controller LEDs to match current app state."""

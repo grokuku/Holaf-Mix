@@ -68,13 +68,22 @@ class StripWidget(QFrame):
         super().__init__(parent)
         self.strip = strip_model
         self._is_learning = False
-        
+
         # --- Throttling Mechanism ---
+        # The QTimer detects external changes to self.strip.volume (e.g. from
+        # MIDI controllers) and forwards them to the audio engine via
+        # volume_changed. It is ONLY active when the strip has a MIDI volume
+        # mapping, since otherwise the only writer to strip.volume is the
+        # slider itself (which already emits via _on_slider_move).
+        # This avoids 200 wakeups/second per strip in the common case.
         self.last_sent_vol = self.strip.volume
-        self.update_timer = QTimer(self)
-        self.update_timer.setInterval(50) # 20Hz limit (Requested change)
-        self.update_timer.timeout.connect(self._check_and_send_volume)
-        self.update_timer.start()
+        if self.strip.midi_volume:
+            self.update_timer = QTimer(self)
+            self.update_timer.setInterval(50)  # 20Hz limit
+            self.update_timer.timeout.connect(self._check_and_send_volume)
+            self.update_timer.start()
+        else:
+            self.update_timer = None
 
         # Visual Setup
         self.setFixedWidth(100)
@@ -394,6 +403,13 @@ class StripWidget(QFrame):
     def _on_device_changed(self, index):
         device_name = self.device_combo.itemData(index)
         self.strip.device_name = device_name
+        # Keep strip.mode in sync with the actual device selection so the
+        # widget is self-consistent even if it is ever used outside of
+        # MainWindow (where on_strip_device_changed currently re-applies it).
+        if device_name:
+            self.strip.mode = StripMode.PHYSICAL
+        else:
+            self.strip.mode = StripMode.VIRTUAL
         self._refresh_device_ui_state()
         self.device_changed.emit(self.strip.uid, device_name)
 

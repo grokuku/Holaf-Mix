@@ -1,5 +1,7 @@
-mido
-python-rtmidi
-PySide6
-sounddevice
-numpy
+# Pinned to known-compatible versions. Major-version bounds allow safe
+# patch/minor upgrades without risk of breaking API changes.
+mido>=1.3.0,<2.0.0
+python-rtmidi>=1.5.0,<2.0.0
+PySide6>=6.6.0,<7.0.0
+sounddevice>=0.4.6,<1.0.0
+numpy>=1.24.0,<2.0.0

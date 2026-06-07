@@ -1,6 +1,15 @@
 import subprocess
 import json
 import time
+import os
+
+# Simple TTL cache for pw-dump results. pw-dump output can be megabytes
+# and parsing it on every lookup is wasteful. The cache is invalidated
+# automatically after CACHE_TTL_SECONDS so newly-created nodes (effects,
+# virtual strips) are still discoverable.
+_CACHE = {"data": None, "timestamp": 0.0}
+CACHE_TTL_SECONDS = 0.5  # 500ms is short enough to be fresh, long enough to coalesce burst lookups
+
 
 def _run_command(command_args):
     try:
@@ -13,6 +22,25 @@ def _run_command(command_args):
         return result.stdout.strip()
     except Exception as e:
         return None
+
+def _pw_dump_cached():
+    """Returns the parsed pw-dump JSON, refreshed at most once per CACHE_TTL_SECONDS."""
+    now = time.monotonic()
+    if _CACHE["data"] is not None and (now - _CACHE["timestamp"]) < CACHE_TTL_SECONDS:
+        return _CACHE["data"]
+    dump_out = _run_command(['pw-dump'])
+    if not dump_out:
+        return None
+    try:
+        _CACHE["data"] = json.loads(dump_out)
+    except json.JSONDecodeError:
+        return None
+    _CACHE["timestamp"] = now
+    return _CACHE["data"]
+
+def invalidate_pw_dump_cache():
+    """Force the next get_audio_nodes() call to re-run pw-dump."""
+    _CACHE["timestamp"] = 0.0
 
 def find_monitor_id_by_name(target_name: str):
     """Finds a node ID by its monitor name using native discovery."""
@@ -28,14 +56,15 @@ def get_audio_nodes(include_internal=False):
     """
     Retrieves list of Audio Nodes using native 'pw-dump'.
     Replaces pactl for instant discovery of new nodes (Effects/Virtual).
+    Results are cached for a short TTL to avoid re-parsing the full pw-dump
+    JSON on every lookup (which can be megabytes on busy systems).
     """
     nodes = []
-    dump_out = _run_command(['pw-dump'])
-    if not dump_out:
+    data = _pw_dump_cached()
+    if not data:
         return []
 
     try:
-        data = json.loads(dump_out)
         for obj in data:
             if obj.get('type') != "PipeWire:Interface:Node":
                 continue
@@ -90,20 +119,32 @@ def get_sink_inputs():
         if not result.stdout.strip(): return []
         sink_inputs = json.loads(result.stdout)
         apps = []
+        # Filter out the Holaf-Mix process itself (and its child pw-record helpers)
+        # by matching the application.process.id, not by a fragile name substring
+        # (the previous "python" filter was excluding legitimate Python audio apps).
+        current_pid = os.getpid()
         for item in sink_inputs:
             if 'index' not in item: continue
             props = item.get('properties', {})
             app_name = props.get('application.name', 'Unknown App')
-            
+
+            # Exclude self by PID if available
+            sink_pid_str = props.get('application.process.id')
+            if sink_pid_str:
+                try:
+                    if int(sink_pid_str) == current_pid:
+                        continue
+                except ValueError:
+                    pass
+            # Exclude well-known helper binaries
             if app_name == "Holaf-Mix": continue
             if "pw-record" in app_name: continue
-            if "python" in app_name.lower(): continue 
 
             apps.append({
                 'id': item['index'],
                 'name': app_name,
                 'icon': props.get('application.icon_name', ''),
-                'target_node': item.get('sink'), 
+                'target_node': item.get('sink'),
             })
         return apps
     except Exception as e:

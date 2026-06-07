@@ -1,13 +1,19 @@
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QSlider, QDoubleSpinBox, QPushButton, QWidget, QScrollArea)
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 
 class EffectSettingsDialog(QDialog):
     """
     Dynamic dialog to configure LADSPA effect parameters.
+
+    The dialog mutates the `current_params` dict in place. Callers should
+    emit their own "params changed" signal once on dialog close (not on
+    every slider tick), so the audio engine restarts at most once per
+    dialog session.
     """
-    # Emits (param_name, new_value) when changed
-    params_changed = Signal(str, float)
+    # Note: the per-slider `params_changed` signal was removed — it was
+    # emitted but never connected anywhere. The in-place dict mutation is
+    # the actual mechanism used to propagate changes.
 
     def __init__(self, effect_name, current_params, parent=None):
         super().__init__(parent)
@@ -132,5 +138,7 @@ class EffectSettingsDialog(QDialog):
         return (0.0, 10.0, 0.1) # Default
 
     def _on_value_changed(self, param, value):
+        # Mutate the shared dict in place. The signal that the parent listens
+        # to (`effect_params_changed`) is emitted from the widget *once* on
+        # dialog close, not on every slider tick — see strip_widget.py.
         self.current_params[param] = value
-        self.params_changed.emit(param, value)

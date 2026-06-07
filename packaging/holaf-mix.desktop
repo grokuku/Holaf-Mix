@@ -1,0 +1,47 @@
+[Desktop Entry]
+# ============================================================================
+#  holaf-mix.desktop — KDE / XDG launcher entry
+# ============================================================================
+#  Install:
+#    User:   cp holaf-mix.desktop ~/.local/share/applications/
+#    System: sudo cp holaf-mix.desktop /usr/local/share/applications/
+#    Then:   update-desktop-database ~/.local/share/applications/
+# ============================================================================
+
+Type=Application
+Version=1.5
+Name=Holaf-Mix
+GenericName=Audio Mixer
+Comment=Voicemeeter-like audio mixer for PipeWire with MIDI control
+# Categories: see https://specifications.freedesktop.org/menu-spec/latest/
+#   AudioVideo   = multimedia app
+#   Audio        = audio-focused
+#   Mixer        = audio mixer
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;mixer;pipewire;midi;ladspa;fader;volume;
+
+# Path to the binary. %k expands to the location of this .desktop file
+# so the launcher works whether installed system-wide or in the user's
+# home directory. Update Exec if you install the binary elsewhere.
+Exec=python3 -m PySide6.QtCore %k/../../holaf-mix
+# The Exec above is a fallback. The recommended way is:
+#   Exec=__EXEC_PATH__/holaf-mix %U
+# (replaced at install time by the PKGBUILD / install script)
+
+# Icon — KDE will pick the largest size it finds; we ship 16-512
+Icon=__ICON_PATH__/holaf-mix
+
+# Whether to show in the system tray
+StartupNotify=true
+StartupWMClass=Holaf-Mix
+Terminal=false
+
+# Show in the audio/multimedia submenu
+Categories=AudioVideo;
+
+# Mime types for "open with" support
+MimeType=application/json;
+
+# X-KDE specific (KIO / Plasma hints)
+X-KDE-StartupNotify=true
+X-KDE-FormFactors=desktop;laptop;

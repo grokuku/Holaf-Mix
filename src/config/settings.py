@@ -1,8 +1,39 @@
 import json
 import os
+import sys
+import tempfile
 from src.models.strip_model import Strip, StripType, StripMode
 
-CONFIG_FILE = 'config.json'
+
+def _resolve_config_path() -> str:
+    """
+    Resolve the path to config.json, handling both source-tree and
+    PyInstaller-frozen (onefile/onedir) execution modes.
+
+    - Source / dev mode:  <repo-root>/config.json  (alongside main.py)
+    - Frozen (PyInstaller --onefile):  next to sys.executable
+      (writable, since onefile extracts _MEI* to a temp dir, so the
+      cwd-relative config.json inside the bundle is read-only)
+    - Frozen (PyInstaller --onedir):  same as onefile — next to the
+      executable, so config survives across runs and upgrades.
+    """
+    if getattr(sys, "frozen", False):
+        # Running inside a PyInstaller bundle
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        # Running as a normal Python script: <repo-root>/config.json
+        # settings.py lives at <root>/src/config/settings.py, so the
+        # repo root is THREE levels up from this file.
+        base_dir = os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
+        )
+
+    return os.path.join(base_dir, "config.json")
+
+
+CONFIG_FILE = _resolve_config_path()
 
 def create_default_config():
     """
@@ -13,13 +44,13 @@ def create_default_config():
         kind=StripType.INPUT,
         mode=StripMode.VIRTUAL
     )
-    
+
     main_speakers = Strip(
         label="Speakers",
         kind=StripType.OUTPUT,
         mode=StripMode.PHYSICAL
     )
-    
+
     return [desktop_input, main_speakers]
 
 def _load_raw_json():
@@ -33,10 +64,25 @@ def _load_raw_json():
         return {}
 
 def _save_raw_json(data):
-    """Helper to save the raw JSON dict."""
+    """
+    Atomic save: write to a temp file in the same directory, then rename.
+    os.replace() is atomic on POSIX, so a crash mid-write cannot corrupt
+    the existing config.json (it stays untouched until the rename).
+    """
+    config_dir = os.path.dirname(os.path.abspath(CONFIG_FILE)) or "."
     try:
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
+        fd, tmp_path = tempfile.mkstemp(dir=config_dir, prefix=".config_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f, indent=4)
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception:
+            # Clean up the temp file on any failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except IOError as e:
         print(f"Error saving to {CONFIG_FILE}: {e}")
 

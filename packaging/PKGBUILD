@@ -1,0 +1,152 @@
+# ============================================================================
+#  PKGBUILD — Holaf-Mix for CachyOS / Arch Linux
+# ============================================================================
+#  Usage:
+#    makepkg -si          # build + install deps + install
+#    makepkg -s           # build + install deps (no install)
+#    makepkg --clean       # clean build dir
+#
+#  After install:
+#    holaf-mix             # run the app
+#    holaf-mix.desktop     # appears in KDE app menu under "Multimedia"
+#
+#  To uninstall:  sudo pacman -Rns holaf-mix
+# ============================================================================
+
+pkgname=holaf-mix
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Voicemeeter-like audio mixer for PipeWire with MIDI control"
+arch=('x86_64' 'aarch64')
+url="https://github.com/your-username/holaf-mix"
+license=('MIT')
+depends=(
+    'python>=3.10'
+    'python-pyside6'
+    'python-sounddevice'
+    'python-numpy'
+    'python-mido'
+    'python-python-rtmidi'
+    # System-level runtime deps (PySide6 wheel bundles Qt, but PipeWire
+    # integration still needs the system daemons + LADSPA plugins):
+    'pipewire'
+    'pipewire-pulse'
+    'pulseaudio'
+    'ladspa'
+    'ladspa-plugins'      # for gate_1410, mbeq_1197, sc4_1882
+)
+makedepends=(
+    'python-pyinstaller'
+    'librsvg2'             # for icon rendering
+    'imagemagick'
+)
+optdepends=(
+    'rnnoise: AI noise cancellation (librnnoise_ladspa)'
+)
+
+# Use the source directory or a git checkout
+# For a local dev build: leave _srcroot unset, build from current dir
+# For a release tarball: set _srcroot=/path/to/holaf-mix-${pkgver}
+_srcroot="."
+_srcdir="$startdir"
+
+build() {
+    cd "$_srcdir"
+
+    # 1. Generate icons from the source SVG
+    ./assets/icons/build_icons.sh
+
+    # 2. Build the standalone executable via PyInstaller
+    pyinstaller \
+        --noconfirm \
+        --clean \
+        --workpath build/pyinstaller \
+        --distpath build/dist \
+        packaging/holaf-mix.spec
+
+    # 3. Re-render the .desktop with absolute install paths
+    sed \
+        -e "s|__EXEC_PATH__|/usr/bin|g" \
+        -e "s|__ICON_PATH__|/usr/share/holaf-mix/icons|g" \
+        packaging/holaf-mix.desktop \
+        > build/holaf-mix.desktop
+}
+
+package() {
+    cd "$_srcdir"
+
+    # --- Binary ---
+    install -Dm755 "build/dist/holaf-mix"             "$pkgdir/usr/bin/holaf-mix"
+    # If onedir mode, copy the whole folder:
+    if [[ -d build/dist/holaf-mix ]]; then
+        install -dm755 "$pkgdir/usr/lib/holaf-mix"
+        cp -r build/dist/holaf-mix/. "$pkgdir/usr/lib/holaf-mix/"
+        # Symlink to /usr/bin
+        ln -sf /usr/lib/holaf-mix/holaf-mix "$pkgdir/usr/bin/holaf-mix"
+    fi
+
+    # --- Icons (all sizes for HiDPI support) ---
+    install -dm755 "$pkgdir/usr/share/holaf-mix/icons"
+    cp -r dist/icons/*.png  "$pkgdir/usr/share/holaf-mix/icons/"
+    cp -r dist/icons/*.svg  "$pkgdir/usr/share/holaf-mix/icons/" 2>/dev/null || true
+    cp -r dist/icons/*.ico  "$pkgdir/usr/share/holaf-mix/icons/" 2>/dev/null || true
+
+    # Register with the freedesktop hicolor theme
+    for size in 16 22 32 48 64 128 256 512; do
+        install -dm755 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
+        if [[ -f "dist/icons/holaf-mix-${size}.png" ]]; then
+            ln -sf "/usr/share/holaf-mix/icons/holaf-mix-${size}.png" \
+                  "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/holaf-mix.png"
+        fi
+    done
+    install -dm755 "$pkgdir/usr/share/icons/hicolor/scalable/apps"
+    if [[ -f dist/icons/holaf-mix.svg ]]; then
+        ln -sf "/usr/share/holaf-mix/icons/holaf-mix.svg" \
+              "$pkgdir/usr/share/icons/hicolor/scalable/apps/holaf-mix.svg"
+    fi
+
+    # --- Desktop entry ---
+    install -Dm644 build/holaf-mix.desktop \
+        "$pkgdir/usr/share/applications/holaf-mix.desktop"
+
+    # --- Optional: default config next to the binary ---
+    # Commented out: each user gets their own config.json on first run.
+    # Uncomment to ship a pre-configured default:
+    # install -Dm644 config.json "$pkgdir/usr/share/holaf-mix/config.json.default"
+
+    # --- License ---
+    # If you have a LICENSE file, install it
+    if [[ -f LICENSE ]]; then
+        install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    fi
+}
+
+# ============================================================================
+#  Post-install: refresh icon cache
+# ============================================================================
+post_install() {
+    if [[ -x /usr/bin/gtk-update-icon-cache ]]; then
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+    if [[ -x /usr/bin/update-desktop-database ]]; then
+        update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    fi
+    echo "==> Holaf-Mix installed. Launch with: holaf-mix"
+    echo "    Config will be created at: ~/.config/holaf-mix/ on first run"
+    # NOTE: the app currently saves config next to the binary.
+    # If you want it in ~/.config/, patch src/config/settings.py to use
+    # XDG_CONFIG_HOME / ~/.config/holaf-mix/config.json
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    if [[ -x /usr/bin/gtk-update-icon-cache ]]; then
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+    if [[ -x /usr/bin/update-desktop-database ]]; then
+        update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    fi
+}

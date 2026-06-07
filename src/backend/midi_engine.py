@@ -110,17 +110,21 @@ class MidiEngine(QObject):
 
     def _listen_loop(self):
         """Background thread listening for MIDI messages."""
+        # Reuse a single Event for the idle sleep to avoid allocating a new
+        # one on every iteration (the previous code allocated 200/s while idle).
+        idle_event = threading.Event()
         while self.listening and self.inport:
             try:
-                # Iterate pending messages to drain buffer
+                # Iterate pending messages to drain buffer (non-blocking).
                 for msg in self.inport.iter_pending():
                     if self.learning_mode:
                         self._process_learn(msg)
                     else:
                         self.message_received.emit(msg)
-                
-                # Sleep briefly to prevent CPU hogging (100% usage fix)
-                threading.Event().wait(0.005) 
+
+                # Sleep briefly to prevent CPU hogging. 5ms keeps shutdown
+                # latency low while still avoiding a busy spin.
+                idle_event.wait(0.005)
             except Exception as e:
                 logger.error(f"Error in MIDI loop: {e}")
                 break

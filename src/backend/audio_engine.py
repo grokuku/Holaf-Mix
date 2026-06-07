@@ -10,12 +10,133 @@ from . import pipewire_utils
 from src.models.strip_model import Strip, StripType, StripMode
 from src.backend.metering import MeteringEngine
 
-# Configuration du logging
-logging.basicConfig(level=logging.INFO)
+# NOTE: Logging is configured in main.py, not here. Module-level
+# basicConfig() is process-global and only takes effect on the first call;
+# doing it here makes the import order of modules matter, which is fragile.
 logger = logging.getLogger("AudioEngine")
 
 # Chemin standard des plugins LADSPA sous Arch/Linux
 LADSPA_PATH = "/usr/lib/ladspa"
+
+# --- Timing constants (module-level, no magic numbers scattered around) ---
+# Virtual node creation: how long to wait for the node to appear in pw-dump
+# (used by _create_virtual_node polling loop).
+VIRTUAL_NODE_POLL_ATTEMPTS = 20
+VIRTUAL_NODE_POLL_INTERVAL_S = 0.05
+
+# FX chain verification: how long to wait for the filter-chain node ports
+# to appear in pw-link output after a load-module command.
+FX_CHAIN_PORT_VERIFY_ATTEMPTS = 20
+FX_CHAIN_PORT_VERIFY_INTERVAL_S = 0.1
+
+# FX host process shutdown grace period before SIGKILL.
+FX_HOST_TERMINATE_TIMEOUT_S = 2
+
+# Meter retry: how many get_meter_levels() calls between retry_pending()
+# sweeps. At 25Hz meter timer, this is ~2s between sweeps.
+METER_RETRY_INTERVAL_CYCLES = 50
+
+# Default polling interval for waiting on async PipeWire operations.
+PIPEWAIT_POLL_INTERVAL_S = 0.05
+
+
+# --- FX graph builders (module-level so they can be tested in isolation) ---
+
+# Mapping: (effect_key, internal_name, plugin_file, ladspa_label)
+FX_PLUGIN_MAP = [
+    ('gate', 'gate', 'gate_1410', 'gate'),
+    ('noise_cancel', 'rnnoise', 'librnnoise_ladspa', 'noise_suppressor_mono'),
+    ('eq', 'eq', 'mbeq_1197', 'mbeq'),
+    ('compressor', 'comp', 'sc4_1882', 'sc4'),
+]
+
+
+def _get_fx_data(effects: Dict, key: str):
+    """Returns (active: bool, params: dict) for a given effect, handling both
+    legacy boolean and new dict formats."""
+    data = effects.get(key)
+    if isinstance(data, dict):
+        return data.get('active', False), data.get('params', {})
+    return bool(data), {}  # Fallback for old boolean style
+
+
+def _format_params(params: Dict[str, float]) -> str:
+    """
+    Converts a dictionary of parameters into SPA-JSON control format.
+    Example: {'Thresh': -30} -> '{ "Thresh" = -30 }'
+    """
+    if not params:
+        return "{}"
+    items = [f'"{k}" = {v}' for k, v in params.items()]
+    return f'{{ {" ".join(items)} }}'
+
+
+def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
+    """
+    Build the SPA-JSON filter.graph string for a strip's active effects.
+    Extracted from _create_fx_chain to be a pure, testable function.
+
+    Args:
+        strip: The Strip model containing the effects dict.
+        format_params_fn: Callable that formats a params dict to SPA-JSON.
+        include_controls: If False, omit the `control = ...` part of each node
+                          (used as a fallback when the first attempt fails).
+    """
+    nodes_config = []
+    links_config = []
+    fx_list = []
+
+    # Build the ordered list of active effects whose plugin file exists on disk.
+    for (key, internal_name, plugin_file, ladspa_label) in FX_PLUGIN_MAP:
+        active, params = _get_fx_data(strip.effects, key)
+        if not active:
+            continue
+        plugin_abs_path = os.path.join(LADSPA_PATH, f"{plugin_file}.so")
+        if not os.path.exists(plugin_abs_path):
+            continue
+        ctrl = format_params_fn(params)
+        fx_list.append((internal_name, plugin_abs_path, ladspa_label, ctrl))
+
+    if not fx_list:
+        return ""
+
+    first_nodes = []
+    last_nodes = []
+
+    for i, (name, plugin_abs_path, label, ctrl) in enumerate(fx_list):
+        control_str = f" control = {ctrl}" if include_controls and ctrl != '{}' else ""
+
+        nodes_config.append(
+            f'{{ type = ladspa name = "{name}_L" plugin = "{plugin_abs_path}" '
+            f'label = "{label}"{control_str} }}'
+        )
+        nodes_config.append(
+            f'{{ type = ladspa name = "{name}_R" plugin = "{plugin_abs_path}" '
+            f'label = "{label}"{control_str} }}'
+        )
+
+        if i == 0:
+            first_nodes = [f"{name}_L", f"{name}_R"]
+        if i == len(fx_list) - 1:
+            last_nodes = [f"{name}_L", f"{name}_R"]
+
+        if i > 0:
+            prev_name = fx_list[i - 1][0]
+            links_config.append(f'{{ output = "{prev_name}_L:Output" input = "{name}_L:Input" }}')
+            links_config.append(f'{{ output = "{prev_name}_R:Output" input = "{name}_R:Input" }}')
+
+    inputs_def = f'[ "{first_nodes[0]}:Input", "{first_nodes[1]}:Input" ]'
+    outputs_def = f'[ "{last_nodes[0]}:Output", "{last_nodes[1]}:Output" ]'
+
+    return (
+        f'{{ '
+        f'nodes = [ {" ".join(nodes_config)} ] '
+        f'links = [ {" ".join(links_config)} ] '
+        f'inputs = {inputs_def} '
+        f'outputs = {outputs_def} '
+        f'}}'
+    )
+
 
 class AudioEngine:
     def __init__(self):
@@ -33,9 +154,13 @@ class AudioEngine:
 
     def start_engine(self, strips: List[Strip]):
         logger.info("Starting Audio Engine...")
-        self.metering.stop_all() 
-        self._stop_fx_host() 
+        self.metering.stop_all()
+        self._stop_fx_host()
         self._clean_zombie_nodes()
+        # Reset the meter retry counter so the first retry after a restart
+        # happens at a predictable offset (not somewhere in the middle of a
+        # 50-cycle window left over from a previous run).
+        self._meter_retry_counter = 0
         self._start_fx_host()
 
         self.node_registry.clear()
@@ -65,6 +190,11 @@ class AudioEngine:
                             node_id = self._find_node_id_by_name(strip.device_name)
                             if node_id:
                                 self.name_cache[node_id] = strip.device_name
+                                # Physical sources expose the listenable signal on their
+                                # monitor port (e.g. alsa_input.xxx.monitor). Populate
+                                # monitor_cache so _link_physical_source_to_strip can
+                                # route the signal to outputs when no FX chain is active.
+                                self.monitor_cache[node_id] = f"{strip.device_name}.monitor"
                                 node_name = strip.device_name
                 else:
                     node_id = self._create_virtual_node(strip)
@@ -139,9 +269,11 @@ class AudioEngine:
 
     def shutdown(self):
         logger.info("Shutting down Audio Engine...")
-        self.metering.stop_all() 
+        self.metering.stop_all()
         self._stop_fx_host()
         self._clean_zombie_nodes()
+        # Invalidate pw-dump cache so next start_engine() sees fresh state.
+        pipewire_utils.invalidate_pw_dump_cache()
         self.created_nodes.clear()
         self.node_registry.clear()
         self.name_cache.clear()
@@ -175,7 +307,7 @@ class AudioEngine:
             logger.info("Stopping FX Host...")
             self.fx_host_process.terminate()
             try:
-                self.fx_host_process.wait(timeout=2)
+                self.fx_host_process.wait(timeout=FX_HOST_TERMINATE_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 self.fx_host_process.kill()
             self.fx_host_process = None
@@ -184,41 +316,16 @@ class AudioEngine:
     
     def get_meter_levels(self):
         self._meter_retry_counter += 1
-        if self._meter_retry_counter > 50:
+        if self._meter_retry_counter > METER_RETRY_INTERVAL_CYCLES:
             self.metering.retry_pending()
             self._meter_retry_counter = 0
+            # Proactive FX-host health check: if pw-cli died (OOM, manual
+            # kill, etc.) and no FX chain is currently loaded, restart it
+            # silently so the next FX toggle is not delayed.
+            if self.fx_host_process is None or self.fx_host_process.poll() is not None:
+                logger.warning("FX host (pw-cli) is not running; restarting.")
+                self._start_fx_host()
         return self.metering.get_levels()
-
-    def update_fx_params(self, strip: Strip):
-        """
-        Hot-reload FX chain when parameters change.
-        Currently implements a full reload strategy (simplest/safest for graph consistency).
-        """
-        # 1. Unlink current FX
-        if strip.uid in self.fx_source_names:
-            old_fx_node = self.fx_source_names[strip.uid]
-            # Unlink from all targets
-            for (src, dst) in list(self.link_registry.keys()):
-                if src == strip.uid:
-                    dst_id = self.node_registry.get(dst)
-                    if dst_id:
-                        dst_name = self._get_node_name(dst_id)
-                        if dst_name:
-                            self._unlink_nodes(old_fx_node, dst_name)
-            
-            # Destroy old FX (Wait a bit handled by _clean_zombie_nodes logic if we restart whole engine)
-            # But here we want to be surgical.
-            # For now, simplest is to just restart the specific chain?
-            # Creating a new one with same name might conflict.
-            # Given the complexity, we will rely on the UI triggering a restart 
-            # or just re-run routing update.
-            # TODO: Ideally, implement parameter update via 'pw-cli set-param' but hard with filter-chain.
-            pass
-        
-        # Real-time parameter update for LADSPA in filter-chain is complex without destroying/recreating.
-        # For now, the UI might need to restart engine or we implement a "Respawn FX" method.
-        # But for this fix, we just ensure START works correctly.
-        pass
 
     def set_volume(self, strip_uid: str, volume: float):
         node_id = self.node_registry.get(strip_uid)
@@ -283,9 +390,6 @@ class AudioEngine:
         else:
             self._destroy_link(source_uid, target_uid)
 
-    def set_mono_registry(self, strip_uid: str, is_mono: bool):
-        self.mono_registry[strip_uid] = is_mono
-
     def set_system_default(self, strip_uid: str):
         node_id = self.node_registry.get(strip_uid)
         if not node_id: return
@@ -296,15 +400,10 @@ class AudioEngine:
 
     # --- Internal Logic ---
 
+    # Note: _format_params is now a module-level function (see top of file).
+    # Kept as a method alias for backward compatibility with existing callers.
     def _format_params(self, params: Dict[str, float]) -> str:
-        """
-        Converts a dictionary of parameters into SPA-JSON control format.
-        Example: {'Thresh': -30} -> '{ "Thresh" = -30 }'
-        """
-        if not params:
-            return "{}"
-        items = [f'"{k}" = {v}' for k, v in params.items()]
-        return f'{{ {" ".join(items)} }}'
+        return _format_params(params)
 
     def _create_fx_chain(self, strip: Strip, master_source_name: str) -> Optional[str]:
         if not self.fx_host_process or self.fx_host_process.poll() is not None:
@@ -316,95 +415,11 @@ class AudioEngine:
         fx_node_name = f"Holaf_FX_{strip.uid}"
         safe_label = re.sub(r'[^a-zA-Z0-9 ]', '', strip.label)
         fx_label = f"Holaf FX {safe_label}"
-        
-        def build_graph(include_controls: bool) -> str:
-            nodes_config = []
-            links_config = []
-            
-            # --- 1. Select Candidates & Prepare Params ---
-            fx_candidates = []
-            
-            # Helper to safely get active state and params
-            def get_fx_data(key):
-                data = strip.effects.get(key)
-                if isinstance(data, dict):
-                    return data.get('active', False), data.get('params', {})
-                return bool(data), {} # Fallback for old boolean style
 
-            # GATE
-            active, params = get_fx_data('gate')
-            if active:
-                ctrl = self._format_params(params)
-                fx_candidates.append(('gate', 'gate_1410', 'gate', ctrl))
+        attempts = [True, False]
 
-            # NOISE CANCEL
-            active, params = get_fx_data('noise_cancel')
-            if active:
-                # RNNoise usually has no controls, but we keep format consistent
-                ctrl = self._format_params(params)
-                fx_candidates.append(('rnnoise', 'librnnoise_ladspa', 'noise_suppressor_mono', ctrl))
-
-            # EQ
-            active, params = get_fx_data('eq')
-            if active:
-                ctrl = self._format_params(params)
-                fx_candidates.append(('eq', 'mbeq_1197', 'mbeq', ctrl))
-
-            # COMPRESSOR
-            active, params = get_fx_data('compressor')
-            if active:
-                ctrl = self._format_params(params)
-                fx_candidates.append(('comp', 'sc4_1882', 'sc4', ctrl))
-
-            fx_list = []
-            for (name, plugin, label, ctrl) in fx_candidates:
-                plugin_path = os.path.join(LADSPA_PATH, f"{plugin}.so")
-                if os.path.exists(plugin_path):
-                    fx_list.append((name, plugin_path, label, ctrl)) 
-            
-            if not fx_list: return ""
-
-            # --- 2. Build Nodes & Internal Links ---
-            first_nodes = []
-            last_nodes = []
-
-            for i, (name, plugin_abs_path, label, ctrl) in enumerate(fx_list):
-                control_str = f" control = {ctrl}" if include_controls and ctrl != '{}' else ""
-                
-                nodes_config.append(f'{{ type = ladspa name = "{name}_L" plugin = "{plugin_abs_path}" label = "{label}"{control_str} }}')
-                nodes_config.append(f'{{ type = ladspa name = "{name}_R" plugin = "{plugin_abs_path}" label = "{label}"{control_str} }}')
-                
-                if i == 0:
-                    first_nodes = [f"{name}_L", f"{name}_R"]
-                
-                if i == len(fx_list) - 1:
-                    last_nodes = [f"{name}_L", f"{name}_R"]
-
-                if i > 0:
-                    prev_name = fx_list[i-1][0]
-                    links_config.append(f'{{ output = "{prev_name}_L:Output" input = "{name}_L:Input" }}')
-                    links_config.append(f'{{ output = "{prev_name}_R:Output" input = "{name}_R:Input" }}')
-
-            # --- 3. Define Inputs/Outputs ---
-            inputs_def = f'[ "{first_nodes[0]}:Input", "{first_nodes[1]}:Input" ]'
-            outputs_def = f'[ "{last_nodes[0]}:Output", "{last_nodes[1]}:Output" ]'
-
-            nodes_str = " ".join(nodes_config)
-            links_str = " ".join(links_config)
-            
-            return (
-                f'{{ '
-                f'nodes = [ {nodes_str} ] '
-                f'links = [ {links_str} ] '
-                f'inputs = {inputs_def} '
-                f'outputs = {outputs_def} '
-                f'}}'
-            )
-
-        attempts = [True, False] 
-        
         for use_controls in attempts:
-            graph_str = build_graph(use_controls)
+            graph_str = _build_fx_graph(strip, _format_params, use_controls)
             if not graph_str:
                 return None
 
@@ -429,16 +444,14 @@ class AudioEngine:
                 # --- VERIFICATION ---
                 in_node = f"input.{fx_node_name}"
                 out_node = f"output.{fx_node_name}"
-                
-                retries = 20 
+
                 ports_ready = False
-                while retries > 0:
-                    time.sleep(0.1)
+                for _ in range(FX_CHAIN_PORT_VERIFY_ATTEMPTS):
+                    time.sleep(FX_CHAIN_PORT_VERIFY_INTERVAL_S)
                     ports = self._get_ports_by_name(in_node, is_input=True)
                     if ports:
                         ports_ready = True
                         break
-                    retries -= 1
                     
                 if not ports_ready:
                     logger.warning(f"FX Node verification failed (controls={use_controls}).")
@@ -533,10 +546,18 @@ class AudioEngine:
                 return None
             else:
                 logger.info(f"Created virtual sink via pactl: {node_name}")
-            
-            time.sleep(0.3)
-            
-            node_id = self._find_node_id_by_name(node_name)
+
+            # Poll for the node to appear in pw-dump. 0.3s is enough on a
+            # fast system but unreliable under load; polling exits as soon
+            # as the node is visible (typically <50ms) and tolerates slower
+            # PipeWire init up to ~1s total.
+            node_id = None
+            for _attempt in range(VIRTUAL_NODE_POLL_ATTEMPTS):
+                node_id = self._find_node_id_by_name(node_name)
+                if node_id:
+                    break
+                time.sleep(VIRTUAL_NODE_POLL_INTERVAL_S)
+
             if node_id:
                 self.created_nodes.append(node_id)
                 self.name_cache[node_id] = node_name
@@ -556,7 +577,7 @@ class AudioEngine:
                     remap_proc = subprocess.run(cmd_remap, capture_output=True, text=True)
                     if remap_proc.returncode == 0:
                         logger.info(f"Created remapped source: {remap_desc}")
-                        time.sleep(0.1)
+                        time.sleep(PIPEWAIT_POLL_INTERVAL_S * 2)
                         remap_id = self._find_node_id_by_name(remap_name)
                         if remap_id:
                             self.created_nodes.append(remap_id)
@@ -571,7 +592,31 @@ class AudioEngine:
         return None
 
     def _link_physical_source_to_strip(self, strip: Strip):
-        pass
+        """
+        Prepares an input strip backed by a physical source (e.g. USB mic).
+
+        For a physical source in PipeWire, the *listenable* signal is exposed
+        on the source's monitor port (e.g. `alsa_input.usb-...:monitor_FL`),
+        not on the source node itself. We register the monitor name in
+        `fx_source_names` so that the routing logic in `_create_link` picks
+        the correct source, mirroring what an FX chain would do.
+
+        Called only when no FX chain is active (the FX branch sets
+        `fx_source_names[uid]` itself in `start_engine`).
+        """
+        if strip.uid not in self.node_registry:
+            return
+        node_id = self.node_registry[strip.uid]
+        monitor_name = self.monitor_cache.get(node_id)
+        if not monitor_name:
+            logger.warning(f"Physical source '{strip.label}' has no monitor port; cannot route.")
+            return
+        # Store as the 'effective source' so _create_link uses it for routing.
+        # FX chain (if any) would have already populated this with output.Holaf_FX_<uid>,
+        # in which case we leave it untouched to preserve the active FX path.
+        if strip.uid not in self.fx_source_names:
+            self.fx_source_names[strip.uid] = monitor_name
+            logger.info(f"Physical source '{strip.label}' linked via monitor: {monitor_name}")
 
     def _find_node_id_by_name(self, node_name: str) -> Optional[int]:
         nodes = pipewire_utils.get_audio_nodes(include_internal=True)
@@ -652,14 +697,19 @@ class AudioEngine:
     def _unlink_nodes(self, node_src: str, node_dst: str):
         src_ports = self._get_ports_by_name(node_src, is_input=False)
         dst_ports = self._get_ports_by_name(node_dst, is_input=True)
-        
+
         if not src_ports or not dst_ports:
             return
 
         for s in src_ports:
             for d in dst_ports:
                 logger.info(f"Ensure Unlink: {s} -X- {d}")
-                subprocess.run(['pw-link', '-d', s, d], capture_output=True, check=False)
+                result = subprocess.run(['pw-link', '-d', s, d],
+                                        capture_output=True, text=True)
+                if result.returncode != 0:
+                    # Log instead of silently swallowing. Genuine errors
+                    # (port gone, daemon down, perms) were previously hidden.
+                    logger.warning(f"Failed to unlink {s} -X- {d}: {result.stderr.strip()}")
 
     def _auto_link_ports(self, src_name: str, dst_name: str, force_mono: bool = False) -> List[Tuple[str, str]]:
         src_ports = self._get_ports_by_name(src_name, is_input=False)
@@ -759,4 +809,7 @@ class AudioEngine:
                 if fx_name: self._unlink_nodes(fx_name, dst_name)
 
         for (p_src, p_dst) in links:
-                subprocess.run(['pw-link', '-d', p_src, p_dst], capture_output=True)
+                result = subprocess.run(['pw-link', '-d', p_src, p_dst],
+                                        capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.warning(f"Failed to unlink {p_src} -X- {p_dst}: {result.stderr.strip()}")
