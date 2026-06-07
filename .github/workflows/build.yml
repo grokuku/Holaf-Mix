@@ -73,12 +73,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Display environment info
+        # Note: this is a best-effort diagnostic. The base archlinux:latest
+        # image doesn't ship python3, so we tolerate its absence here —
+        # python is installed in the next step.
         run: |
           echo "::group::Environment"
           uname -a
           cat /etc/os-release
-          pacman --version | head -1
-          python3 --version
+          pacman --version | head -1 || echo "(no pacman)"
+          command -v python3 >/dev/null && python3 --version || echo "(python3 not yet installed)"
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
@@ -98,6 +101,17 @@ jobs:
             imagemagick \
             python \
             python-pip
+
+          # Arch's `python` package provides /usr/bin/python3; verify
+          # before continuing, otherwise the next step fails with a
+          # confusing "command not found".
+          if ! command -v python3 >/dev/null; then
+            echo "::error::python3 not found after installing 'python' package."
+            echo "::error::Check that pacman succeeded and PATH includes /usr/bin."
+            ls -la /usr/bin/python* 2>/dev/null || true
+            exit 1
+          fi
+          python3 --version
 
       - name: Install Python build dependencies
         run: |
