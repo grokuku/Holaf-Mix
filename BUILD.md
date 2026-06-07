@@ -28,24 +28,34 @@ On CachyOS / Arch:
 ```bash
 sudo pacman -S --needed \
     python-pip \
-    python-pyinstaller \
-    librsvg2 \
+    librsvg \
     imagemagick
 
+# pyinstaller is in AUR on Arch; installing via pip (the upstream-
+# recommended method) is simpler and keeps versions reproducible.
 pip install --user \
     PySide6 \
     sounddevice \
     numpy \
     mido \
-    python-rtmidi
+    python-rtmidi \
+    pyinstaller
 ```
+
+> **Why no `python-pyinstaller`?** It's an AUR package, not in `[extra]`.
+> Pip install is the upstream-recommended install method (it's a build
+> tool, not a runtime dep, so system-package-staleness isn't an issue).
+>
+> **Why no `python-pyside6`?** Same — pip gives you the exact version
+> pinned in `requirements.txt` rather than whatever CachyOS built.
+> If you'd rather use the system package, drop the `PySide6` line above
+> and `sudo pacman -S python-pyside6`.
 
 On Debian / Ubuntu:
 
 ```bash
 sudo apt install \
     python3-pip \
-    pyinstaller \
     librsvg2-bin \
     imagemagick \
     libpipewire-0.3-dev \
