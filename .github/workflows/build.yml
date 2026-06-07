@@ -97,6 +97,9 @@ jobs:
           #
           # python-rtmidi builds C++ bindings for JACK and ALSA, so we
           # need the dev headers (pkg-config .pc files) for both.
+          #
+          # sounddevice links against PortAudio at *import* time (not just
+          # build time), so we need the shared lib too.
           # base-devel pulls in gcc/g++/make/pkgconf which are also needed.
           pacman -S --noconfirm --needed \
             base-devel \
@@ -107,7 +110,8 @@ jobs:
             python \
             python-pip \
             jack2 \
-            alsa-lib
+            alsa-lib \
+            portaudio
 
           # Arch's `python` package provides /usr/bin/python3; verify
           # before continuing, otherwise the next step fails with a
