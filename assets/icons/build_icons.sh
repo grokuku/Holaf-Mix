@@ -33,8 +33,10 @@
 set -euo pipefail
 
 # --- Paths -------------------------------------------------------------------
+# This script lives at <repo>/assets/icons/build_icons.sh, so we go up
+# two levels to get to the repo root.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-ROOT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+ROOT_DIR="$( cd "$SCRIPT_DIR/../.." && pwd )"
 SRC_SVG="$ROOT_DIR/assets/icons/holaf-mix.svg"
 OUT_DIR="$ROOT_DIR/dist/icons"
 
