@@ -94,13 +94,20 @@ jobs:
       - name: Install build dependencies
         run: |
           # --noconfirm is safe in CI: no interactive prompts
+          #
+          # python-rtmidi builds C++ bindings for JACK and ALSA, so we
+          # need the dev headers (pkg-config .pc files) for both.
+          # base-devel pulls in gcc/g++/make/pkgconf which are also needed.
           pacman -S --noconfirm --needed \
             base-devel \
+            pkgconf \
             git \
             librsvg \
             imagemagick \
             python \
-            python-pip
+            python-pip \
+            jack2 \
+            alsa-lib
 
           # Arch's `python` package provides /usr/bin/python3; verify
           # before continuing, otherwise the next step fails with a
