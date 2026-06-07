@@ -17,6 +17,8 @@
 
 from pathlib import Path
 import sys
+import os
+import email as _stdlib_email  # the actual stdlib package, for path resolution
 
 from PyInstaller.utils.hooks import collect_submodules
 
@@ -63,6 +65,15 @@ _hiddenimports = [
     *collect_submodules('setuptools._vendor.importlib_metadata'),
 ]
 
+# --- Bundled stdlib data files ----------------------------------------------
+# On Python 3.12+, the `email` package has lazy-imported submodules that
+# neither PyInstaller's static analysis, collect_submodules(), nor our
+# runtime hook can fully wire up. As a last resort, we copy the entire
+# `email` stdlib package directory into the bundle as data files. The
+# runtime hook (hook-email.py) is still useful as a first attempt, but
+# the data files guarantee `import email.message` will succeed.
+_EMAIL_PKG_PATH = os.path.dirname(_stdlib_email.__file__)
+
 # --- Analysis ----------------------------------------------------------------
 a = Analysis(
     [str(MAIN_PY)],
@@ -73,7 +84,13 @@ a = Analysis(
     # (see _resolve_config_path() in src/config/settings.py). Bundling
     # the source config would only matter for "fresh-install" scenarios
     # where the user wants pre-existing settings, which isn't our use case.
-    datas=[],
+    #
+    # We DO bundle the `email` stdlib package as data files. This is the
+    # nuclear option for Python 3.12+ where PyInstaller's static analysis
+    # + collect_submodules() + runtime hooks all fail to make `import
+    # email.message` work for importlib.metadata. The runtime hook tries
+    # first (smaller bundle), but the data files guarantee resolution.
+    datas=[(_EMAIL_PKG_PATH, 'email')],
     # sounddevice loads PortAudio via ctypes, which PyInstaller misses.
     # python-rtmidi has a dynamic backend. These hidden imports force
     # PyInstaller to include the .so modules explicitly.
