@@ -50,13 +50,16 @@ a = Analysis(
     # sounddevice loads PortAudio via ctypes, which PyInstaller misses.
     # python-rtmidi has a dynamic backend. These hidden imports force
     # PyInstaller to include the .so modules explicitly.
+    #
+    # Note: hiddenimports entries MUST be valid Python import paths
+    # (e.g. "package.module"), not filesystem paths. "UNIX_JACK" in the
+    # mido backend path is an internal compiler symbol, not a module.
     hiddenimports=[
         'sounddevice',
         '_sounddevice',
         'sounddevice._portaudio',
         'mido',
         'mido.backends.rtmidi',
-        'mido.backends.rtmidi/UNIX_JACK',
         'rtmidi',
         '_rtmidi',
     ],
