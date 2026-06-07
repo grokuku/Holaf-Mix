@@ -86,12 +86,17 @@ detect_distro() {
 #     (it's a build-time tool, not a runtime dep, so pip is fine).
 #   - "python-pyside6" exists in [extra] but is frequently out of date; pip
 #     gives you the version pinned in requirements.txt.
+# On Arch/CachyOS, `pipewire-pulse` REPLACES `pulseaudio` (it provides
+# the PulseAudio client API on top of PipeWire). Installing both at once
+# triggers a hard pacman conflict. The vast majority of modern CachyOS
+# installs only have pipewire-pulse; legacy pulseaudio-only systems are
+# rare and would be incompatible with the rest of Holaf-Mix's PipeWire
+# routing anyway. If you're on such a system, run the install manually.
 SYSTEM_DEPS_ARCH=(
     "librsvg"            # provides rsvg-convert
     "imagemagick"        # provides `magick` for ICO bundling
     "pipewire"
-    "pipewire-pulse"
-    "pulseaudio"
+    "pipewire-pulse"     # provides the PulseAudio client API
     "ladspa"
     "ladspa-plugins"
 )
@@ -133,8 +138,67 @@ print_help() {
 
 # --- Step implementations ----------------------------------------------------
 install_deps() {
+    # ========================================================================
+    # SAFETY GUARDS — read these before running --install-deps
+    # ========================================================================
+    # This function invokes `sudo pacman` / `apt` / `dnf` on the host. It is
+    # INTENDED FOR USE INSIDE A BUILD ENVIRONMENT (a fresh container, a
+    # throwaway VM, a GitHub Actions runner) — NOT on a workstation you care
+    # about. It will refuse to run by default in interactive desktop
+    # sessions. To opt in, set the env var HOLAF_BUILD_INSTALL_DEPS=1.
+    # ========================================================================
+
     detect_distro
     hdr "Detected distro: $DISTRO_FAMILY ($PKG_MGR)"
+
+    # Guard 1: explicit opt-in env var
+    if [[ "${HOLAF_BUILD_INSTALL_DEPS:-0}" != "1" ]]; then
+        err "Refusing to install system packages without explicit opt-in."
+        err ""
+        err "This script calls 'sudo pacman' / 'apt' / 'dnf' on your machine."
+        err "If you really want that, re-run with:"
+        err "    HOLAF_BUILD_INSTALL_DEPS=1 ./build.sh --install-deps"
+        err ""
+        err "Safer alternatives:"
+        err "  - Build inside a container (see .github/workflows/build.yml)"
+        err "  - Install deps manually (see BUILD.md for your distro)"
+        exit 2
+    fi
+
+    # Guard 2: refuse if a graphical session is detected
+    if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}${XDG_CURRENT_DESKTOP:-}" ]]; then
+        err "Refusing to run --install-deps: a graphical session is detected."
+        err "  DISPLAY=${DISPLAY:-(unset)}"
+        err "  WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-(unset)}"
+        err "  XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-(unset)}"
+        err ""
+        err "This usually means you're on a desktop / workstation. Running"
+        err "package managers in a GUI session is risky because:"
+        err "  - It can disrupt running services (e.g. pipewire-pulse)"
+        err "  - A failed transaction can leave the system in a partial state"
+        err "  - It can break user sessions mid-operation"
+        err ""
+        err "Use a build environment instead: container, VM, or CI runner."
+        err "If you REALLY know what you're doing, unset these vars first."
+        exit 3
+    fi
+
+    # Guard 3: confirm interactively (skipped if non-interactive, e.g. CI)
+    if [[ -t 0 ]]; then
+        printf '\033[1;33m[build]\033[0m About to run:\n'
+        case "$DISTRO_FAMILY" in
+            arch)   printf '    sudo pacman -S --needed %s\n' "${SYSTEM_DEPS_ARCH[*]}" ;;
+            debian) printf '    sudo apt install %s\n'         "${SYSTEM_DEPS_DEBIAN[*]}" ;;
+            fedora) printf '    sudo dnf install %s\n'         "${SYSTEM_DEPS_FEDORA[*]}" ;;
+        esac
+        printf '    pip install %s\n' "${PYTHON_DEPS[*]}"
+        printf '\033[1;33m[build]\033[0m Continue? [y/N] '
+        read -r answer
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            err "Aborted by user."
+            exit 4
+        fi
+    fi
 
     if [[ "$DISTRO_FAMILY" == "unknown" ]]; then
         err "Unsupported distro. Please install manually:"
