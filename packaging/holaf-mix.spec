@@ -16,14 +16,23 @@
 # ============================================================================
 
 from pathlib import Path
+import sys
 
 block_cipher = None
 
 # --- Paths -------------------------------------------------------------------
-# The .spec lives in <repo>/packaging/, so the repo root is its parent.
-# Resolving paths from the spec's own location makes the build reproducible
-# regardless of the caller's cwd.
-SPEC_DIR = Path(__file__).resolve().parent
+# PyInstaller executes this spec file in a namespace where __file__ is NOT
+# defined (it gets stripped to avoid leaking build-host paths into the bundle).
+# However, PyInstaller sets sys.argv[0] to the spec file's path, so we use
+# that as a reliable anchor. Falls back to CWD if the spec is fed via stdin
+# (rare; not a concern for our build.sh workflow).
+_spec_argv0 = sys.argv[0] if sys.argv and sys.argv[0] else ''
+if _spec_argv0 and Path(_spec_argv0).is_file():
+    SPEC_DIR = Path(_spec_argv0).resolve().parent
+else:
+    # Fallback: assume the spec is run from its own directory (e.g. when
+    # `pyinstaller --clean` is invoked from packaging/).
+    SPEC_DIR = Path.cwd()
 ROOT = SPEC_DIR.parent
 MAIN_PY = ROOT / 'main.py'
 ICON_PNG = ROOT / 'dist' / 'icons' / 'holaf-mix-256.png'
