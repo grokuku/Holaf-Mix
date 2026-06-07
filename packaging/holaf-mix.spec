@@ -20,12 +20,17 @@ from pathlib import Path
 block_cipher = None
 
 # --- Paths -------------------------------------------------------------------
-ROOT = Path('.').resolve()
+# The .spec lives in <repo>/packaging/, so the repo root is its parent.
+# Resolving paths from the spec's own location makes the build reproducible
+# regardless of the caller's cwd.
+SPEC_DIR = Path(__file__).resolve().parent
+ROOT = SPEC_DIR.parent
+MAIN_PY = ROOT / 'main.py'
 ICON_PNG = ROOT / 'dist' / 'icons' / 'holaf-mix-256.png'
 
 # --- Analysis ----------------------------------------------------------------
 a = Analysis(
-    ['main.py'],
+    [str(MAIN_PY)],
     pathex=[str(ROOT)],
     binaries=[],
     # Bundle the default config so a fresh install has something to load.
