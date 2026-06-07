@@ -42,11 +42,12 @@ a = Analysis(
     [str(MAIN_PY)],
     pathex=[str(ROOT)],
     binaries=[],
-    # Bundle the default config so a fresh install has something to load.
-    # The user's config.json still lives next to the executable (writable).
-    datas=[
-        ('config.json', '.'),
-    ],
+    # We don't bundle config.json into the binary. The app creates a
+    # default config on first run and writes it next to the executable
+    # (see _resolve_config_path() in src/config/settings.py). Bundling
+    # the source config would only matter for "fresh-install" scenarios
+    # where the user wants pre-existing settings, which isn't our use case.
+    datas=[],
     # sounddevice loads PortAudio via ctypes, which PyInstaller misses.
     # python-rtmidi has a dynamic backend. These hidden imports force
     # PyInstaller to include the .so modules explicitly.
