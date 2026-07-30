@@ -695,15 +695,44 @@ class AudioEngine:
             # VU meters going crazy on other outputs because WirePlumber was
             # auto-connecting audio to the FX chain's virtual sink).
             capture_props = 'media.class = Audio/Sink node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ] media.role = comms'
-            playback_props = 'node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
+            # target.object ensures WirePlumber connects the filter-chain's
+            # playback stream to the intended physical/virtual device.
+            # WITHOUT it, WirePlumber auto-connects to the system default
+            # sink, duplicating the signal and causing VU meters on the
+            # default sink (and outputs fed by it) to show phantom signal.
+            # node.passive = true does NOT prevent this auto-connect — it only
+            # controls the graph busy state.
+            playback_props = f'node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ] target.object = "{master_node_name}"'
         else:
             # Input: capture receives from the source (passive follower),
             # playback acts as a virtual source.
+            #
+            # target.object on capture.props tells WirePlumber to auto-connect
+            # the filter-chain's capture stream to the SPECIFIC source
+            # (master_node_name), NOT the system default source.
+            #
+            # Without target.object, WirePlumber's default policy auto-connects
+            # the capture stream to the DEFAULT source (e.g. the system mic or
+            # another input).  The manual pw-link then ALSO connects the correct
+            # source, so the FX chain receives from BOTH → one input's audio
+            # "bleeds" onto another input's VU meter (BUG: VU meter activates
+            # with no sound from the correct source).
+            #
+            # node.passive = true does NOT prevent auto-connection — it only
+            # controls graph suspension.  The previous approach of omitting
+            # target.object and relying on node.passive was incorrect.
+            #
+            # The source (master_node_name) is guaranteed to exist before the
+            # FX chain is created: physical sources always exist, and virtual
+            # inputs' null-sink monitor is polled until visible in pw-dump.
+            # The manual pw-link below is kept as a safety net — pw-link returns
+            # "exists" (handled gracefully) if WirePlumber already linked the
+            # same ports.
+            capture_props = f'node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ] target.object = "{master_node_name}"'
             # node.passive on playback.props tells WirePlumber NOT to auto-connect
             # this virtual source to physical outputs (which would cause mic
             # leakage into headphones).  stream.dont-remix prevents channel
             # remixing.
-            capture_props = 'node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
             playback_props = 'media.class = Audio/Source node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
 
         # NOTE: We no longer fall back to loading WITHOUT controls.  The
@@ -745,31 +774,66 @@ class AudioEngine:
                 in_node = f"input.{fx_node_name}"
                 out_node = f"output.{fx_node_name}"
 
+                # Invalidate pw-dump cache so _find_node_id_by_name sees
+                # the freshly-created nodes immediately (cache TTL=0.5s can
+                # otherwise hide them for several calls).
+                pipewire_utils.invalidate_pw_dump_cache()
+
+                # Verify BOTH input and output ports are ready.  Previously
+                # only input ports were checked, but _create_link needs the
+                # output ports of the virtual source to be visible in pw-link.
+                # If they aren't ready yet, routing silently fails.
                 ports_ready = False
                 for _ in range(FX_CHAIN_PORT_VERIFY_ATTEMPTS):
                     time.sleep(FX_CHAIN_PORT_VERIFY_INTERVAL_S)
-                    ports = self._get_ports_by_name(in_node, is_input=True)
-                    if ports:
+                    in_ports = self._get_ports_by_name(in_node, is_input=True)
+                    out_ports = self._get_ports_by_name(out_node, is_input=False)
+                    if in_ports and out_ports:
                         ports_ready = True
                         break
                     
                 if not ports_ready:
-                    logger.warning(f"FX Node verification failed (controls={use_controls}).")
+                    missing = []
+                    if not in_ports: missing.append(f"input ports for {in_node}")
+                    if not out_ports: missing.append(f"output ports for {out_node}")
+                    logger.warning(
+                        f"FX Node verification failed (controls={use_controls}): "
+                        f"missing {' and '.join(missing)}."
+                    )
                     # Clean up partially-created nodes before next attempt
                     self._destroy_nodes_by_name_substring(fx_node_name)
                     continue 
 
-                logger.info(f"FX Chain successfully loaded: {fx_node_name}")
+                logger.info(f"FX Chain successfully loaded: {fx_node_name} (in_ports={len(in_ports)}, out_ports={len(out_ports)})")
 
-                # Linking Logic
-                if is_output:
-                    # Link filter output → physical/virtual device
-                    links = self._auto_link_ports(out_node, master_node_name)
-                else:
-                    # Link source → filter input
-                    links = self._auto_link_ports(master_node_name, in_node)
+                # Linking Logic — link source → filter input (for input strips)
+                # or filter output → device (for output strips).
+                # Retry a few times because port enumeration in pw-link may
+                # lag behind the node creation by a few milliseconds.
+                links = []
+                for link_attempt in range(self.LINK_CREATE_MAX_RETRIES):
+                    if is_output:
+                        # Link filter output → physical/virtual device
+                        links = self._auto_link_ports(out_node, master_node_name)
+                    else:
+                        # Link source → filter input
+                        links = self._auto_link_ports(master_node_name, in_node)
+                    if links:
+                        break
+                    if link_attempt < self.LINK_CREATE_MAX_RETRIES - 1:
+                        logger.debug(
+                            f"FX input link attempt {link_attempt + 1}/{self.LINK_CREATE_MAX_RETRIES} "
+                            f"failed for {master_node_name} -> {in_node if not is_output else out_node}, retrying..."
+                        )
+                        time.sleep(self.LINK_CREATE_RETRY_INTERVAL_S)
                 if not links:
-                    logger.info(f"Stereo link to FX incomplete (normal if link exists). Verifying...")
+                    logger.error(
+                        f"Failed to link source to FX chain after {self.LINK_CREATE_MAX_RETRIES} attempts: "
+                        f"{master_node_name} -> {in_node if not is_output else out_node} — "
+                        f"audio will not reach the FX chain!"
+                    )
+                else:
+                    logger.info(f"FX input link created: {len(links)} ports linked")
                 
                 in_id = self._find_node_id_by_name(in_node)
                 out_id = self._find_node_id_by_name(out_node)
@@ -781,6 +845,7 @@ class AudioEngine:
                 fc_node_id = self._find_node_id_by_name(fx_node_name)
                 if fc_node_id:
                     self.fx_node_ids[strip.uid] = fc_node_id
+                    logger.info(f"FX node ID stored: {fc_node_id} for strip {strip.uid}")
                 else:
                     logger.warning(f"Could not find filter-chain node ID for {fx_node_name}; hot-reload will fall back to restart.")
                 
@@ -924,21 +989,33 @@ class AudioEngine:
                 routes_to_restore.append((src_uid, dst_uid))
                 keys_to_remove.append((src_uid, dst_uid))
 
+        logger.info(f"reload_strip: destroying {len(keys_to_remove)} links for '{strip.label}': {routes_to_restore}")
         for key in keys_to_remove:
+            logger.debug(f"reload_strip: destroying link {key[0]} -> {key[1]}")
             self._destroy_link(key[0], key[1])
 
         # --- 2. Destroy FX nodes for this strip ---
+        logger.info(f"reload_strip: destroying FX nodes matching '{fx_node_name}'")
         self._destroy_nodes_by_name_substring(fx_node_name)
 
         # Clean up registries for this strip
-        self.fx_source_names.pop(uid, None)
-        self.fx_sink_names.pop(uid, None)
-        self.fx_node_ids.pop(uid, None)
+        old_fx_src = self.fx_source_names.pop(uid, None)
+        old_fx_sink = self.fx_sink_names.pop(uid, None)
+        old_fx_node = self.fx_node_ids.pop(uid, None)
+        if old_fx_src: logger.info(f"reload_strip: cleared fx_source_names[{uid}] = {old_fx_src}")
+        if old_fx_sink: logger.info(f"reload_strip: cleared fx_sink_names[{uid}] = {old_fx_sink}")
+        if old_fx_node: logger.info(f"reload_strip: cleared fx_node_ids[{uid}] = {old_fx_node}")
         # Reset hot-reload failure counter — fresh chain.
         self._fx_hotreload_failures.pop(uid, None)
 
         # Stop metering for this strip (will restart after chain creation)
         self.metering.stop_monitoring(uid)
+
+        # Invalidate pw-dump cache so that _find_node_id_by_name (called
+        # inside _create_fx_chain) sees the freshly-created nodes immediately.
+        # Without this, the 0.5s TTL cache may return stale data and
+        # fx_node_ids[uid] won't be set, making subsequent hot-reload fail.
+        pipewire_utils.invalidate_pw_dump_cache()
 
         # --- 3. Recreate the FX chain (if any effect is active) ---
         node_id = self.node_registry.get(uid)
@@ -948,10 +1025,13 @@ class AudioEngine:
         if not _has_active_fx(strip):
             # No active FX — no chain to create.  Fall back to direct
             # monitor-port routing for physical sources.
+            logger.info(f"reload_strip: no active FX for '{strip.label}', using direct routing")
             if strip.kind == StripType.INPUT and is_source:
                 self._link_physical_source_to_strip(strip)
+                logger.info(f"reload_strip: set fx_source_names[{uid}] = {self.fx_source_names.get(uid)} (monitor)")
 
             # Re-link routes
+            logger.info(f"reload_strip: re-linking {len(routes_to_restore)} routes (no FX)")
             for (src_uid, dst_uid) in routes_to_restore:
                 self.update_routing(src_uid, dst_uid, active=True)
 
@@ -970,6 +1050,7 @@ class AudioEngine:
                 logger.error(f"reload_strip: failed to recreate FX chain for {strip.label}")
                 return False
             self.fx_sink_names[uid] = fx_sink
+            logger.info(f"reload_strip: set fx_sink_names[{uid}] = {fx_sink}")
         else:
             base_source = strip.device_name if is_source else (f"{node_name}.monitor" if node_name else None)
             if not base_source:
@@ -980,8 +1061,10 @@ class AudioEngine:
                 logger.error(f"reload_strip: failed to recreate FX chain for {strip.label}")
                 return False
             self.fx_source_names[uid] = fx_src
+            logger.info(f"reload_strip: set fx_source_names[{uid}] = {fx_src}")
 
         # --- 4. Re-link routes involving this strip ---
+        logger.info(f"reload_strip: re-linking {len(routes_to_restore)} routes for '{strip.label}': {routes_to_restore}")
         for (src_uid, dst_uid) in routes_to_restore:
             self.update_routing(src_uid, dst_uid, active=True)
 
@@ -1279,11 +1362,20 @@ class AudioEngine:
         
         return created_links
 
+    # Retry configuration for _create_link port linking.  After a reload_strip,
+    # the new FX chain's output ports may not be visible in pw-link output
+    # for a few hundred milliseconds.  Without retries, _auto_link_ports
+    # returns [] and the routing is silently lost.
+    LINK_CREATE_MAX_RETRIES = 5
+    LINK_CREATE_RETRY_INTERVAL_S = 0.1
+
     def _create_link(self, source_uid: str, target_uid: str):
         src_id = self.node_registry.get(source_uid)
         dst_id = self.node_registry.get(target_uid)
         
-        if not src_id or not dst_id: return
+        if not src_id or not dst_id:
+            logger.warning(f"_create_link: missing node_id src={source_uid}({src_id}) dst={target_uid}({dst_id})")
+            return
         
         active_src_name = self.fx_source_names.get(source_uid)
         raw_src_name = self._get_node_name(src_id)
@@ -1291,7 +1383,9 @@ class AudioEngine:
         # instead of the raw physical/virtual device node.
         dst_name = self.fx_sink_names.get(target_uid) or self._get_node_name(dst_id)
         
-        if not dst_name: return
+        if not dst_name:
+            logger.warning(f"_create_link: could not resolve dst_name for target_uid={target_uid}")
+            return
 
         # ANTI-GATE FIX: EXCLUSIVE ROUTING
         if active_src_name:
@@ -1303,16 +1397,44 @@ class AudioEngine:
             self._unlink_nodes(fx_name_potential, dst_name)
             src_name_to_use = raw_src_name
         
-        if not src_name_to_use: return
+        if not src_name_to_use:
+            logger.warning(f"_create_link: src_name_to_use is None for {source_uid} -> {target_uid}")
+            return
 
         is_mono = self.mono_registry.get(source_uid, False)
-        created_links = self._auto_link_ports(src_name_to_use, dst_name, force_mono=is_mono)
+
+        # Retry loop: after a reload_strip, the new FX chain's ports may not
+        # be visible in pw-link output for a few hundred milliseconds.  Without
+        # retries, _auto_link_ports returns [] and the routing is silently
+        # lost — the primary cause of the "routing breaks on FX toggle" bug.
+        created_links = []
+        for attempt in range(self.LINK_CREATE_MAX_RETRIES):
+            created_links = self._auto_link_ports(src_name_to_use, dst_name, force_mono=is_mono)
+            if created_links:
+                break
+            if attempt < self.LINK_CREATE_MAX_RETRIES - 1:
+                logger.debug(
+                    f"_create_link: no ports found for '{src_name_to_use}' -> '{dst_name}' "
+                    f"(attempt {attempt + 1}/{self.LINK_CREATE_MAX_RETRIES}), retrying..."
+                )
+                time.sleep(self.LINK_CREATE_RETRY_INTERVAL_S)
         
         if created_links:
             self.link_registry[(source_uid, target_uid)] = created_links
+            logger.info(
+                f"_create_link: linked {src_name_to_use} -> {dst_name} "
+                f"({len(created_links)} ports) [{source_uid} -> {target_uid}]"
+            )
+        else:
+            logger.error(
+                f"_create_link: FAILED to link '{src_name_to_use}' -> '{dst_name}' "
+                f"after {self.LINK_CREATE_MAX_RETRIES} attempts [{source_uid} -> {target_uid}] — "
+                f"routing is LOST!"
+            )
 
     def _destroy_link(self, source_uid: str, target_uid: str):
         links = self.link_registry.pop((source_uid, target_uid), [])
+        logger.debug(f"_destroy_link: {source_uid} -X- {target_uid} (had {len(links)} port links)")
         
         src_id = self.node_registry.get(source_uid)
         dst_id = self.node_registry.get(target_uid)
