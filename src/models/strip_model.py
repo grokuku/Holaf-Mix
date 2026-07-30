@@ -92,8 +92,29 @@ DEFAULT_EFFECT_PARAMS = {
 # explicit value.  This is critical because pw-cli set-param REPLACES all
 # control values (it does not merge), so partial specs would reset
 # unmentioned ports to LADSPA defaults.
+# NOTE: The gate's "Output select" port name contains '=' signs which
+# are the same character SPA-JSON uses as key-value separator.  PipeWire's
+# parser may reject the ENTIRE control block for a node whose key contains
+# '=', discarding all control values → the gate falls back to LADSPA
+# defaults (Range = -90 dB, gate mode) → silence.
+#
+# _format_params() now skips keys containing '=' (see its docstring).
+# "Output select" is therefore NEVER sent to PipeWire.  The LADSPA default
+# for that port is 0 (gate mode), which is correct for active gates.
+# For inactive (bypassed) gates, Range = 0.0 and Threshold = -100.0 make
+# the gate fully transparent regardless of the Output select value.
+#
+# We keep "Output select" in BYPASS_PARAMS for documentation purposes,
+# but it is filtered out by _format_params at format time.
 BYPASS_PARAMS = {
-    "gate": {"Output select (-1 = key listen, 0 = gate, 1 = bypass)": 1.0},
+    "gate": {
+        # "Output select" is filtered out by _format_params (= signs break SPA-JSON).
+        # The gate stays in gate mode (LADSPA default 0), but the two values below
+        # make it fully transparent (always open, no gain reduction).
+        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 1.0,  # bypass mode (documented; filtered at format time)
+        "Range (dB)": 0.0,       # no gain reduction even if gate closes
+        "Threshold (dB)": -100.0,  # gate always open (signal always above -100 dB)
+    },
     "noise_cancel": {"Dry Mix": 1.0},  # 1.0 = pure dry passthrough
     "eq": {  # All bands flat (0.0 dB)
         "50Hz gain (low shelving)": 0.0,

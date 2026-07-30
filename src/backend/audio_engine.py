@@ -104,10 +104,22 @@ def _format_params(params: Dict[str, float]) -> str:
     """
     Converts a dictionary of parameters into SPA-JSON control format.
     Example: {'Thresh': -30} -> '{ "Thresh" = -30 }'
+
+    IMPORTANT: Keys containing '=' signs are **skipped** because PipeWire's
+    SPA-JSON parser uses '=' as its key-value separator and may fail to
+    parse the entire control block when a quoted key contains '=' —
+    discarding ALL control values for that node.
+
+    The only affected key is the gate_1410 plugin's
+    'Output select (-1 = key listen, 0 = gate, 1 = bypass)'.
+    Omitting it is safe: the LADSPA default for that port is 0 (gate mode),
+    which is correct for active gates.  For inactive (bypassed) gates,
+    the safety nets Range=0.0 and Threshold=-100.0 (set in BYPASS_PARAMS)
+    make the gate fully transparent regardless of the Output select value.
     """
     if not params:
         return "{}"
-    items = [f'"{k}" = {v}' for k, v in params.items()]
+    items = [f'"{k}" = {v}' for k, v in params.items() if '=' not in k]
     return f'{{ {" ".join(items)} }}'
 
 
@@ -678,7 +690,11 @@ class AudioEngine:
             # this virtual sink to any physical source — only manual pw-link
             # routing should drive it.  stream.dont-remix prevents channel
             # remixing that could alter the signal.
-            capture_props = 'media.class = Audio/Sink node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
+            # media.role = comms prevents WirePlumber from listing this as a
+            # regular media sink and auto-routing other streams to it (BUG 2:
+            # VU meters going crazy on other outputs because WirePlumber was
+            # auto-connecting audio to the FX chain's virtual sink).
+            capture_props = 'media.class = Audio/Sink node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ] media.role = comms'
             playback_props = 'node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
         else:
             # Input: capture receives from the source (passive follower),
@@ -690,7 +706,13 @@ class AudioEngine:
             capture_props = 'node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
             playback_props = 'media.class = Audio/Source node.passive = true stream.dont-remix = true audio.channels = 2 audio.position = [ FL, FR ]'
 
-        attempts = [True, False]
+        # NOTE: We no longer fall back to loading WITHOUT controls.  The
+        # previous fallback (attempts = [True, False]) loaded the filter-chain
+        # with LADSPA default values when the first attempt failed.  For the
+        # gate, the LADSPA default is Output select = 0 (gate mode) with
+        # Range = -90 dB → SILENCE.  If the first attempt fails, return None
+        # so the caller can retry or fall back to a full engine restart.
+        attempts = [True]
 
         for use_controls in attempts:
             graph_str = _build_fx_graph(strip, _format_params, use_controls)

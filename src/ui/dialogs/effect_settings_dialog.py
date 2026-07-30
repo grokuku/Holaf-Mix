@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                               QSlider, QDoubleSpinBox, QPushButton, QWidget, QScrollArea)
+                               QSlider, QDoubleSpinBox, QPushButton, QWidget)
 from PySide6.QtCore import Qt
 
 class EffectSettingsDialog(QDialog):
@@ -18,7 +18,7 @@ class EffectSettingsDialog(QDialog):
     def __init__(self, effect_name, current_params, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Settings: {effect_name.upper()}")
-        self.setFixedWidth(400)
+        self.setMinimumWidth(420)
         self.setModal(True)
         self.current_params = current_params
         self.effect_name = effect_name
@@ -27,26 +27,26 @@ class EffectSettingsDialog(QDialog):
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        
-        # Scroll Area for EQ which has many bands
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("background-color: #2b2b2b; border: none;")
-        
+
         container = QWidget()
         self.form_layout = QVBoxLayout(container)
         self.form_layout.setSpacing(15)
-        
+
         # Sort params to keep order (especially for EQ frequencies)
         # Simple heuristic: try to sort by numeric value in key if possible (for Hz), else alpha
         sorted_keys = sorted(self.current_params.keys(), key=self._sort_key)
-        
+
         for param_key in sorted_keys:
+            # Skip params whose name contains '=' — their value is filtered
+            # out by the SPA-JSON formatter (e.g. gate "Output select
+            # (-1 = key listen, 0 = gate, 1 = bypass)").  Showing a control
+            # that never reaches PipeWire would be misleading.
+            if '=' in param_key:
+                continue
             val = self.current_params[param_key]
             self._add_control(param_key, val)
 
-        scroll.setWidget(container)
-        main_layout.addWidget(scroll)
+        main_layout.addWidget(container)
 
         # Close Button
         btn_close = QPushButton("Close")
@@ -56,6 +56,18 @@ class EffectSettingsDialog(QDialog):
             QPushButton:hover { background-color: #555; }
         """)
         main_layout.addWidget(btn_close)
+
+        # Auto-size the dialog to fit all controls (no scroll bar).
+        # Each effect has a different number of params so the height
+        # naturally adapts (EQ=15 → tall, tube=2 → short).
+        self.adjustSize()
+        # Clamp to available screen height to avoid going off-screen
+        # on very small displays.
+        screen = self.screen()
+        if screen is not None:
+            max_h = screen.availableGeometry().height() - 50
+            if self.height() > max_h:
+                self.setMaximumHeight(max_h)
 
     def _sort_key(self, key):
         """Helper to sort EQ bands like 50Hz, 100Hz correctly.
