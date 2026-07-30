@@ -87,9 +87,16 @@ jobs:
       # ------------------------------------------------------------------
       # 1. Install system dependencies (Arch inside the container)
       # ------------------------------------------------------------------
-      - name: Refresh package database
+      - name: Full system upgrade (align glibc with repo packages)
+        # Critical: `pacman -Syu` upgrades ALL packages (including glibc)
+        # to match the synced repo versions. The base archlinux:latest
+        # image may ship an older glibc than the one imagemagick was
+        # compiled against, causing:
+        #   magick: GLIBC_2.44 not found (required by libMagickCore-7…)
+        # A plain `pacman -Sy` (no upgrade) would leave glibc stale while
+        # `pacman -S imagemagick` installs the latest build → ABI mismatch.
         run: |
-          pacman -Sy --noconfirm
+          pacman -Syu --noconfirm
 
       - name: Install build dependencies
         run: |
