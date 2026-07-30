@@ -85,6 +85,13 @@ DEFAULT_EFFECT_PARAMS = {
 # When an effect is inactive, these values make the plugin transparent
 # so it stays in the filter-chain graph without altering the audio.
 # This enables hot-reload toggling via set-param instead of full restarts.
+#
+# NOTE: Only the KEY parameter that makes the effect transparent needs to
+# be listed here.  The audio engine merges these values on top of
+# DEFAULT_EFFECT_PARAMS at build time, so every control port receives an
+# explicit value.  This is critical because pw-cli set-param REPLACES all
+# control values (it does not merge), so partial specs would reset
+# unmentioned ports to LADSPA defaults.
 BYPASS_PARAMS = {
     "gate": {"Output select (-1 = key listen, 0 = gate, 1 = bypass)": 1.0},
     "noise_cancel": {"Dry Mix": 1.0},  # 1.0 = pure dry passthrough

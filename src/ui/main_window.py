@@ -9,6 +9,9 @@ from src.ui.widgets.strip_widget import StripWidget
 
 # Updated import: pipewire_utils is now located in src.backend
 from src.backend import pipewire_utils
+import logging
+
+logger = logging.getLogger("MainWindow")
 
 # --- UI timing constants ---
 # Debounce window for engine restarts: rapid FX toggles are coalesced into one
@@ -583,7 +586,8 @@ class MainWindow(QMainWindow):
         With always-on effects, the filter-chain graph already contains all
         plugins.  Toggling just switches between real params and neutral bypass
         values via set-param (hot-reload), avoiding a full engine restart.
-        Falls back to restart if the FX node is not available.
+        Falls back to restart if the FX node is not available or set-param
+        fails (e.g. pw-cli error, process death, or too many failures).
         """
         self._save_state()
         strip = next((s for s in self.strips if s.uid == uid), None)
@@ -592,6 +596,7 @@ class MainWindow(QMainWindow):
         # Attempt hot-reload (toggle = bypass/active values via set-param)
         success = self.audio_engine.update_fx_params(strip)
         if not success:
+            logger.info(f"Effect toggle for '{effect_name}' on '{strip.label}' falling back to full restart.")
             self._schedule_engine_restart()
 
     def on_strip_effect_params_changed(self, uid, effect_name):
@@ -608,4 +613,5 @@ class MainWindow(QMainWindow):
             success = self.audio_engine.update_fx_params(strip)
             if not success:
                 # Fallback: full engine restart
+                logger.info(f"FX param change for '{effect_name}' on '{strip.label}' falling back to full restart.")
                 self._schedule_engine_restart()

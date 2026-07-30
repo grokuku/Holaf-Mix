@@ -4,10 +4,11 @@ import logging
 import json
 import re
 import os
+import select
 from typing import Dict, List, Optional, Tuple
 
 from . import pipewire_utils
-from src.models.strip_model import Strip, StripType, StripMode, BYPASS_PARAMS
+from src.models.strip_model import Strip, StripType, StripMode, BYPASS_PARAMS, DEFAULT_EFFECT_PARAMS
 from src.backend.metering import MeteringEngine
 
 # NOTE: Logging is configured in main.py, not here. Module-level
@@ -38,6 +39,10 @@ METER_RETRY_INTERVAL_CYCLES = 50
 
 # Default polling interval for waiting on async PipeWire operations.
 PIPEWAIT_POLL_INTERVAL_S = 0.05
+
+# Safety net: after this many consecutive set-param failures for a given
+# strip, hot-reload is disabled and all FX toggles fall back to restart.
+FX_HOTRELOAD_MAX_FAILURES = 3
 
 
 # --- FX graph builders (module-level so they can be tested in isolation) ---
@@ -84,6 +89,64 @@ def _format_params(params: Dict[str, float]) -> str:
     return f'{{ {" ".join(items)} }}'
 
 
+def _resolve_effect_controls(strip, key: str) -> Dict[str, float]:
+    """Return the full control-parameter dict for a given effect.
+
+    When the effect is **active**, the user's params are used as-is.
+    When the effect is **inactive**, BYPASS_PARAMS values are merged on top
+    of DEFAULT_EFFECT_PARAMS so that *every* control port receives an
+    explicit value.  This is critical for ``set-param`` (Props), which
+    **replaces** all control values rather than merging them — sending only
+    a partial set would reset unmentioned ports to LADSPA defaults and
+    could produce unexpected audio artefacts.
+    """
+    active, params = _get_fx_data(strip.effects, key)
+    if active:
+        return params
+    merged = dict(DEFAULT_EFFECT_PARAMS.get(key, {}))
+    merged.update(BYPASS_PARAMS.get(key, {}))
+    return merged
+
+
+def _build_fx_props(strip, format_params_fn) -> str:
+    """Build the Props SPA-JSON string for ``set-param`` on a filter-chain node.
+
+    Unlike ``_build_fx_graph`` which produces the full graph definition
+    (nodes, links, inputs, outputs), this function produces **only** the
+    control values in the format expected by PipeWire's Props param:
+
+    ::
+
+        { "node_name" = { "control_port" = value } ... }
+
+    Mono plugins get two entries (``_L`` and ``_R``); stereo plugins get
+    one entry.  Returns an empty string if no plugins are available.
+    """
+    props_parts = []
+
+    for (key, internal_name, plugin_file, ladspa_label) in FX_PLUGIN_MAP:
+        plugin_abs_path = os.path.join(LADSPA_PATH, f"{plugin_file}.so")
+        if not os.path.exists(plugin_abs_path):
+            continue
+
+        ctrl = _resolve_effect_controls(strip, key)
+        ctrl_str = format_params_fn(ctrl)
+        if ctrl_str == '{}':
+            continue
+
+        stereo_info = STEREO_PLUGINS.get(plugin_file)
+        if stereo_info:
+            props_parts.append(f'"{internal_name}" = {ctrl_str}')
+        else:
+            props_parts.append(f'"{internal_name}_L" = {ctrl_str}')
+            props_parts.append(f'"{internal_name}_R" = {ctrl_str}')
+
+    if not props_parts:
+        return ""
+
+    return f'{{ {" ".join(props_parts)} }}'
+
+
 def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
     """
     Build the SPA-JSON filter.graph string for a strip's active effects.
@@ -122,8 +185,11 @@ def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
         if active:
             ctrl = format_params_fn(params)
         else:
-            # Neutral/bypass values — plugin stays in graph but is transparent.
-            ctrl = format_params_fn(BYPASS_PARAMS.get(key, {}))
+            # Merge bypass values over defaults so ALL control ports get
+            # explicit values.  set-param replaces (not merges) controls,
+            # so partial values would reset unmentioned ports to LADSPA
+            # defaults — potentially causing unexpected audio behaviour.
+            ctrl = format_params_fn(_resolve_effect_controls(strip, key))
         stereo_info = STEREO_PLUGINS.get(plugin_file)
         fx_list.append((internal_name, plugin_abs_path, ladspa_label, ctrl, stereo_info))
 
@@ -207,6 +273,10 @@ class AudioEngine:
         self.fx_host_process: Optional[subprocess.Popen] = None
         self.metering = MeteringEngine()
         self._meter_retry_counter = 0
+        # Safety net: track consecutive hot-reload (set-param) failures per
+        # strip.  After FX_HOTRELOAD_MAX_FAILURES, hot-reload is disabled for
+        # that strip and all toggles fall back to full restart.
+        self._fx_hotreload_failures: Dict[str, int] = {}
 
     def start_engine(self, strips: List[Strip]):
         logger.info("Starting Audio Engine...")
@@ -228,6 +298,8 @@ class AudioEngine:
         self.fx_source_names.clear()
         self.fx_sink_names.clear()
         self.fx_node_ids.clear()
+        # Reset hot-reload failure counters on fresh start.
+        self._fx_hotreload_failures.clear()
         
         # 2. Create Nodes
         for strip in strips:
@@ -352,11 +424,15 @@ class AudioEngine:
 
         try:
             logger.info("Starting Persistent FX Host (pw-cli)...")
+            # Capture stdout AND stderr via PIPE so we can detect errors
+            # (especially set-param failures).  Previously these were
+            # DEVNULL, which swallowed all error messages and made
+            # debugging impossible.
             self.fx_host_process = subprocess.Popen(
                 ['pw-cli'], 
                 stdin=subprocess.PIPE, 
-                stdout=subprocess.DEVNULL, 
-                stderr=subprocess.DEVNULL, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
                 text=True,
                 bufsize=1
             )
@@ -374,6 +450,61 @@ class AudioEngine:
                 self.fx_host_process.kill()
             self.fx_host_process = None
 
+    # --- pw-cli output helpers ---
+
+    def _drain_pw_cli_output(self):
+        """Non-blocking drain of any pending pw-cli stdout/stderr.
+
+        Prevents the OS pipe buffer (~64 KB) from filling up and blocking
+        pw-cli.  Should be called periodically and before sending commands.
+        """
+        if not self.fx_host_process or self.fx_host_process.poll() is not None:
+            return
+        try:
+            while True:
+                ready, _, _ = select.select(
+                    [self.fx_host_process.stdout, self.fx_host_process.stderr],
+                    [], [], 0.0
+                )
+                if not ready:
+                    break
+                for fd in ready:
+                    fd.readline()
+        except Exception:
+            pass
+
+    def _read_pw_cli_output(self, timeout: float = 0.3) -> Tuple[str, str]:
+        """Read available output from pw-cli stdout and stderr.
+
+        Returns (stdout_text, stderr_text).  Blocks up to *timeout* seconds
+        for the first line, then drains remaining lines non-blocking.
+        """
+        stdout_data: List[str] = []
+        stderr_data: List[str] = []
+        if not self.fx_host_process or self.fx_host_process.poll() is not None:
+            return "", "process dead"
+        try:
+            poll_timeout = timeout
+            while True:
+                ready, _, _ = select.select(
+                    [self.fx_host_process.stdout, self.fx_host_process.stderr],
+                    [], [], poll_timeout
+                )
+                if not ready:
+                    break
+                for fd in ready:
+                    line = fd.readline()
+                    if not line:
+                        continue
+                    if fd == self.fx_host_process.stdout:
+                        stdout_data.append(line.rstrip())
+                    else:
+                        stderr_data.append(line.rstrip())
+                poll_timeout = 0.05  # short timeout for subsequent reads
+        except Exception as e:
+            logger.error(f"Error reading pw-cli output: {e}")
+        return "\n".join(stdout_data), "\n".join(stderr_data)
+
     # --- Public API ---
     
     def get_meter_levels(self):
@@ -387,6 +518,9 @@ class AudioEngine:
             if self.fx_host_process is None or self.fx_host_process.poll() is not None:
                 logger.warning("FX host (pw-cli) is not running; restarting.")
                 self._start_fx_host()
+            else:
+                # Drain any stale pw-cli output to prevent pipe buffer overflow.
+                self._drain_pw_cli_output()
         return self.metering.get_levels()
 
     def set_volume(self, strip_uid: str, volume: float):
@@ -531,6 +665,10 @@ class AudioEngine:
                 self.fx_host_process.stdin.write(cmd_str)
                 self.fx_host_process.stdin.flush()
                 
+                # Drain any immediate pw-cli output (e.g. "loaded module: N")
+                # so it doesn't accumulate in the pipe buffer.
+                self._drain_pw_cli_output()
+                
                 # --- VERIFICATION ---
                 in_node = f"input.{fx_node_name}"
                 out_node = f"output.{fx_node_name}"
@@ -591,30 +729,91 @@ class AudioEngine:
         """Update a strip's FX parameters in-place via pw-cli set-param, without
         recreating the filter-chain node.
 
-        Returns True if the command was sent successfully, False if a full
-        engine restart is needed as fallback.
+        Returns True if the command was sent and pw-cli acknowledged it.
+        Returns False if a full engine restart is needed as fallback.
         """
+        # Safety net: after too many consecutive failures, disable hot-reload
+        # for this strip and always fall back to restart.
+        fail_count = self._fx_hotreload_failures.get(strip.uid, 0)
+        if fail_count >= FX_HOTRELOAD_MAX_FAILURES:
+            logger.warning(
+                f"Hot-reload disabled for {strip.uid} ({fail_count} consecutive "
+                f"failures); falling back to restart."
+            )
+            return False
+
         node_id = self.fx_node_ids.get(strip.uid)
         if not node_id or not self.fx_host_process:
             logger.warning(f"update_fx_params: no node_id for {strip.uid} or FX host down; falling back to restart.")
             return False
 
-        # Build the filter.graph string with current control values.
-        graph_str = _build_fx_graph(strip, _format_params, include_controls=True)
-        if not graph_str:
-            logger.warning(f"update_fx_params: graph_str is empty for {strip.uid}; falling back to restart.")
+        # Check if pw-cli process is still alive before sending.
+        if self.fx_host_process.poll() is not None:
+            logger.error(
+                f"pw-cli process is dead (exit code {self.fx_host_process.returncode}); "
+                f"falling back to restart."
+            )
+            self._start_fx_host()
             return False
 
-        # Send set-param to the filter-chain node.
-        # SPA_PARAM_Props = 2, so we use Props directly in pw-cli syntax.
-        cmd = f'set-param {node_id} Props {{ filter.graph = {graph_str} }}\n'
+        # Build the Props string with control values ONLY (not the full graph).
+        # The previous implementation sent the entire filter.graph definition
+        # via set-param, which is invalid — set-param expects control values,
+        # not a graph reconfiguration.  This was the primary cause of crashes.
+        props_str = _build_fx_props(strip, _format_params)
+        if not props_str:
+            logger.warning(f"update_fx_params: props_str is empty for {strip.uid}; falling back to restart.")
+            return False
+
+        cmd = f'set-param {node_id} Props {props_str}\n'
         try:
+            # Drain any stale output before sending the command so we don't
+            # misinterpret old messages as errors.
+            self._drain_pw_cli_output()
+
+            logger.info(f"Hot-reload: sending set-param to node {node_id} for strip {strip.uid}.")
+            logger.debug(f"Hot-reload command: {cmd.strip()}")
             self.fx_host_process.stdin.write(cmd)
             self.fx_host_process.stdin.flush()
-            logger.info(f"Hot-reload FX params sent to node {node_id} for strip {strip.uid}.")
+
+            # Give pw-cli a moment to process the command.
+            time.sleep(0.1)
+
+            # Check if the process died immediately after the command.
+            if self.fx_host_process.poll() is not None:
+                logger.error(
+                    f"pw-cli died after set-param (exit code "
+                    f"{self.fx_host_process.returncode}); falling back to restart."
+                )
+                self._fx_hotreload_failures[strip.uid] = fail_count + 1
+                self._start_fx_host()
+                return False
+
+            # Read any output — errors on stderr indicate failure.
+            stdout_data, stderr_data = self._read_pw_cli_output(timeout=0.3)
+            if stderr_data:
+                logger.error(
+                    f"pw-cli stderr after set-param: {stderr_data} "
+                    f"(fail #{fail_count + 1} for {strip.uid})"
+                )
+                self._fx_hotreload_failures[strip.uid] = fail_count + 1
+                return False
+            if stdout_data:
+                logger.debug(f"pw-cli stdout after set-param: {stdout_data}")
+
+            # Success — reset the failure counter.
+            self._fx_hotreload_failures[strip.uid] = 0
+            logger.info(f"Hot-reload FX params sent successfully for strip {strip.uid}.")
             return True
+
+        except BrokenPipeError as e:
+            logger.error(f"update_fx_params: pw-cli pipe broken: {e}; falling back to restart.")
+            self._fx_hotreload_failures[strip.uid] = fail_count + 1
+            self._start_fx_host()
+            return False
         except Exception as e:
-            logger.error(f"update_fx_params: failed to send set-param: {e}")
+            logger.error(f"update_fx_params: exception during set-param: {e}")
+            self._fx_hotreload_failures[strip.uid] = fail_count + 1
             return False
 
     def _resolve_metering_target_name(self, strip: Strip, node_id: Optional[int]) -> Optional[str]:
