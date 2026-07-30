@@ -578,9 +578,21 @@ class MainWindow(QMainWindow):
                 self._run_in_background(self.audio_engine.set_system_default, uid)
 
     def on_strip_effect_toggled(self, uid, effect_name, is_active):
-        """Called when an FX button is clicked."""
+        """Called when an FX button is clicked.
+
+        With always-on effects, the filter-chain graph already contains all
+        plugins.  Toggling just switches between real params and neutral bypass
+        values via set-param (hot-reload), avoiding a full engine restart.
+        Falls back to restart if the FX node is not available.
+        """
         self._save_state()
-        self._schedule_engine_restart()
+        strip = next((s for s in self.strips if s.uid == uid), None)
+        if not strip or not self.audio_engine:
+            return
+        # Attempt hot-reload (toggle = bypass/active values via set-param)
+        success = self.audio_engine.update_fx_params(strip)
+        if not success:
+            self._schedule_engine_restart()
 
     def on_strip_effect_params_changed(self, uid, effect_name):
         """Called when FX params are modified via the settings dialog."""

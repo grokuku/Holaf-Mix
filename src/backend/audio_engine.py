@@ -7,7 +7,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 from . import pipewire_utils
-from src.models.strip_model import Strip, StripType, StripMode
+from src.models.strip_model import Strip, StripType, StripMode, BYPASS_PARAMS
 from src.backend.metering import MeteringEngine
 
 # NOTE: Logging is configured in main.py, not here. Module-level
@@ -45,16 +45,23 @@ PIPEWAIT_POLL_INTERVAL_S = 0.05
 # Mapping: (effect_key, internal_name, plugin_file, ladspa_label)
 FX_PLUGIN_MAP = [
     ('gate', 'gate', 'gate_1410', 'gate'),
-    ('noise_cancel', 'rnnoise', 'librnnoise_ladspa', 'noise_suppressor_mono'),
+    ('noise_cancel', 'rnnoise', 'librnnoise_ladspa', 'noise_suppressor_stereo'),
     ('eq', 'eq', 'mbeq_1197', 'mbeq'),
     ('tube', 'tube', 'valve_1209', 'valve'),
     ('compressor', 'comp', 'sc4_1882', 'sc4'),
 ]
 
-# Plugins whose LADSPA ports are "Left input"/"Right input"/"Left output"/
-# "Right output" (true stereo) instead of the usual mono "Input"/"Output".
-# These get a SINGLE node in the filter graph instead of dual-mono.
-STEREO_PLUGINS = {'sc4_1882'}
+# Plugins with true stereo LADSPA ports (single node instead of dual-mono).
+# Each entry maps the plugin_file (3rd element of FX_PLUGIN_MAP) to its
+# four stereo port names. Different plugins use different naming conventions:
+#   sc4_1882:          "Left input" / "Right input" / "Left output" / "Right output"
+#   librnnoise_ladspa: "Input (L)"  / "Input (R)"  / "Output (L)"  / "Output (R)"
+STEREO_PLUGINS = {
+    'sc4_1882': {'in_l': 'Left input', 'in_r': 'Right input',
+                 'out_l': 'Left output', 'out_r': 'Right output'},
+    'librnnoise_ladspa': {'in_l': 'Input (L)', 'in_r': 'Input (R)',
+                          'out_l': 'Output (L)', 'out_r': 'Output (R)'},
+}
 
 
 def _get_fx_data(effects: Dict, key: str):
@@ -82,12 +89,18 @@ def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
     Build the SPA-JSON filter.graph string for a strip's active effects.
     Extracted from _create_fx_chain to be a pure, testable function.
 
-    Mono plugins (gate, rnnoise, eq, tube) are instantiated as dual-mono:
+    Mono plugins (gate, eq, tube) are instantiated as dual-mono:
     two identical nodes (``name_L`` / ``name_R``) each processing one channel,
     with ports ``Input`` / ``Output``.
 
-    Stereo plugins (sc4_1882) are instantiated as a SINGLE node with ports
-    ``Left input`` / ``Right input`` / ``Left output`` / ``Right output``.
+    Stereo plugins (sc4_1882, librnnoise_ladspa) are instantiated as a SINGLE
+    node.  Port names come from the STEREO_PLUGINS dict because different
+    plugins use different naming conventions (e.g. ``Left input`` vs
+    ``Input (L)``).
+
+    All effects are ALWAYS included in the graph (always-on).  When an
+    effect is inactive, its control parameters are replaced with neutral
+    BYPASS_PARAMS values so the plugin is transparent.
 
     Args:
         strip: The Strip model containing the effects dict.
@@ -99,44 +112,47 @@ def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
     links_config = []
     fx_list = []
 
-    # Build the ordered list of active effects whose plugin file exists on disk.
+    # Build the ordered list of ALL effects (always-on).  Inactive effects
+    # use neutral BYPASS_PARAMS so they are transparent in the audio path.
     for (key, internal_name, plugin_file, ladspa_label) in FX_PLUGIN_MAP:
         active, params = _get_fx_data(strip.effects, key)
-        if not active:
-            continue
         plugin_abs_path = os.path.join(LADSPA_PATH, f"{plugin_file}.so")
         if not os.path.exists(plugin_abs_path):
             continue
-        ctrl = format_params_fn(params)
-        is_stereo = plugin_file in STEREO_PLUGINS
-        fx_list.append((internal_name, plugin_abs_path, ladspa_label, ctrl, is_stereo))
+        if active:
+            ctrl = format_params_fn(params)
+        else:
+            # Neutral/bypass values — plugin stays in graph but is transparent.
+            ctrl = format_params_fn(BYPASS_PARAMS.get(key, {}))
+        stereo_info = STEREO_PLUGINS.get(plugin_file)
+        fx_list.append((internal_name, plugin_abs_path, ladspa_label, ctrl, stereo_info))
 
     if not fx_list:
         return ""
 
     # For each FX entry, track the four port-name strings used for linking.
     # mono:    (name_L:Input,  name_R:Input,  name_L:Output,  name_R:Output)
-    # stereo:  (name:Left input, name:Right input, name:Left output, name:Right output)
+    # stereo:  port names from STEREO_PLUGINS dict
     fx_ports = []
 
     first_input_ports = None
     last_output_ports = None
 
-    for i, (name, plugin_abs_path, label, ctrl, is_stereo) in enumerate(fx_list):
+    for i, (name, plugin_abs_path, label, ctrl, stereo_info) in enumerate(fx_list):
         control_str = f" control = {ctrl}" if include_controls and ctrl != '{}' else ""
 
-        if is_stereo:
-            # --- Single stereo node (e.g. sc4_1882) ---
+        if stereo_info:
+            # --- Single stereo node (e.g. sc4_1882, librnnoise_ladspa) ---
             nodes_config.append(
                 f'{{ type = ladspa name = "{name}" plugin = "{plugin_abs_path}" '
                 f'label = "{label}"{control_str} }}'
             )
-            in_l = f"{name}:Left input"
-            in_r = f"{name}:Right input"
-            out_l = f"{name}:Left output"
-            out_r = f"{name}:Right output"
+            in_l = f"{name}:{stereo_info['in_l']}"
+            in_r = f"{name}:{stereo_info['in_r']}"
+            out_l = f"{name}:{stereo_info['out_l']}"
+            out_r = f"{name}:{stereo_info['out_r']}"
         else:
-            # --- Dual-mono nodes (gate, rnnoise, eq, tube) ---
+            # --- Dual-mono nodes (gate, eq, tube) ---
             nodes_config.append(
                 f'{{ type = ladspa name = "{name}_L" plugin = "{plugin_abs_path}" '
                 f'label = "{label}"{control_str} }}'
@@ -249,35 +265,26 @@ class AudioEngine:
                     self.set_volume(strip.uid, strip.volume)
                     self.set_mute(strip.uid, strip.mute)
                 
-                # --- EFFECTS SETUP ---
-                # Check if ANY effect is effectively active (same logic for
-                # inputs and outputs; the UI simply prevents activating
-                # gate/rnnoise on output strips).
-                has_active_fx = False
-                for fx_data in strip.effects.values():
-                    if isinstance(fx_data, dict) and fx_data.get('active'):
-                        has_active_fx = True
-                        break
-                    elif isinstance(fx_data, bool) and fx_data:
-                        has_active_fx = True
-                        break
-                
-                if has_active_fx:
-                    if strip.kind == StripType.INPUT:
-                        # Input FX: capture from source, playback as virtual source
-                        base_source = strip.device_name if is_source else f"{node_name}.monitor"
-                        if base_source:
-                            fx_src = self._create_fx_chain(strip, base_source)
-                            if fx_src:
-                                self.fx_source_names[strip.uid] = fx_src
-                    else:  # OUTPUT
-                        # Output FX: capture as virtual sink (receives audio
-                        # from routed inputs), playback to the physical/virtual
-                        # device.
-                        if node_name:
-                            fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
-                            if fx_sink:
-                                self.fx_sink_names[strip.uid] = fx_sink
+                # --- EFFECTS SETUP (always-on) ---
+                # All effects are always in the filter-chain graph.  Even when
+                # every effect is toggled off, the chain is created with neutral
+                # (bypass) values so that toggling can be done via set-param
+                # without a full engine restart.
+                if strip.kind == StripType.INPUT:
+                    # Input FX: capture from source, playback as virtual source
+                    base_source = strip.device_name if is_source else f"{node_name}.monitor"
+                    if base_source:
+                        fx_src = self._create_fx_chain(strip, base_source)
+                        if fx_src:
+                            self.fx_source_names[strip.uid] = fx_src
+                else:  # OUTPUT
+                    # Output FX: capture as virtual sink (receives audio
+                    # from routed inputs), playback to the physical/virtual
+                    # device.
+                    if node_name:
+                        fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
+                        if fx_sink:
+                            self.fx_sink_names[strip.uid] = fx_sink
 
                 # --- METERING SETUP ---
                 target_name = self.fx_source_names.get(strip.uid) or self._resolve_metering_target_name(strip, node_id)

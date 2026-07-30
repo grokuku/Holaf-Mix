@@ -120,6 +120,17 @@ class EffectSettingsDialog(QDialog):
         """Returns (min, max, step) based on parameter name."""
         name_l = name.lower()
 
+        # --- RNNoise (librnnoise_ladspa) params ---
+        if "vad threshold" in name_l:
+            return (0.0, 99.0, 1.0)
+        if "dry mix" in name_l:
+            return (0.0, 1.0, 0.01)
+        if "grace" in name_l:
+            # VAD Grace Period (0-1000) and Retroactive VAD Grace (0-200)
+            if "retroactive" in name_l:
+                return (0.0, 200.0, 1.0)
+            return (0.0, 1000.0, 1.0)
+
         # --- Compressor sc4_1882: RMS/peak (0-1, no unit keyword) ---
         if "rms" in name_l:
             return (0.0, 1.0, 0.01)

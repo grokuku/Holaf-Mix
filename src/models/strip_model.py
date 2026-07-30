@@ -62,13 +62,51 @@ DEFAULT_EFFECT_PARAMS = {
         "20000Hz gain": 0.0
     },
     "noise_cancel": {
-        "Model": 0.0 # Placeholder if we add VAD threshold later
+        # librnnoise_ladspa (noise_suppressor_stereo) — control port names.
+        # These are the real LADSPA ports (verified via analyseplugin):
+        #   VAD Threshold (%)          — 0-99, default 74.25, integer
+        #   VAD Grace Period (ms)      — 0-1000, default 500, integer
+        #   Retroactive VAD Grace (ms) — 0-200, default 100, integer
+        #   Placeholder                — unused, no range
+        #   Dry Mix                   — 0-1, default 0 (0=full denoise, 1=dry)
+        "VAD Threshold (%)": 74.25,
+        "VAD Grace Period (ms)": 500,
+        "Retroactive VAD Grace (ms)": 100,
+        "Dry Mix": 0.0,
     },
     "tube": {
         # Valve_1209 LADSPA plugin - tube saturation
         "Distortion level": 0.0,
         "Distortion character": 0.5,
     }
+}
+
+# Neutral (bypass) parameter values for each effect.
+# When an effect is inactive, these values make the plugin transparent
+# so it stays in the filter-chain graph without altering the audio.
+# This enables hot-reload toggling via set-param instead of full restarts.
+BYPASS_PARAMS = {
+    "gate": {"Output select (-1 = key listen, 0 = gate, 1 = bypass)": 1.0},
+    "noise_cancel": {"Dry Mix": 1.0},  # 1.0 = pure dry passthrough
+    "eq": {  # All bands flat (0.0 dB)
+        "50Hz gain (low shelving)": 0.0,
+        "100Hz gain": 0.0,
+        "156Hz gain": 0.0,
+        "220Hz gain": 0.0,
+        "311Hz gain": 0.0,
+        "440Hz gain": 0.0,
+        "622Hz gain": 0.0,
+        "880Hz gain": 0.0,
+        "1250Hz gain": 0.0,
+        "1750Hz gain": 0.0,
+        "2500Hz gain": 0.0,
+        "3500Hz gain": 0.0,
+        "5000Hz gain": 0.0,
+        "10000Hz gain": 0.0,
+        "20000Hz gain": 0.0,
+    },
+    "tube": {"Distortion level": 0.0},
+    "compressor": {"Ratio (1:n)": 1.0},  # 1:1 = no compression
 }
 
 class Strip:
@@ -232,6 +270,16 @@ class Strip:
                     for old_key, new_key in GATE_KEY_MIGRATION.items():
                         if old_key in params and new_key not in params:
                             params[new_key] = params.pop(old_key)
+
+                # --- RNNoise Param Migration (BEFORE default-filling) ---
+                # Old config used a single "Model" placeholder param. The real
+                # librnnoise_ladspa plugin exposes VAD Threshold, VAD Grace
+                # Period, Retroactive VAD Grace, and Dry Mix. Remove the stale
+                # "Model" key so the default-filling loop below adds the real
+                # port names with their proper defaults.
+                if key == "noise_cancel":
+                    if "Model" in params:
+                        params.pop("Model")
 
                 # Ensure missing params are filled with defaults (e.g. if we
                 # added new controls or migration left gaps).
