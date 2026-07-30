@@ -583,11 +583,20 @@ class MainWindow(QMainWindow):
     def on_strip_effect_toggled(self, uid, effect_name, is_active):
         """Called when an FX button is clicked.
 
-        With always-on effects, the filter-chain graph already contains all
-        plugins.  Toggling just switches between real params and neutral bypass
-        values via set-param (hot-reload), avoiding a full engine restart.
-        Falls back to restart if the FX node is not available or set-param
-        fails (e.g. pw-cli error, process death, or too many failures).
+        If a filter-chain already exists for this strip (i.e. at least one
+        effect was active at engine start), the toggle is applied via set-param
+        (hot-reload) — switching between real params and neutral bypass values
+        without recreating the filter-chain node.
+
+        If no filter-chain exists yet (no effect was active at start time),
+        update_fx_params returns False.  Instead of a full engine restart
+        (which destroys ALL strips and notifies WirePlumber of a device
+        change, pausing YouTube / disrupting Discord), we try a **partial
+        reload** via ``reload_strip`` which only destroys and recreates the
+        FX chain for *this* strip.  Other strips are untouched.
+
+        If ``reload_strip`` also fails, we fall back to a full engine restart.
+        Subsequent toggles then use hot-reload.
         """
         self._save_state()
         strip = next((s for s in self.strips if s.uid == uid), None)
@@ -596,8 +605,9 @@ class MainWindow(QMainWindow):
         # Attempt hot-reload (toggle = bypass/active values via set-param)
         success = self.audio_engine.update_fx_params(strip)
         if not success:
-            logger.info(f"Effect toggle for '{effect_name}' on '{strip.label}' falling back to full restart.")
-            self._schedule_engine_restart()
+            logger.info(f"Effect toggle for '{effect_name}' on '{strip.label}': hot-reload failed, trying partial reload.")
+            # Partial reload: only touch this strip's FX chain
+            self._run_in_background(self._reload_strip_or_full_restart, strip)
 
     def on_strip_effect_params_changed(self, uid, effect_name):
         """Called when FX params are modified via the settings dialog."""
@@ -612,6 +622,21 @@ class MainWindow(QMainWindow):
             # Attempt hot-reload via pw-cli set-param (no audio interruption)
             success = self.audio_engine.update_fx_params(strip)
             if not success:
-                # Fallback: full engine restart
-                logger.info(f"FX param change for '{effect_name}' on '{strip.label}' falling back to full restart.")
-                self._schedule_engine_restart()
+                logger.info(f"FX param change for '{effect_name}' on '{strip.label}': hot-reload failed, trying partial reload.")
+                self._run_in_background(self._reload_strip_or_full_restart, strip)
+
+    def _reload_strip_or_full_restart(self, strip):
+        """Try a partial strip reload; fall back to full restart if it fails.
+
+        This runs in a background thread (via _run_in_background) so the
+        UI is not blocked.  ``reload_strip`` only destroys/recreates the FX
+        chain for *one* strip, avoiding WirePlumber device-change
+        notifications for other strips.
+        """
+        if not self.audio_engine:
+            return
+        success = self.audio_engine.reload_strip(strip)
+        if not success:
+            logger.warning(f"reload_strip failed for '{strip.label}'; falling back to full engine restart.")
+            self.audio_engine.shutdown()
+            self.audio_engine.start_engine(self.strips)
