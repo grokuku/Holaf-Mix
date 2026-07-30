@@ -32,12 +32,30 @@ DEFAULT_EFFECT_PARAMS = {
     },
     "eq": {
         # MBEQ_1197 15 bands - Default to FLAT (0.0) to prevent saturation
-        "50Hz": 0.0, "100Hz": 0.0, "156Hz": 0.0, "220Hz": 0.0, "311Hz": 0.0,
-        "440Hz": 0.0, "622Hz": 0.0, "880Hz": 0.0, "1250Hz": 0.0, "1750Hz": 0.0,
-        "2500Hz": 0.0, "3500Hz": 0.0, "5000Hz": 0.0, "10000Hz": 0.0, "20000Hz": 0.0
+        # Port names must match the LADSPA plugin's control port names EXACTLY.
+        "50Hz gain (low shelving)": 0.0,
+        "100Hz gain": 0.0,
+        "156Hz gain": 0.0,
+        "220Hz gain": 0.0,
+        "311Hz gain": 0.0,
+        "440Hz gain": 0.0,
+        "622Hz gain": 0.0,
+        "880Hz gain": 0.0,
+        "1250Hz gain": 0.0,
+        "1750Hz gain": 0.0,
+        "2500Hz gain": 0.0,
+        "3500Hz gain": 0.0,
+        "5000Hz gain": 0.0,
+        "10000Hz gain": 0.0,
+        "20000Hz gain": 0.0
     },
     "noise_cancel": {
         "Model": 0.0 # Placeholder if we add VAD threshold later
+    },
+    "tube": {
+        # Valve_1209 LADSPA plugin - tube saturation
+        "Distortion level": 0.0,
+        "Distortion character": 0.5,
     }
 }
 
@@ -74,12 +92,15 @@ class Strip:
         self.midi_mute = None
         self.midi_mono = None
 
-        # Effects Configuration (Only for Inputs)
+        # Effects Configuration (Inputs and Outputs)
         # Structure: { "effect_name": { "active": bool, "params": { ... } } }
+        # Note: gate and noise_cancel are only meaningful for inputs, but the
+        # dict is always populated so that from_dict / to_dict remain uniform.
         self.effects = {
             "gate": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["gate"])},
             "noise_cancel": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["noise_cancel"])},
             "eq": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["eq"])},
+            "tube": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["tube"])},
             "compressor": {"active": False, "params": copy.deepcopy(DEFAULT_EFFECT_PARAMS["compressor"])}
         }
 
@@ -128,7 +149,7 @@ class Strip:
         normalized_effects = {}
         
         # Defined keys to look for
-        known_keys = ["gate", "noise_cancel", "eq", "compressor"]
+        known_keys = ["gate", "noise_cancel", "eq", "tube", "compressor"]
         
         for key in known_keys:
             val = raw_effects.get(key, False)
@@ -144,11 +165,43 @@ class Strip:
                 # NEW FORMAT: Validate structure
                 active = val.get("active", False)
                 params = val.get("params", default_p)
-                # Ensure missing params are filled with defaults (e.g. if we added new controls)
+
+                # --- EQ Port Name Migration (BEFORE default-filling) ---
+                # Old config files used short names like "50Hz", "100Hz", etc.
+                # The LADSPA mbeq_1197 plugin requires the full port names like
+                # "50Hz gain (low shelving)", "100Hz gain", etc.
+                # This must run BEFORE the default-filling loop below, otherwise
+                # the new keys would be added with default values (0.0) and the
+                # migration condition `new_key not in params` would be False,
+                # causing old user values to be silently lost.
+                if key == "eq":
+                    EQ_KEY_MIGRATION = {
+                        "50Hz": "50Hz gain (low shelving)",
+                        "100Hz": "100Hz gain",
+                        "156Hz": "156Hz gain",
+                        "220Hz": "220Hz gain",
+                        "311Hz": "311Hz gain",
+                        "440Hz": "440Hz gain",
+                        "622Hz": "622Hz gain",
+                        "880Hz": "880Hz gain",
+                        "1250Hz": "1250Hz gain",
+                        "1750Hz": "1750Hz gain",
+                        "2500Hz": "2500Hz gain",
+                        "3500Hz": "3500Hz gain",
+                        "5000Hz": "5000Hz gain",
+                        "10000Hz": "10000Hz gain",
+                        "20000Hz": "20000Hz gain",
+                    }
+                    for old_key, new_key in EQ_KEY_MIGRATION.items():
+                        if old_key in params and new_key not in params:
+                            params[new_key] = params.pop(old_key)
+
+                # Ensure missing params are filled with defaults (e.g. if we
+                # added new controls or migration left gaps).
                 for p_key, p_val in default_p.items():
                     if p_key not in params:
                         params[p_key] = p_val
-                        
+                    
                 normalized_effects[key] = {
                     "active": active,
                     "params": params

@@ -47,6 +47,7 @@ FX_PLUGIN_MAP = [
     ('gate', 'gate', 'gate_1410', 'gate'),
     ('noise_cancel', 'rnnoise', 'librnnoise_ladspa', 'noise_suppressor_mono'),
     ('eq', 'eq', 'mbeq_1197', 'mbeq'),
+    ('tube', 'tube', 'valve_1209', 'valve'),
     ('compressor', 'comp', 'sc4_1882', 'sc4'),
 ]
 
@@ -146,6 +147,7 @@ class AudioEngine:
         self.is_source_registry: Dict[str, bool] = {} 
         self.mono_registry: Dict[str, bool] = {}
         self.fx_source_names: Dict[str, str] = {}
+        self.fx_sink_names: Dict[str, str] = {}
         self.link_registry: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.created_nodes: List[int] = []
         self.fx_host_process: Optional[subprocess.Popen] = None
@@ -170,6 +172,7 @@ class AudioEngine:
         self.mono_registry.clear()
         self.link_registry.clear()
         self.fx_source_names.clear()
+        self.fx_sink_names.clear()
         
         # 2. Create Nodes
         for strip in strips:
@@ -207,24 +210,35 @@ class AudioEngine:
                     self.set_volume(strip.uid, strip.volume)
                     self.set_mute(strip.uid, strip.mute)
                 
-                # --- EFFECTS SETUP (UPDATED LOGIC) ---
-                if strip.kind == StripType.INPUT:
-                    # Check if ANY effect is effectively active
-                    has_active_fx = False
-                    for fx_data in strip.effects.values():
-                        if isinstance(fx_data, dict) and fx_data.get('active'):
-                            has_active_fx = True
-                            break
-                        elif isinstance(fx_data, bool) and fx_data:
-                            has_active_fx = True
-                            break
-                    
-                    if has_active_fx:
+                # --- EFFECTS SETUP ---
+                # Check if ANY effect is effectively active (same logic for
+                # inputs and outputs; the UI simply prevents activating
+                # gate/rnnoise on output strips).
+                has_active_fx = False
+                for fx_data in strip.effects.values():
+                    if isinstance(fx_data, dict) and fx_data.get('active'):
+                        has_active_fx = True
+                        break
+                    elif isinstance(fx_data, bool) and fx_data:
+                        has_active_fx = True
+                        break
+                
+                if has_active_fx:
+                    if strip.kind == StripType.INPUT:
+                        # Input FX: capture from source, playback as virtual source
                         base_source = strip.device_name if is_source else f"{node_name}.monitor"
                         if base_source:
                             fx_src = self._create_fx_chain(strip, base_source)
                             if fx_src:
                                 self.fx_source_names[strip.uid] = fx_src
+                    else:  # OUTPUT
+                        # Output FX: capture as virtual sink (receives audio
+                        # from routed inputs), playback to the physical/virtual
+                        # device.
+                        if node_name:
+                            fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
+                            if fx_sink:
+                                self.fx_sink_names[strip.uid] = fx_sink
 
                 # --- METERING SETUP ---
                 target_name = self.fx_source_names.get(strip.uid) or self._resolve_metering_target_name(strip, node_id)
@@ -281,6 +295,7 @@ class AudioEngine:
         self.is_source_registry.clear()
         self.mono_registry.clear()
         self.fx_source_names.clear()
+        self.fx_sink_names.clear()
 
     # --- FX Host Management ---
 
@@ -405,7 +420,24 @@ class AudioEngine:
     def _format_params(self, params: Dict[str, float]) -> str:
         return _format_params(params)
 
-    def _create_fx_chain(self, strip: Strip, master_source_name: str) -> Optional[str]:
+    def _create_fx_chain(self, strip: Strip, master_node_name: str,
+                         is_output: bool = False) -> Optional[str]:
+        """Create a PipeWire filter-chain for the strip's active effects.
+
+        For **input** strips (``is_output=False``):
+            * ``capture.props`` is passive — it follows an external source.
+            * ``playback.props`` has ``media.class = Audio/Source`` so the
+              chain appears as a virtual source other nodes can listen to.
+            * We link *source → filter input* and return the *filter output*
+              node name (the virtual source).
+
+        For **output** strips (``is_output=True``):
+            * ``capture.props`` has ``media.class = Audio/Sink`` so the
+              chain appears as a virtual sink that input strips route to.
+            * ``playback.props`` is passive — it plays to the real device.
+            * We link *filter output → device* and return the *filter input*
+              node name (the virtual sink).
+        """
         if not self.fx_host_process or self.fx_host_process.poll() is not None:
             logger.error("FX Host process is not running! Restarting...")
             self._start_fx_host()
@@ -415,6 +447,17 @@ class AudioEngine:
         fx_node_name = f"Holaf_FX_{strip.uid}"
         safe_label = re.sub(r'[^a-zA-Z0-9 ]', '', strip.label)
         fx_label = f"Holaf FX {safe_label}"
+
+        if is_output:
+            # Output: capture acts as a sink (receives from input strips),
+            # playback sends processed audio to the physical/virtual device.
+            capture_props = 'media.class = Audio/Sink audio.channels = 2 audio.position = [ FL, FR ]'
+            playback_props = 'node.passive = true audio.channels = 2 audio.position = [ FL, FR ]'
+        else:
+            # Input: capture receives from the source (passive follower),
+            # playback acts as a virtual source.
+            capture_props = 'node.passive = true audio.channels = 2 audio.position = [ FL, FR ]'
+            playback_props = 'media.class = Audio/Source audio.channels = 2 audio.position = [ FL, FR ]'
 
         attempts = [True, False]
 
@@ -429,15 +472,15 @@ class AudioEngine:
                 f'node.description = "{fx_label}" '
                 f'media.name = "{fx_label}" '
                 f'filter.graph = {graph_str} '
-                f'capture.props = {{ node.passive = true audio.channels = 2 audio.position = [ FL, FR ] }} '
-                f'playback.props = {{ media.class = Audio/Source audio.channels = 2 audio.position = [ FL, FR ] }} '
+                f'capture.props = {{ {capture_props} }} '
+                f'playback.props = {{ {playback_props} }} '
                 f'}}'
             ).replace('\n', ' ')
 
             try:
                 cmd_str = f"load-module libpipewire-module-filter-chain {fx_config_json}\n"
                 
-                logger.info(f"Sending FX command to host (controls={use_controls})...")
+                logger.info(f"Sending FX command to host (controls={use_controls}, output={is_output})...")
                 self.fx_host_process.stdin.write(cmd_str)
                 self.fx_host_process.stdin.flush()
                 
@@ -462,7 +505,12 @@ class AudioEngine:
                 logger.info(f"FX Chain successfully loaded: {fx_node_name}")
 
                 # Linking Logic
-                links = self._auto_link_ports(master_source_name, in_node)
+                if is_output:
+                    # Link filter output → physical/virtual device
+                    links = self._auto_link_ports(out_node, master_node_name)
+                else:
+                    # Link source → filter input
+                    links = self._auto_link_ports(master_node_name, in_node)
                 if not links:
                     logger.info(f"Stereo link to FX incomplete (normal if link exists). Verifying...")
                 
@@ -471,7 +519,11 @@ class AudioEngine:
                 if in_id: self.created_nodes.append(in_id)
                 if out_id: self.created_nodes.append(out_id)
                 
-                return out_node
+                # Return the node that other strips should connect to.
+                if is_output:
+                    return in_node   # virtual sink that input strips route to
+                else:
+                    return out_node  # virtual source that output strips listen to
 
             except Exception as e:
                 logger.error(f"Exception during FX load: {e}")
@@ -772,7 +824,9 @@ class AudioEngine:
         
         active_src_name = self.fx_source_names.get(source_uid)
         raw_src_name = self._get_node_name(src_id)
-        dst_name = self._get_node_name(dst_id)
+        # If the output (target) has an FX chain, route to its virtual sink
+        # instead of the raw physical/virtual device node.
+        dst_name = self.fx_sink_names.get(target_uid) or self._get_node_name(dst_id)
         
         if not dst_name: return
 
@@ -803,10 +857,13 @@ class AudioEngine:
             raw_name = self._get_node_name(src_id)
             fx_name = self.fx_source_names.get(source_uid)
             dst_name = self._get_node_name(dst_id)
+            fx_sink_name = self.fx_sink_names.get(target_uid)
             
-            if dst_name:
-                if raw_name: self._unlink_nodes(raw_name, dst_name)
-                if fx_name: self._unlink_nodes(fx_name, dst_name)
+            # Unlink from both the raw device node and the FX sink (if any).
+            for dn in [dst_name, fx_sink_name]:
+                if dn:
+                    if raw_name: self._unlink_nodes(raw_name, dn)
+                    if fx_name: self._unlink_nodes(fx_name, dn)
 
         for (p_src, p_dst) in links:
                 result = subprocess.run(['pw-link', '-d', p_src, p_dst],

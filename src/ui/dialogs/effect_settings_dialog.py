@@ -58,12 +58,13 @@ class EffectSettingsDialog(QDialog):
         main_layout.addWidget(btn_close)
 
     def _sort_key(self, key):
-        """Helper to sort EQ bands like 50Hz, 100Hz correctly."""
-        if "Hz" in key:
-            try:
-                return int(key.replace("Hz", ""))
-            except:
-                return key
+        """Helper to sort EQ bands like 50Hz, 100Hz correctly.
+        Handles both legacy names ('50Hz') and full LADSPA port names
+        ('50Hz gain (low shelving)')."""
+        import re
+        m = re.match(r'(\d+)\s*Hz', key)
+        if m:
+            return int(m.group(1))
         return key
 
     def _add_control(self, param_name, current_value):
@@ -123,9 +124,13 @@ class EffectSettingsDialog(QDialog):
             if "gain" in name_l: return (-24.0, 24.0, 0.5) # Makeup gain or EQ
             return (-60.0, 10.0, 0.5)
         
+        if "distortion" in name_l:
+            # Valve_1209 LADSPA plugin parameters (0.0 to 1.0)
+            return (0.0, 1.0, 0.01)
+        
         if "hz" in name_l:
-            # EQ Gains usually
-            return (-30.0, 30.0, 0.1)
+            # EQ band gains (mbeq_1197 plugin range: -70 to +30)
+            return (-70.0, 30.0, 0.1)
             
         if "ms" in name_l:
             if "attack" in name_l: return (0.1, 200.0, 1.0)

@@ -163,7 +163,10 @@ class StripWidget(QFrame):
             self._style_combo(self.device_combo)
             self.device_combo.currentIndexChanged.connect(self._on_device_changed)
             dev_layout.addWidget(self.device_combo)
-        
+
+            # --- EFFECTS SECTION ---
+            self._init_fx_section(dev_layout)
+
         else: # INPUT
             lbl_src = QLabel("SOURCE IN")
             lbl_src.setStyleSheet("font-size: 8px; color: #aaa; margin-top: 5px;")
@@ -275,19 +278,33 @@ class StripWidget(QFrame):
         self._refresh_device_ui_state()
 
     def _init_fx_section(self, parent_layout):
-        """Initializes the FX toggle buttons for input strips."""
+        """Initializes the FX toggle buttons for input and output strips.
+
+        For input strips, all effects are available (gate, rnnoise, eq, tube,
+        compressor).  For output strips, only eq, tube and compressor make
+        sense — a noise gate on an output bus would just chop music, so gate
+        and rnnoise are omitted.
+        """
         fx_frame = QFrame()
         fx_layout = QHBoxLayout(fx_frame)
         fx_layout.setContentsMargins(0, 5, 0, 5)
         fx_layout.setSpacing(2)
         
         self.fx_buttons = {}
-        effects = [
-            ("gate", "GT", "Noise Gate"),
-            ("noise_cancel", "RN", "RNNoise (IA)"),
-            ("eq", "EQ", "Equalizer"),
-            ("compressor", "CP", "Compressor")
-        ]
+        if self.strip.kind == StripType.INPUT:
+            effects = [
+                ("gate", "GT", "Noise Gate"),
+                ("noise_cancel", "RN", "RNNoise (IA)"),
+                ("eq", "EQ", "Equalizer"),
+                ("tube", "TB", "Tube Saturation"),
+                ("compressor", "CP", "Compressor"),
+            ]
+        else:  # OUTPUT
+            effects = [
+                ("eq", "EQ", "Equalizer"),
+                ("tube", "TB", "Tube Saturation"),
+                ("compressor", "CP", "Compressor"),
+            ]
         
         for key, label, tooltip in effects:
             btn = QPushButton(label)

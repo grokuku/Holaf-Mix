@@ -33,6 +33,10 @@
 import sys
 import types
 
+# Print to stderr so we can see if the hook actually runs. PyInstaller
+# captures this and surfaces it as a "traceback" line before the real error.
+print("[hook-email] running", file=sys.stderr)
+
 
 def _ensure_email_package():
     """Pre-import email submodules and synthesize the `email` parent
@@ -122,4 +126,8 @@ def _ensure_email_package():
 
 
 # Execute at import time (runtime hooks run before main.py).
+print("[hook-email] starting email pre-import", file=sys.stderr)
 _ensure_email_package()
+print(f"[hook-email] done. email in sys.modules: {'email' in sys.modules}, "
+      f"email.message: {'email.message' in sys.modules}",
+      file=sys.stderr)

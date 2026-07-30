@@ -46,21 +46,21 @@
                 "eq": {
                     "active": false,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": 0.0,
-                        "220Hz": 0.0,
-                        "311Hz": 0.0,
-                        "440Hz": 0.0,
-                        "622Hz": 0.0,
-                        "880Hz": 0.0,
-                        "1250Hz": 0.0,
-                        "1750Hz": 0.0,
-                        "2500Hz": 0.0,
-                        "3500Hz": 0.0,
-                        "5000Hz": 0.0,
-                        "10000Hz": 0.0,
-                        "20000Hz": 0.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": 0.0,
+                        "220Hz gain": 0.0,
+                        "311Hz gain": 0.0,
+                        "440Hz gain": 0.0,
+                        "622Hz gain": 0.0,
+                        "880Hz gain": 0.0,
+                        "1250Hz gain": 0.0,
+                        "1750Hz gain": 0.0,
+                        "2500Hz gain": 0.0,
+                        "3500Hz gain": 0.0,
+                        "5000Hz gain": 0.0,
+                        "10000Hz gain": 0.0,
+                        "20000Hz gain": 0.0
                     }
                 },
                 "compressor": {
@@ -71,6 +71,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }
@@ -121,21 +128,21 @@
                 "eq": {
                     "active": false,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": 0.0,
-                        "220Hz": 0.0,
-                        "311Hz": 0.0,
-                        "440Hz": 0.0,
-                        "622Hz": 0.0,
-                        "880Hz": 0.0,
-                        "1250Hz": 0.0,
-                        "1750Hz": 0.0,
-                        "2500Hz": 0.0,
-                        "3500Hz": 0.0,
-                        "5000Hz": 0.0,
-                        "10000Hz": 0.0,
-                        "20000Hz": 0.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": 0.0,
+                        "220Hz gain": 0.0,
+                        "311Hz gain": 0.0,
+                        "440Hz gain": 0.0,
+                        "622Hz gain": 0.0,
+                        "880Hz gain": 0.0,
+                        "1250Hz gain": 0.0,
+                        "1750Hz gain": 0.0,
+                        "2500Hz gain": 0.0,
+                        "3500Hz gain": 0.0,
+                        "5000Hz gain": 0.0,
+                        "10000Hz gain": 0.0,
+                        "20000Hz gain": 0.0
                     }
                 },
                 "compressor": {
@@ -146,6 +153,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }
@@ -198,21 +212,21 @@
                 "eq": {
                     "active": true,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": -30.0,
-                        "220Hz": -30.0,
-                        "311Hz": -30.0,
-                        "440Hz": -30.0,
-                        "622Hz": -30.0,
-                        "880Hz": -30.0,
-                        "1250Hz": -30.0,
-                        "1750Hz": -30.0,
-                        "2500Hz": -30.0,
-                        "3500Hz": -30.0,
-                        "5000Hz": -30.0,
-                        "10000Hz": -30.0,
-                        "20000Hz": -30.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": -30.0,
+                        "220Hz gain": -30.0,
+                        "311Hz gain": -30.0,
+                        "440Hz gain": -30.0,
+                        "622Hz gain": -30.0,
+                        "880Hz gain": -30.0,
+                        "1250Hz gain": -30.0,
+                        "1750Hz gain": -30.0,
+                        "2500Hz gain": -30.0,
+                        "3500Hz gain": -30.0,
+                        "5000Hz gain": -30.0,
+                        "10000Hz gain": -30.0,
+                        "20000Hz gain": -30.0
                     }
                 },
                 "compressor": {
@@ -223,6 +237,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }
@@ -276,21 +297,21 @@
                 "eq": {
                     "active": false,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": 0.0,
-                        "220Hz": 0.0,
-                        "311Hz": 0.0,
-                        "440Hz": 0.0,
-                        "622Hz": 0.0,
-                        "880Hz": 0.0,
-                        "1250Hz": 0.0,
-                        "1750Hz": 0.0,
-                        "2500Hz": 0.0,
-                        "3500Hz": 0.0,
-                        "5000Hz": 0.0,
-                        "10000Hz": 0.0,
-                        "20000Hz": 0.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": 0.0,
+                        "220Hz gain": 0.0,
+                        "311Hz gain": 0.0,
+                        "440Hz gain": 0.0,
+                        "622Hz gain": 0.0,
+                        "880Hz gain": 0.0,
+                        "1250Hz gain": 0.0,
+                        "1750Hz gain": 0.0,
+                        "2500Hz gain": 0.0,
+                        "3500Hz gain": 0.0,
+                        "5000Hz gain": 0.0,
+                        "10000Hz gain": 0.0,
+                        "20000Hz gain": 0.0
                     }
                 },
                 "compressor": {
@@ -301,6 +322,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }
@@ -357,21 +385,21 @@
                 "eq": {
                     "active": false,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": 0.0,
-                        "220Hz": 0.0,
-                        "311Hz": 0.0,
-                        "440Hz": 0.0,
-                        "622Hz": 0.0,
-                        "880Hz": 0.0,
-                        "1250Hz": 0.0,
-                        "1750Hz": 0.0,
-                        "2500Hz": 0.0,
-                        "3500Hz": 0.0,
-                        "5000Hz": 0.0,
-                        "10000Hz": 0.0,
-                        "20000Hz": 0.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": 0.0,
+                        "220Hz gain": 0.0,
+                        "311Hz gain": 0.0,
+                        "440Hz gain": 0.0,
+                        "622Hz gain": 0.0,
+                        "880Hz gain": 0.0,
+                        "1250Hz gain": 0.0,
+                        "1750Hz gain": 0.0,
+                        "2500Hz gain": 0.0,
+                        "3500Hz gain": 0.0,
+                        "5000Hz gain": 0.0,
+                        "10000Hz gain": 0.0,
+                        "20000Hz gain": 0.0
                     }
                 },
                 "compressor": {
@@ -382,6 +410,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }
@@ -438,21 +473,21 @@
                 "eq": {
                     "active": false,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": 0.0,
-                        "220Hz": 0.0,
-                        "311Hz": 0.0,
-                        "440Hz": 0.0,
-                        "622Hz": 0.0,
-                        "880Hz": 0.0,
-                        "1250Hz": 0.0,
-                        "1750Hz": 0.0,
-                        "2500Hz": 0.0,
-                        "3500Hz": 0.0,
-                        "5000Hz": 0.0,
-                        "10000Hz": 0.0,
-                        "20000Hz": 0.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": 0.0,
+                        "220Hz gain": 0.0,
+                        "311Hz gain": 0.0,
+                        "440Hz gain": 0.0,
+                        "622Hz gain": 0.0,
+                        "880Hz gain": 0.0,
+                        "1250Hz gain": 0.0,
+                        "1750Hz gain": 0.0,
+                        "2500Hz gain": 0.0,
+                        "3500Hz gain": 0.0,
+                        "5000Hz gain": 0.0,
+                        "10000Hz gain": 0.0,
+                        "20000Hz gain": 0.0
                     }
                 },
                 "compressor": {
@@ -463,6 +498,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }
@@ -501,21 +543,21 @@
                 "eq": {
                     "active": false,
                     "params": {
-                        "50Hz": 0.0,
-                        "100Hz": 0.0,
-                        "156Hz": 0.0,
-                        "220Hz": 0.0,
-                        "311Hz": 0.0,
-                        "440Hz": 0.0,
-                        "622Hz": 0.0,
-                        "880Hz": 0.0,
-                        "1250Hz": 0.0,
-                        "1750Hz": 0.0,
-                        "2500Hz": 0.0,
-                        "3500Hz": 0.0,
-                        "5000Hz": 0.0,
-                        "10000Hz": 0.0,
-                        "20000Hz": 0.0
+                        "50Hz gain (low shelving)": 0.0,
+                        "100Hz gain": 0.0,
+                        "156Hz gain": 0.0,
+                        "220Hz gain": 0.0,
+                        "311Hz gain": 0.0,
+                        "440Hz gain": 0.0,
+                        "622Hz gain": 0.0,
+                        "880Hz gain": 0.0,
+                        "1250Hz gain": 0.0,
+                        "1750Hz gain": 0.0,
+                        "2500Hz gain": 0.0,
+                        "3500Hz gain": 0.0,
+                        "5000Hz gain": 0.0,
+                        "10000Hz gain": 0.0,
+                        "20000Hz gain": 0.0
                     }
                 },
                 "compressor": {
@@ -526,6 +568,13 @@
                         "Attack (ms)": 20.0,
                         "Release (ms)": 300.0,
                         "Makeup Gain (dB)": 0.0
+                    }
+                },
+                "tube": {
+                    "active": false,
+                    "params": {
+                        "Distortion level": 0.0,
+                        "Distortion character": 0.5
                     }
                 }
             }

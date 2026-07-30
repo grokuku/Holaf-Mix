@@ -233,6 +233,53 @@ jobs:
             echo "  WARN PySide6 strings not found (may be compressed)"
           fi
 
+      - name: Inspect bundled email modules
+        # Diagnose whether the `email` stdlib package and its submodules
+        # are actually present in the bundle. This was the root cause of
+        # a runtime ModuleNotFoundError on Python 3.12+ — PyInstaller's
+        # static analysis misses the lazy-imported submodules.
+        # Output is preserved in the workflow log for inspection.
+        continue-on-error: true
+        run: |
+          # shellcheck disable=SC1091
+          source /opt/holaf-venv/bin/activate
+          echo "::group::Email module introspection"
+          # Use PyInstaller's own introspection: run the binary in a mode
+          # that just lists bundled modules and grep for email.
+          # We can't actually exec the bundle (no display), but we can
+          # inspect the build artifacts left by PyInstaller.
+          if [[ -d "$PYI_DIST/_internal" ]]; then
+            # onedir mode
+            base="$PYI_DIST/_internal"
+          elif [[ -d "$PYI_DIST" ]]; then
+            base="$PYI_DIST"
+          else
+            base=""
+          fi
+          echo "Looking in: ${base:-<no _internal dir>}"
+          if [[ -n "$base" ]]; then
+            echo "--- email* files in PYZ/PUP archive ---"
+            find "$base" -name "*.pyz" -o -name "*.toc" 2>/dev/null | head -5
+            echo "--- email* in bundle filesystem ---"
+            find "$base" -path "*email*" 2>/dev/null | head -20
+            echo "--- PYZ contents (if readable) ---"
+            find "$base" -name "*.pyz" 2>/dev/null | while read -r pyz; do
+              echo "  $pyz:"
+              python3 -c "
+              import zipfile, sys
+              try:
+                  with zipfile.ZipFile('$pyz', 'r') as z:
+                      names = [n for n in z.namelist() if 'email' in n.lower()]
+                      for n in sorted(names)[:20]:
+                          print(f'    {n}')
+                      print(f'  ... ({len(names)} total email* files)')
+              except Exception as e:
+                  print(f'  cannot read: {e}')
+              "
+            done
+          fi
+          echo "::endgroup::"
+
       # ------------------------------------------------------------------
       # 4. Compute checksums
       # ------------------------------------------------------------------
