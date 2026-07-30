@@ -51,6 +51,11 @@ FX_PLUGIN_MAP = [
     ('compressor', 'comp', 'sc4_1882', 'sc4'),
 ]
 
+# Plugins whose LADSPA ports are "Left input"/"Right input"/"Left output"/
+# "Right output" (true stereo) instead of the usual mono "Input"/"Output".
+# These get a SINGLE node in the filter graph instead of dual-mono.
+STEREO_PLUGINS = {'sc4_1882'}
+
 
 def _get_fx_data(effects: Dict, key: str):
     """Returns (active: bool, params: dict) for a given effect, handling both
@@ -77,6 +82,13 @@ def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
     Build the SPA-JSON filter.graph string for a strip's active effects.
     Extracted from _create_fx_chain to be a pure, testable function.
 
+    Mono plugins (gate, rnnoise, eq, tube) are instantiated as dual-mono:
+    two identical nodes (``name_L`` / ``name_R``) each processing one channel,
+    with ports ``Input`` / ``Output``.
+
+    Stereo plugins (sc4_1882) are instantiated as a SINGLE node with ports
+    ``Left input`` / ``Right input`` / ``Left output`` / ``Right output``.
+
     Args:
         strip: The Strip model containing the effects dict.
         format_params_fn: Callable that formats a params dict to SPA-JSON.
@@ -96,38 +108,63 @@ def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
         if not os.path.exists(plugin_abs_path):
             continue
         ctrl = format_params_fn(params)
-        fx_list.append((internal_name, plugin_abs_path, ladspa_label, ctrl))
+        is_stereo = plugin_file in STEREO_PLUGINS
+        fx_list.append((internal_name, plugin_abs_path, ladspa_label, ctrl, is_stereo))
 
     if not fx_list:
         return ""
 
-    first_nodes = []
-    last_nodes = []
+    # For each FX entry, track the four port-name strings used for linking.
+    # mono:    (name_L:Input,  name_R:Input,  name_L:Output,  name_R:Output)
+    # stereo:  (name:Left input, name:Right input, name:Left output, name:Right output)
+    fx_ports = []
 
-    for i, (name, plugin_abs_path, label, ctrl) in enumerate(fx_list):
+    first_input_ports = None
+    last_output_ports = None
+
+    for i, (name, plugin_abs_path, label, ctrl, is_stereo) in enumerate(fx_list):
         control_str = f" control = {ctrl}" if include_controls and ctrl != '{}' else ""
 
-        nodes_config.append(
-            f'{{ type = ladspa name = "{name}_L" plugin = "{plugin_abs_path}" '
-            f'label = "{label}"{control_str} }}'
-        )
-        nodes_config.append(
-            f'{{ type = ladspa name = "{name}_R" plugin = "{plugin_abs_path}" '
-            f'label = "{label}"{control_str} }}'
-        )
+        if is_stereo:
+            # --- Single stereo node (e.g. sc4_1882) ---
+            nodes_config.append(
+                f'{{ type = ladspa name = "{name}" plugin = "{plugin_abs_path}" '
+                f'label = "{label}"{control_str} }}'
+            )
+            in_l = f"{name}:Left input"
+            in_r = f"{name}:Right input"
+            out_l = f"{name}:Left output"
+            out_r = f"{name}:Right output"
+        else:
+            # --- Dual-mono nodes (gate, rnnoise, eq, tube) ---
+            nodes_config.append(
+                f'{{ type = ladspa name = "{name}_L" plugin = "{plugin_abs_path}" '
+                f'label = "{label}"{control_str} }}'
+            )
+            nodes_config.append(
+                f'{{ type = ladspa name = "{name}_R" plugin = "{plugin_abs_path}" '
+                f'label = "{label}"{control_str} }}'
+            )
+            in_l = f"{name}_L:Input"
+            in_r = f"{name}_R:Input"
+            out_l = f"{name}_L:Output"
+            out_r = f"{name}_R:Output"
+
+        fx_ports.append((in_l, in_r, out_l, out_r))
 
         if i == 0:
-            first_nodes = [f"{name}_L", f"{name}_R"]
+            first_input_ports = [in_l, in_r]
         if i == len(fx_list) - 1:
-            last_nodes = [f"{name}_L", f"{name}_R"]
+            last_output_ports = [out_l, out_r]
 
         if i > 0:
-            prev_name = fx_list[i - 1][0]
-            links_config.append(f'{{ output = "{prev_name}_L:Output" input = "{name}_L:Input" }}')
-            links_config.append(f'{{ output = "{prev_name}_R:Output" input = "{name}_R:Input" }}')
+            prev_out_l = fx_ports[i - 1][2]
+            prev_out_r = fx_ports[i - 1][3]
+            links_config.append(f'{{ output = "{prev_out_l}" input = "{in_l}" }}')
+            links_config.append(f'{{ output = "{prev_out_r}" input = "{in_r}" }}')
 
-    inputs_def = f'[ "{first_nodes[0]}:Input", "{first_nodes[1]}:Input" ]'
-    outputs_def = f'[ "{last_nodes[0]}:Output", "{last_nodes[1]}:Output" ]'
+    inputs_def = f'[ "{first_input_ports[0]}", "{first_input_ports[1]}" ]'
+    outputs_def = f'[ "{last_output_ports[0]}", "{last_output_ports[1]}" ]'
 
     return (
         f'{{ '
@@ -150,6 +187,7 @@ class AudioEngine:
         self.fx_sink_names: Dict[str, str] = {}
         self.link_registry: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self.created_nodes: List[int] = []
+        self.fx_node_ids: Dict[str, int] = {}  # strip.uid → node_id of the filter-chain node
         self.fx_host_process: Optional[subprocess.Popen] = None
         self.metering = MeteringEngine()
         self._meter_retry_counter = 0
@@ -173,6 +211,7 @@ class AudioEngine:
         self.link_registry.clear()
         self.fx_source_names.clear()
         self.fx_sink_names.clear()
+        self.fx_node_ids.clear()
         
         # 2. Create Nodes
         for strip in strips:
@@ -296,6 +335,7 @@ class AudioEngine:
         self.mono_registry.clear()
         self.fx_source_names.clear()
         self.fx_sink_names.clear()
+        self.fx_node_ids.clear()
 
     # --- FX Host Management ---
 
@@ -519,6 +559,14 @@ class AudioEngine:
                 if in_id: self.created_nodes.append(in_id)
                 if out_id: self.created_nodes.append(out_id)
                 
+                # Store the main filter-chain node ID (not the input/output
+                # stream nodes) so update_fx_params can send set-param to it.
+                fc_node_id = self._find_node_id_by_name(fx_node_name)
+                if fc_node_id:
+                    self.fx_node_ids[strip.uid] = fc_node_id
+                else:
+                    logger.warning(f"Could not find filter-chain node ID for {fx_node_name}; hot-reload will fall back to restart.")
+                
                 # Return the node that other strips should connect to.
                 if is_output:
                     return in_node   # virtual sink that input strips route to
@@ -531,6 +579,36 @@ class AudioEngine:
 
         logger.error(f"All attempts to load FX failed for {strip.label}")
         return None
+
+    def update_fx_params(self, strip: Strip) -> bool:
+        """Update a strip's FX parameters in-place via pw-cli set-param, without
+        recreating the filter-chain node.
+
+        Returns True if the command was sent successfully, False if a full
+        engine restart is needed as fallback.
+        """
+        node_id = self.fx_node_ids.get(strip.uid)
+        if not node_id or not self.fx_host_process:
+            logger.warning(f"update_fx_params: no node_id for {strip.uid} or FX host down; falling back to restart.")
+            return False
+
+        # Build the filter.graph string with current control values.
+        graph_str = _build_fx_graph(strip, _format_params, include_controls=True)
+        if not graph_str:
+            logger.warning(f"update_fx_params: graph_str is empty for {strip.uid}; falling back to restart.")
+            return False
+
+        # Send set-param to the filter-chain node.
+        # SPA_PARAM_Props = 2, so we use Props directly in pw-cli syntax.
+        cmd = f'set-param {node_id} Props {{ filter.graph = {graph_str} }}\n'
+        try:
+            self.fx_host_process.stdin.write(cmd)
+            self.fx_host_process.stdin.flush()
+            logger.info(f"Hot-reload FX params sent to node {node_id} for strip {strip.uid}.")
+            return True
+        except Exception as e:
+            logger.error(f"update_fx_params: failed to send set-param: {e}")
+            return False
 
     def _resolve_metering_target_name(self, strip: Strip, node_id: Optional[int]) -> Optional[str]:
         if strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL:

@@ -588,8 +588,12 @@ class MainWindow(QMainWindow):
         strip = next((s for s in self.strips if s.uid == uid), None)
         if not strip or not self.audio_engine:
             return
-        # Only restart engine if the modified effect is currently active
+        # Only hot-reload if the modified effect is currently active
         fx_data = strip.effects.get(effect_name, {})
         is_active = fx_data.get('active', False) if isinstance(fx_data, dict) else bool(fx_data)
         if is_active:
-            self._schedule_engine_restart()
+            # Attempt hot-reload via pw-cli set-param (no audio interruption)
+            success = self.audio_engine.update_fx_params(strip)
+            if not success:
+                # Fallback: full engine restart
+                self._schedule_engine_restart()

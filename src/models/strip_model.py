@@ -18,17 +18,29 @@ class StripMode:
 # Default parameters to avoid saturation (EQ) and provide usable starting points
 DEFAULT_EFFECT_PARAMS = {
     "gate": {
-        "Threshold (dB)": -30.0,
-        "Attack (ms)": 5.0,
-        "Release (ms)": 200.0,
-        "Hold (ms)": 50.0
+        # gate_1410 LADSPA plugin — control port names must match exactly.
+        # Defaults chosen so the gate is transparent (open) by default:
+        #   Threshold = -70 dB (very low → gate always open for normal signals)
+        #   Range     = -90 dB (max reduction when gate closes)
+        "LF key filter (Hz)": 33.6,
+        "HF key filter (Hz)": 23520.0,
+        "Threshold (dB)": -70.0,
+        "Attack (ms)": 250.008,
+        "Hold (ms)": 1500.5,
+        "Decay (ms)": 2001.0,
+        "Range (dB)": -90.0,
+        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
     },
     "compressor": {
-        "Threshold (dB)": -15.0, # Less aggressive start
-        "Ratio (1:n)": 4.0,
-        "Attack (ms)": 20.0,
-        "Release (ms)": 300.0,
-        "Makeup Gain (dB)": 0.0  # Crucial: 0dB default to avoid blasting volume
+        # sc4_1882 LADSPA plugin — control port names must match exactly.
+        # Defaults are the plugin's own defaults (compressor transparent).
+        "RMS/peak": 0.0,
+        "Attack time (ms)": 101.125,
+        "Release time (ms)": 401.0,
+        "Threshold level (dB)": 0.0,
+        "Ratio (1:n)": 1.0,
+        "Knee radius (dB)": 3.25,
+        "Makeup gain (dB)": 0.0
     },
     "eq": {
         # MBEQ_1197 15 bands - Default to FLAT (0.0) to prevent saturation
@@ -193,6 +205,31 @@ class Strip:
                         "20000Hz": "20000Hz gain",
                     }
                     for old_key, new_key in EQ_KEY_MIGRATION.items():
+                        if old_key in params and new_key not in params:
+                            params[new_key] = params.pop(old_key)
+
+                # --- Compressor Port Name Migration (BEFORE default-filling) ---
+                # Old config used short names; sc4_1882 requires the exact
+                # LADSPA control port names.
+                if key == "compressor":
+                    COMPRESSOR_KEY_MIGRATION = {
+                        "Threshold (dB)": "Threshold level (dB)",
+                        "Attack (ms)": "Attack time (ms)",
+                        "Release (ms)": "Release time (ms)",
+                        "Makeup Gain (dB)": "Makeup gain (dB)",
+                    }
+                    for old_key, new_key in COMPRESSOR_KEY_MIGRATION.items():
+                        if old_key in params and new_key not in params:
+                            params[new_key] = params.pop(old_key)
+
+                # --- Gate Port Name Migration (BEFORE default-filling) ---
+                # Old config used "Release (ms)" but gate_1410 exposes
+                # "Decay (ms)" instead.
+                if key == "gate":
+                    GATE_KEY_MIGRATION = {
+                        "Release (ms)": "Decay (ms)",
+                    }
+                    for old_key, new_key in GATE_KEY_MIGRATION.items():
                         if old_key in params and new_key not in params:
                             params[new_key] = params.pop(old_key)
 

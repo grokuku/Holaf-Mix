@@ -119,27 +119,41 @@ class EffectSettingsDialog(QDialog):
     def _get_range_for_param(self, name):
         """Returns (min, max, step) based on parameter name."""
         name_l = name.lower()
+
+        # --- Compressor sc4_1882: RMS/peak (0-1, no unit keyword) ---
+        if "rms" in name_l:
+            return (0.0, 1.0, 0.01)
+
         if "db" in name_l:
-            if "threshold" in name_l: return (-60.0, 0.0, 0.5)
-            if "gain" in name_l: return (-24.0, 24.0, 0.5) # Makeup gain or EQ
+            if "threshold" in name_l: return (-70.0, 20.0, 0.5)
+            if "makeup" in name_l: return (0.0, 24.0, 0.5)
+            if "knee" in name_l: return (1.0, 10.0, 0.1)
+            if "range" in name_l: return (-90.0, 0.0, 0.5)
+            if "gain" in name_l: return (-24.0, 24.0, 0.5) # EQ band gains
             return (-60.0, 10.0, 0.5)
-        
+
         if "distortion" in name_l:
             # Valve_1209 LADSPA plugin parameters (0.0 to 1.0)
             return (0.0, 1.0, 0.01)
-        
+
         if "hz" in name_l:
+            if "filter" in name_l: return (0.0, 20000.0, 10.0)  # Gate key filters
             # EQ band gains (mbeq_1197 plugin range: -70 to +30)
             return (-70.0, 30.0, 0.1)
-            
+
         if "ms" in name_l:
-            if "attack" in name_l: return (0.1, 200.0, 1.0)
-            if "release" in name_l: return (10.0, 2000.0, 10.0)
-            if "hold" in name_l: return (0.0, 1000.0, 10.0)
-            
+            if "attack" in name_l: return (0.01, 1000.0, 0.1)
+            if "release" in name_l: return (2.0, 4000.0, 1.0)
+            if "hold" in name_l: return (2.0, 2000.0, 1.0)
+            if "decay" in name_l: return (2.0, 4000.0, 1.0)
+
         if "ratio" in name_l:
             return (1.0, 20.0, 0.5)
-            
+
+        # Gate output select (-1 = key listen, 0 = gate, 1 = bypass)
+        if "output select" in name_l:
+            return (-1.0, 1.0, 1.0)
+
         return (0.0, 10.0, 0.1) # Default
 
     def _on_value_changed(self, param, value):
