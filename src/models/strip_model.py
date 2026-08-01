@@ -75,9 +75,9 @@ DEFAULT_EFFECT_PARAMS = {
         "Dry Mix": 0.0,
     },
     "tube": {
-        # Valve_1209 LADSPA plugin - tube saturation
-        "Distortion level": 0.0,
-        "Distortion character": 0.5,
+        # TAP TubeWarmth LADSPA plugin - musical tube/tape warmth
+        "Drive": 2.575,
+        "Tape--Tube Blend": 10.0,
     }
 }
 
@@ -133,7 +133,7 @@ BYPASS_PARAMS = {
         "10000Hz gain": 0.0,
         "20000Hz gain": 0.0,
     },
-    "tube": {"Distortion level": 0.0},
+    "tube": {"Drive": 0.1},  # Drive min = 0.1 → saturation quasi nulle (bypass)
     "compressor": {"Ratio (1:n)": 1.0},  # 1:1 = no compression
 }
 
@@ -296,6 +296,20 @@ class Strip:
                         "Release (ms)": "Decay (ms)",
                     }
                     for old_key, new_key in GATE_KEY_MIGRATION.items():
+                        if old_key in params and new_key not in params:
+                            params[new_key] = params.pop(old_key)
+
+                # --- Tube Port Name Migration (BEFORE default-filling) ---
+                # Old config used valve_1209 (Distortion level / Distortion
+                # character). The new TAP TubeWarmth plugin exposes Drive and
+                # Tape--Tube Blend instead. Migrate old values so user
+                # settings are not lost when upgrading.
+                if key == "tube":
+                    TUBE_KEY_MIGRATION = {
+                        "Distortion level": "Drive",
+                        "Distortion character": "Tape--Tube Blend",
+                    }
+                    for old_key, new_key in TUBE_KEY_MIGRATION.items():
                         if old_key in params and new_key not in params:
                             params[new_key] = params.pop(old_key)
 

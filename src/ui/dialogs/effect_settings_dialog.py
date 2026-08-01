@@ -147,6 +147,16 @@ class EffectSettingsDialog(QDialog):
         if "rms" in name_l:
             return (0.0, 1.0, 0.01)
 
+        # --- TAP TubeWarmth: Drive (0.1-10) ---
+        # NOTE: checked BEFORE the generic "db"/"hz"/"ms" rules so "drive"
+        # never falls through to a wrong range.
+        if "drive" in name_l:
+            return (0.1, 10.0, 0.1)
+
+        # --- TAP TubeWarmth: Tape--Tube Blend (-10 to +10) ---
+        if "blend" in name_l:
+            return (-10.0, 10.0, 0.5)
+
         if "db" in name_l:
             if "threshold" in name_l: return (-70.0, 20.0, 0.5)
             if "makeup" in name_l: return (0.0, 24.0, 0.5)
@@ -154,10 +164,6 @@ class EffectSettingsDialog(QDialog):
             if "range" in name_l: return (-90.0, 0.0, 0.5)
             if "gain" in name_l: return (-24.0, 24.0, 0.5) # EQ band gains
             return (-60.0, 10.0, 0.5)
-
-        if "distortion" in name_l:
-            # Valve_1209 LADSPA plugin parameters (0.0 to 1.0)
-            return (0.0, 1.0, 0.01)
 
         if "hz" in name_l:
             if "filter" in name_l: return (0.0, 20000.0, 10.0)  # Gate key filters

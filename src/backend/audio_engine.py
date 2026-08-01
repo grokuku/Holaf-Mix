@@ -52,7 +52,7 @@ FX_PLUGIN_MAP = [
     ('gate', 'gate', 'gate_1410', 'gate'),
     ('noise_cancel', 'rnnoise', 'librnnoise_ladspa', 'noise_suppressor_stereo'),
     ('eq', 'eq', 'mbeq_1197', 'mbeq'),
-    ('tube', 'tube', 'valve_1209', 'valve'),
+    ('tube', 'tube', 'tap_tubewarmth', 'tap_tubewarmth'),
     ('compressor', 'comp', 'sc4_1882', 'sc4'),
 ]
 
