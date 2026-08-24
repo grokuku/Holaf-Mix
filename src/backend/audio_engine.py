@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import time
 import logging
 import json
@@ -299,6 +300,12 @@ def _build_fx_graph(strip, format_params_fn, include_controls: bool) -> str:
 
 class AudioEngine:
     def __init__(self):
+        # Guards all mutating operations (start_engine, shutdown,
+        # update_fx_params, reload_strip).  These run on BackendWorker
+        # threads and may be submitted concurrently from the UI, so access
+        # must be serialized to protect the pw-cli pipe and the registries.
+        # RLock so nested public calls from within locked methods stay safe.
+        self._engine_lock = threading.RLock()
         self.node_registry: Dict[str, int] = {}
         self.name_cache: Dict[int, str] = {}
         self.monitor_cache: Dict[int, str] = {}
@@ -318,157 +325,159 @@ class AudioEngine:
         self._fx_hotreload_failures: Dict[str, int] = {}
 
     def start_engine(self, strips: List[Strip]):
-        logger.info("Starting Audio Engine...")
-        self.metering.stop_all()
-        self._stop_fx_host()
-        self._clean_zombie_nodes()
-        # Reset the meter retry counter so the first retry after a restart
-        # happens at a predictable offset (not somewhere in the middle of a
-        # 50-cycle window left over from a previous run).
-        self._meter_retry_counter = 0
-        self._start_fx_host()
+        with self._engine_lock:
+            logger.info("Starting Audio Engine...")
+            self.metering.stop_all()
+            self._stop_fx_host()
+            self._clean_zombie_nodes()
+            # Reset the meter retry counter so the first retry after a restart
+            # happens at a predictable offset (not somewhere in the middle of a
+            # 50-cycle window left over from a previous run).
+            self._meter_retry_counter = 0
+            self._start_fx_host()
 
-        self.node_registry.clear()
-        self.name_cache.clear()
-        self.monitor_cache.clear()
-        self.is_source_registry.clear()
-        self.mono_registry.clear()
-        self.link_registry.clear()
-        self.fx_source_names.clear()
-        self.fx_sink_names.clear()
-        self.fx_node_ids.clear()
-        # Reset hot-reload failure counters on fresh start.
-        self._fx_hotreload_failures.clear()
+            self.node_registry.clear()
+            self.name_cache.clear()
+            self.monitor_cache.clear()
+            self.is_source_registry.clear()
+            self.mono_registry.clear()
+            self.link_registry.clear()
+            self.fx_source_names.clear()
+            self.fx_sink_names.clear()
+            self.fx_node_ids.clear()
+            # Reset hot-reload failure counters on fresh start.
+            self._fx_hotreload_failures.clear()
         
-        # 2. Create Nodes
-        for strip in strips:
-            node_id = None
-            node_name = None
+            # 2. Create Nodes
+            for strip in strips:
+                node_id = None
+                node_name = None
             
-            is_source = (strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL)
-            self.is_source_registry[strip.uid] = is_source
-            self.mono_registry[strip.uid] = strip.is_mono
+                is_source = (strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL)
+                self.is_source_registry[strip.uid] = is_source
+                self.mono_registry[strip.uid] = strip.is_mono
 
-            if strip.kind == StripType.OUTPUT and strip.mode == StripMode.PHYSICAL:
-                node_id = self._find_physical_node(strip)
-                if node_id:
-                        node_name = self._get_node_name(node_id)
-            else:
-                if is_source:
-                        if strip.device_name:
-                            node_id = self._find_node_id_by_name(strip.device_name)
-                            if node_id:
-                                self.name_cache[node_id] = strip.device_name
-                                # Physical sources expose the listenable signal on their
-                                # monitor port (e.g. alsa_input.xxx.monitor). Populate
-                                # monitor_cache so _link_physical_source_to_strip can
-                                # route the signal to outputs when no FX chain is active.
-                                self.monitor_cache[node_id] = f"{strip.device_name}.monitor"
-                                node_name = strip.device_name
-                else:
-                    node_id = self._create_virtual_node(strip)
+                if strip.kind == StripType.OUTPUT and strip.mode == StripMode.PHYSICAL:
+                    node_id = self._find_physical_node(strip)
                     if node_id:
-                        node_name = self.name_cache.get(node_id)
-            
-            if node_id or (is_source and strip.device_name):
-                if node_id:
-                    self.node_registry[strip.uid] = node_id
-                    self.set_volume(strip.uid, strip.volume)
-                    self.set_mute(strip.uid, strip.mute)
-                
-                # --- EFFECTS SETUP ---
-                # The filter-chain is created ONLY when at least one effect is
-                # active.  This avoids creating a virtual Audio/Source node for
-                # every strip, which WirePlumber would auto-connect to physical
-                # outputs (causing microphone leakage into headphones) and
-                # which could interfere with the manual pw-link routing for
-                # virtual inputs (causing Firefox/Desktop to be inaudible).
-                #
-                # When no effect is active, routing falls back to direct
-                # monitor-port links via _link_physical_source_to_strip (for
-                # physical sources) or the raw null-sink node (for virtual
-                # inputs).
-                #
-                # Once a filter-chain is created, ALL plugins are included in
-                # the graph (inactive ones use neutral BYPASS_PARAMS).  This
-                # means subsequent effect toggles can use set-param (hot-reload)
-                # without recreating the chain.  If no chain exists yet,
-                # update_fx_params returns False and the UI triggers a restart
-                # to create it.
-                if _has_active_fx(strip):
-                    if strip.kind == StripType.INPUT:
-                        # Input FX: capture from source, playback as virtual source
-                        base_source = strip.device_name if is_source else f"{node_name}.monitor"
-                        if base_source:
-                            fx_src = self._create_fx_chain(strip, base_source)
-                            if fx_src:
-                                self.fx_source_names[strip.uid] = fx_src
-                    else:  # OUTPUT
-                        # Output FX: capture as virtual sink (receives audio
-                        # from routed inputs), playback to the physical/virtual
-                        # device.
-                        if node_name:
-                            fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
-                            if fx_sink:
-                                self.fx_sink_names[strip.uid] = fx_sink
-
-                # --- METERING SETUP ---
-                target_name = self.fx_source_names.get(strip.uid) or self._resolve_metering_target_name(strip, node_id)
-                if target_name:
-                    self.metering.start_monitoring(strip.uid, target_name)
+                            node_name = self._get_node_name(node_id)
                 else:
-                    logger.warning(f"Metering: Could not resolve target Name for {strip.label}")
-            else:
-                if not is_source:
-                    logger.warning(f"Could not initialize node for strip: {strip.label}")
+                    if is_source:
+                            if strip.device_name:
+                                node_id = self._find_node_id_by_name(strip.device_name)
+                                if node_id:
+                                    self.name_cache[node_id] = strip.device_name
+                                    # Physical sources expose the listenable signal on their
+                                    # monitor port (e.g. alsa_input.xxx.monitor). Populate
+                                    # monitor_cache so _link_physical_source_to_strip can
+                                    # route the signal to outputs when no FX chain is active.
+                                    self.monitor_cache[node_id] = f"{strip.device_name}.monitor"
+                                    node_name = strip.device_name
+                    else:
+                        node_id = self._create_virtual_node(strip)
+                        if node_id:
+                            node_name = self.name_cache.get(node_id)
+            
+                if node_id or (is_source and strip.device_name):
+                    if node_id:
+                        self.node_registry[strip.uid] = node_id
+                        self.set_volume(strip.uid, strip.volume)
+                        self.set_mute(strip.uid, strip.mute)
+                
+                    # --- EFFECTS SETUP ---
+                    # The filter-chain is created ONLY when at least one effect is
+                    # active.  This avoids creating a virtual Audio/Source node for
+                    # every strip, which WirePlumber would auto-connect to physical
+                    # outputs (causing microphone leakage into headphones) and
+                    # which could interfere with the manual pw-link routing for
+                    # virtual inputs (causing Firefox/Desktop to be inaudible).
+                    #
+                    # When no effect is active, routing falls back to direct
+                    # monitor-port links via _link_physical_source_to_strip (for
+                    # physical sources) or the raw null-sink node (for virtual
+                    # inputs).
+                    #
+                    # Once a filter-chain is created, ALL plugins are included in
+                    # the graph (inactive ones use neutral BYPASS_PARAMS).  This
+                    # means subsequent effect toggles can use set-param (hot-reload)
+                    # without recreating the chain.  If no chain exists yet,
+                    # update_fx_params returns False and the UI triggers a restart
+                    # to create it.
+                    if _has_active_fx(strip):
+                        if strip.kind == StripType.INPUT:
+                            # Input FX: capture from source, playback as virtual source
+                            base_source = strip.device_name if is_source else f"{node_name}.monitor"
+                            if base_source:
+                                fx_src = self._create_fx_chain(strip, base_source)
+                                if fx_src:
+                                    self.fx_source_names[strip.uid] = fx_src
+                        else:  # OUTPUT
+                            # Output FX: capture as virtual sink (receives audio
+                            # from routed inputs), playback to the physical/virtual
+                            # device.
+                            if node_name:
+                                fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
+                                if fx_sink:
+                                    self.fx_sink_names[strip.uid] = fx_sink
 
-        # 3. Input Logic
-        input_strips = [s for s in strips if s.kind == StripType.INPUT]
-        for inp in input_strips:
-            if inp.mode == StripMode.PHYSICAL and inp.device_name:
-                self._link_physical_source_to_strip(inp)
+                    # --- METERING SETUP ---
+                    target_name = self.fx_source_names.get(strip.uid) or self._resolve_metering_target_name(strip, node_id)
+                    if target_name:
+                        self.metering.start_monitoring(strip.uid, target_name)
+                    else:
+                        logger.warning(f"Metering: Could not resolve target Name for {strip.label}")
+                else:
+                    if not is_source:
+                        logger.warning(f"Could not initialize node for strip: {strip.label}")
 
-        # 4. Routing Logic
-        for inp in input_strips:
-            source_uid = inp.uid
-            if source_uid not in self.node_registry and source_uid not in self.fx_source_names:
-                continue
-            for target_uid in inp.routes:
-                if target_uid in self.node_registry:
-                    self.update_routing(source_uid, target_uid, active=True)
+            # 3. Input Logic
+            input_strips = [s for s in strips if s.kind == StripType.INPUT]
+            for inp in input_strips:
+                if inp.mode == StripMode.PHYSICAL and inp.device_name:
+                    self._link_physical_source_to_strip(inp)
 
-        # 5. Set Default Sink
-        target_strip = next((s for s in strips if s.is_default and s.kind == StripType.INPUT), None)
-        if not target_strip:
-                target_strip = next((s for s in strips if s.label.lower() == "desktop" and s.kind == StripType.INPUT), None)
-        if not target_strip:
-            target_strip = next((s for s in strips if s.label.lower() == "default" and s.kind == StripType.INPUT), None)
-        if not target_strip:
-            target_strip = next((s for s in strips if s.kind == StripType.INPUT), None)
+            # 4. Routing Logic
+            for inp in input_strips:
+                source_uid = inp.uid
+                if source_uid not in self.node_registry and source_uid not in self.fx_source_names:
+                    continue
+                for target_uid in inp.routes:
+                    if target_uid in self.node_registry:
+                        self.update_routing(source_uid, target_uid, active=True)
 
-        if target_strip and target_strip.uid in self.node_registry:
-            node_name = self.name_cache.get(self.node_registry[target_strip.uid])
-            if node_name:
-                self._set_system_default_sink(node_name)
+            # 5. Set Default Sink
+            target_strip = next((s for s in strips if s.is_default and s.kind == StripType.INPUT), None)
+            if not target_strip:
+                    target_strip = next((s for s in strips if s.label.lower() == "desktop" and s.kind == StripType.INPUT), None)
+            if not target_strip:
+                target_strip = next((s for s in strips if s.label.lower() == "default" and s.kind == StripType.INPUT), None)
+            if not target_strip:
+                target_strip = next((s for s in strips if s.kind == StripType.INPUT), None)
 
-        logger.info("Audio Engine Started.")
+            if target_strip and target_strip.uid in self.node_registry:
+                node_name = self.name_cache.get(self.node_registry[target_strip.uid])
+                if node_name:
+                    self._set_system_default_sink(node_name)
+
+            logger.info("Audio Engine Started.")
 
     def shutdown(self):
-        logger.info("Shutting down Audio Engine...")
-        self.metering.stop_all()
-        self._stop_fx_host()
-        self._clean_zombie_nodes()
-        # Invalidate pw-dump cache so next start_engine() sees fresh state.
-        pipewire_utils.invalidate_pw_dump_cache()
-        self.created_nodes.clear()
-        self.node_registry.clear()
-        self.name_cache.clear()
-        self.monitor_cache.clear()
-        self.is_source_registry.clear()
-        self.mono_registry.clear()
-        self.fx_source_names.clear()
-        self.fx_sink_names.clear()
-        self.fx_node_ids.clear()
+        with self._engine_lock:
+            logger.info("Shutting down Audio Engine...")
+            self.metering.stop_all()
+            self._stop_fx_host()
+            self._clean_zombie_nodes()
+            # Invalidate pw-dump cache so next start_engine() sees fresh state.
+            pipewire_utils.invalidate_pw_dump_cache()
+            self.created_nodes.clear()
+            self.node_registry.clear()
+            self.name_cache.clear()
+            self.monitor_cache.clear()
+            self.is_source_registry.clear()
+            self.mono_registry.clear()
+            self.fx_source_names.clear()
+            self.fx_sink_names.clear()
+            self.fx_node_ids.clear()
 
     # --- FX Host Management ---
 
@@ -869,89 +878,90 @@ class AudioEngine:
         Returns True if the command was sent and pw-cli acknowledged it.
         Returns False if a full engine restart is needed as fallback.
         """
-        # Safety net: after too many consecutive failures, disable hot-reload
-        # for this strip and always fall back to restart.
-        fail_count = self._fx_hotreload_failures.get(strip.uid, 0)
-        if fail_count >= FX_HOTRELOAD_MAX_FAILURES:
-            logger.warning(
-                f"Hot-reload disabled for {strip.uid} ({fail_count} consecutive "
-                f"failures); falling back to restart."
-            )
-            return False
+        with self._engine_lock:
+            # Safety net: after too many consecutive failures, disable hot-reload
+            # for this strip and always fall back to restart.
+            fail_count = self._fx_hotreload_failures.get(strip.uid, 0)
+            if fail_count >= FX_HOTRELOAD_MAX_FAILURES:
+                logger.warning(
+                    f"Hot-reload disabled for {strip.uid} ({fail_count} consecutive "
+                    f"failures); falling back to restart."
+                )
+                return False
 
-        node_id = self.fx_node_ids.get(strip.uid)
-        if not node_id or not self.fx_host_process:
-            logger.warning(f"update_fx_params: no node_id for {strip.uid} or FX host down; falling back to restart.")
-            return False
+            node_id = self.fx_node_ids.get(strip.uid)
+            if not node_id or not self.fx_host_process:
+                logger.warning(f"update_fx_params: no node_id for {strip.uid} or FX host down; falling back to restart.")
+                return False
 
-        # Check if pw-cli process is still alive before sending.
-        if self.fx_host_process.poll() is not None:
-            logger.error(
-                f"pw-cli process is dead (exit code {self.fx_host_process.returncode}); "
-                f"falling back to restart."
-            )
-            self._start_fx_host()
-            return False
-
-        # Build the Props string with control values ONLY (not the full graph).
-        # The previous implementation sent the entire filter.graph definition
-        # via set-param, which is invalid — set-param expects control values,
-        # not a graph reconfiguration.  This was the primary cause of crashes.
-        props_str = _build_fx_props(strip, _format_params)
-        if not props_str:
-            logger.warning(f"update_fx_params: props_str is empty for {strip.uid}; falling back to restart.")
-            return False
-
-        cmd = f'set-param {node_id} Props {props_str}\n'
-        try:
-            # Drain any stale output before sending the command so we don't
-            # misinterpret old messages as errors.
-            self._drain_pw_cli_output()
-
-            logger.info(f"Hot-reload: sending set-param to node {node_id} for strip {strip.uid}.")
-            logger.debug(f"Hot-reload command: {cmd.strip()}")
-            self.fx_host_process.stdin.write(cmd)
-            self.fx_host_process.stdin.flush()
-
-            # Give pw-cli a moment to process the command.
-            time.sleep(0.1)
-
-            # Check if the process died immediately after the command.
+            # Check if pw-cli process is still alive before sending.
             if self.fx_host_process.poll() is not None:
                 logger.error(
-                    f"pw-cli died after set-param (exit code "
-                    f"{self.fx_host_process.returncode}); falling back to restart."
+                    f"pw-cli process is dead (exit code {self.fx_host_process.returncode}); "
+                    f"falling back to restart."
                 )
-                self._fx_hotreload_failures[strip.uid] = fail_count + 1
                 self._start_fx_host()
                 return False
 
-            # Read any output — errors on stderr indicate failure.
-            stdout_data, stderr_data = self._read_pw_cli_output(timeout=0.3)
-            if stderr_data:
-                logger.error(
-                    f"pw-cli stderr after set-param: {stderr_data} "
-                    f"(fail #{fail_count + 1} for {strip.uid})"
-                )
+            # Build the Props string with control values ONLY (not the full graph).
+            # The previous implementation sent the entire filter.graph definition
+            # via set-param, which is invalid — set-param expects control values,
+            # not a graph reconfiguration.  This was the primary cause of crashes.
+            props_str = _build_fx_props(strip, _format_params)
+            if not props_str:
+                logger.warning(f"update_fx_params: props_str is empty for {strip.uid}; falling back to restart.")
+                return False
+
+            cmd = f'set-param {node_id} Props {props_str}\n'
+            try:
+                # Drain any stale output before sending the command so we don't
+                # misinterpret old messages as errors.
+                self._drain_pw_cli_output()
+
+                logger.info(f"Hot-reload: sending set-param to node {node_id} for strip {strip.uid}.")
+                logger.debug(f"Hot-reload command: {cmd.strip()}")
+                self.fx_host_process.stdin.write(cmd)
+                self.fx_host_process.stdin.flush()
+
+                # Give pw-cli a moment to process the command.
+                time.sleep(0.1)
+
+                # Check if the process died immediately after the command.
+                if self.fx_host_process.poll() is not None:
+                    logger.error(
+                        f"pw-cli died after set-param (exit code "
+                        f"{self.fx_host_process.returncode}); falling back to restart."
+                    )
+                    self._fx_hotreload_failures[strip.uid] = fail_count + 1
+                    self._start_fx_host()
+                    return False
+
+                # Read any output — errors on stderr indicate failure.
+                stdout_data, stderr_data = self._read_pw_cli_output(timeout=0.3)
+                if stderr_data:
+                    logger.error(
+                        f"pw-cli stderr after set-param: {stderr_data} "
+                        f"(fail #{fail_count + 1} for {strip.uid})"
+                    )
+                    self._fx_hotreload_failures[strip.uid] = fail_count + 1
+                    return False
+                if stdout_data:
+                    logger.debug(f"pw-cli stdout after set-param: {stdout_data}")
+
+                # Success — reset the failure counter.
+                self._fx_hotreload_failures[strip.uid] = 0
+                logger.info(f"Hot-reload FX params sent successfully for strip {strip.uid}.")
+                return True
+
+            except BrokenPipeError as e:
+                logger.error(f"update_fx_params: pw-cli pipe broken: {e}; falling back to restart.")
+                self._fx_hotreload_failures[strip.uid] = fail_count + 1
+                self._start_fx_host()
+                return False
+            except Exception as e:
+                logger.error(f"update_fx_params: exception during set-param: {e}")
                 self._fx_hotreload_failures[strip.uid] = fail_count + 1
                 return False
-            if stdout_data:
-                logger.debug(f"pw-cli stdout after set-param: {stdout_data}")
-
-            # Success — reset the failure counter.
-            self._fx_hotreload_failures[strip.uid] = 0
-            logger.info(f"Hot-reload FX params sent successfully for strip {strip.uid}.")
-            return True
-
-        except BrokenPipeError as e:
-            logger.error(f"update_fx_params: pw-cli pipe broken: {e}; falling back to restart.")
-            self._fx_hotreload_failures[strip.uid] = fail_count + 1
-            self._start_fx_host()
-            return False
-        except Exception as e:
-            logger.error(f"update_fx_params: exception during set-param: {e}")
-            self._fx_hotreload_failures[strip.uid] = fail_count + 1
-            return False
 
     def reload_strip(self, strip: Strip) -> bool:
         """Destroy and recreate ONLY the FX chain for a single strip.
@@ -974,109 +984,110 @@ class AudioEngine:
         Returns ``True`` on success, ``False`` if the FX chain could not
         be recreated (caller should then fall back to full restart).
         """
-        uid = strip.uid
-        fx_node_name = f"Holaf_FX_{uid}"
-        is_output = (strip.kind == StripType.OUTPUT)
+        with self._engine_lock:
+            uid = strip.uid
+            fx_node_name = f"Holaf_FX_{uid}"
+            is_output = (strip.kind == StripType.OUTPUT)
 
-        logger.info(f"reload_strip: reloading FX chain for '{strip.label}' (uid={uid}, output={is_output})")
+            logger.info(f"reload_strip: reloading FX chain for '{strip.label}' (uid={uid}, output={is_output})")
 
-        # --- 1. Destroy links involving this strip ---
-        # Collect route pairs where this strip is the source or the target.
-        routes_to_restore: List[Tuple[str, str]] = []
-        keys_to_remove = []
-        for (src_uid, dst_uid) in list(self.link_registry.keys()):
-            if src_uid == uid or dst_uid == uid:
-                routes_to_restore.append((src_uid, dst_uid))
-                keys_to_remove.append((src_uid, dst_uid))
+            # --- 1. Destroy links involving this strip ---
+            # Collect route pairs where this strip is the source or the target.
+            routes_to_restore: List[Tuple[str, str]] = []
+            keys_to_remove = []
+            for (src_uid, dst_uid) in list(self.link_registry.keys()):
+                if src_uid == uid or dst_uid == uid:
+                    routes_to_restore.append((src_uid, dst_uid))
+                    keys_to_remove.append((src_uid, dst_uid))
 
-        logger.info(f"reload_strip: destroying {len(keys_to_remove)} links for '{strip.label}': {routes_to_restore}")
-        for key in keys_to_remove:
-            logger.debug(f"reload_strip: destroying link {key[0]} -> {key[1]}")
-            self._destroy_link(key[0], key[1])
+            logger.info(f"reload_strip: destroying {len(keys_to_remove)} links for '{strip.label}': {routes_to_restore}")
+            for key in keys_to_remove:
+                logger.debug(f"reload_strip: destroying link {key[0]} -> {key[1]}")
+                self._destroy_link(key[0], key[1])
 
-        # --- 2. Destroy FX nodes for this strip ---
-        logger.info(f"reload_strip: destroying FX nodes matching '{fx_node_name}'")
-        self._destroy_nodes_by_name_substring(fx_node_name)
+            # --- 2. Destroy FX nodes for this strip ---
+            logger.info(f"reload_strip: destroying FX nodes matching '{fx_node_name}'")
+            self._destroy_nodes_by_name_substring(fx_node_name)
 
-        # Clean up registries for this strip
-        old_fx_src = self.fx_source_names.pop(uid, None)
-        old_fx_sink = self.fx_sink_names.pop(uid, None)
-        old_fx_node = self.fx_node_ids.pop(uid, None)
-        if old_fx_src: logger.info(f"reload_strip: cleared fx_source_names[{uid}] = {old_fx_src}")
-        if old_fx_sink: logger.info(f"reload_strip: cleared fx_sink_names[{uid}] = {old_fx_sink}")
-        if old_fx_node: logger.info(f"reload_strip: cleared fx_node_ids[{uid}] = {old_fx_node}")
-        # Reset hot-reload failure counter — fresh chain.
-        self._fx_hotreload_failures.pop(uid, None)
+            # Clean up registries for this strip
+            old_fx_src = self.fx_source_names.pop(uid, None)
+            old_fx_sink = self.fx_sink_names.pop(uid, None)
+            old_fx_node = self.fx_node_ids.pop(uid, None)
+            if old_fx_src: logger.info(f"reload_strip: cleared fx_source_names[{uid}] = {old_fx_src}")
+            if old_fx_sink: logger.info(f"reload_strip: cleared fx_sink_names[{uid}] = {old_fx_sink}")
+            if old_fx_node: logger.info(f"reload_strip: cleared fx_node_ids[{uid}] = {old_fx_node}")
+            # Reset hot-reload failure counter — fresh chain.
+            self._fx_hotreload_failures.pop(uid, None)
 
-        # Stop metering for this strip (will restart after chain creation)
-        self.metering.stop_monitoring(uid)
+            # Stop metering for this strip (will restart after chain creation)
+            self.metering.stop_monitoring(uid)
 
-        # Invalidate pw-dump cache so that _find_node_id_by_name (called
-        # inside _create_fx_chain) sees the freshly-created nodes immediately.
-        # Without this, the 0.5s TTL cache may return stale data and
-        # fx_node_ids[uid] won't be set, making subsequent hot-reload fail.
-        pipewire_utils.invalidate_pw_dump_cache()
+            # Invalidate pw-dump cache so that _find_node_id_by_name (called
+            # inside _create_fx_chain) sees the freshly-created nodes immediately.
+            # Without this, the 0.5s TTL cache may return stale data and
+            # fx_node_ids[uid] won't be set, making subsequent hot-reload fail.
+            pipewire_utils.invalidate_pw_dump_cache()
 
-        # --- 3. Recreate the FX chain (if any effect is active) ---
-        node_id = self.node_registry.get(uid)
-        node_name = self.name_cache.get(node_id) if node_id else None
-        is_source = self.is_source_registry.get(uid, False)
+            # --- 3. Recreate the FX chain (if any effect is active) ---
+            node_id = self.node_registry.get(uid)
+            node_name = self.name_cache.get(node_id) if node_id else None
+            is_source = self.is_source_registry.get(uid, False)
 
-        if not _has_active_fx(strip):
-            # No active FX — no chain to create.  Fall back to direct
-            # monitor-port routing for physical sources.
-            logger.info(f"reload_strip: no active FX for '{strip.label}', using direct routing")
-            if strip.kind == StripType.INPUT and is_source:
-                self._link_physical_source_to_strip(strip)
-                logger.info(f"reload_strip: set fx_source_names[{uid}] = {self.fx_source_names.get(uid)} (monitor)")
+            if not _has_active_fx(strip):
+                # No active FX — no chain to create.  Fall back to direct
+                # monitor-port routing for physical sources.
+                logger.info(f"reload_strip: no active FX for '{strip.label}', using direct routing")
+                if strip.kind == StripType.INPUT and is_source:
+                    self._link_physical_source_to_strip(strip)
+                    logger.info(f"reload_strip: set fx_source_names[{uid}] = {self.fx_source_names.get(uid)} (monitor)")
 
-            # Re-link routes
-            logger.info(f"reload_strip: re-linking {len(routes_to_restore)} routes (no FX)")
+                # Re-link routes
+                logger.info(f"reload_strip: re-linking {len(routes_to_restore)} routes (no FX)")
+                for (src_uid, dst_uid) in routes_to_restore:
+                    self.update_routing(src_uid, dst_uid, active=True)
+
+                # Restart metering
+                target_name = self._resolve_metering_target_name(strip, node_id)
+                if target_name:
+                    self.metering.start_monitoring(uid, target_name)
+                return True
+
+            if is_output:
+                if not node_name:
+                    logger.error(f"reload_strip: no node name for output strip {strip.label}")
+                    return False
+                fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
+                if not fx_sink:
+                    logger.error(f"reload_strip: failed to recreate FX chain for {strip.label}")
+                    return False
+                self.fx_sink_names[uid] = fx_sink
+                logger.info(f"reload_strip: set fx_sink_names[{uid}] = {fx_sink}")
+            else:
+                base_source = strip.device_name if is_source else (f"{node_name}.monitor" if node_name else None)
+                if not base_source:
+                    logger.error(f"reload_strip: no base source for input strip {strip.label}")
+                    return False
+                fx_src = self._create_fx_chain(strip, base_source, is_output=False)
+                if not fx_src:
+                    logger.error(f"reload_strip: failed to recreate FX chain for {strip.label}")
+                    return False
+                self.fx_source_names[uid] = fx_src
+                logger.info(f"reload_strip: set fx_source_names[{uid}] = {fx_src}")
+
+            # --- 4. Re-link routes involving this strip ---
+            logger.info(f"reload_strip: re-linking {len(routes_to_restore)} routes for '{strip.label}': {routes_to_restore}")
             for (src_uid, dst_uid) in routes_to_restore:
                 self.update_routing(src_uid, dst_uid, active=True)
 
-            # Restart metering
-            target_name = self._resolve_metering_target_name(strip, node_id)
+            # --- 5. Restart metering for this strip ---
+            target_name = self.fx_source_names.get(uid) or self._resolve_metering_target_name(strip, node_id)
             if target_name:
                 self.metering.start_monitoring(uid, target_name)
+            else:
+                logger.warning(f"reload_strip: could not resolve metering target for {strip.label}")
+
+            logger.info(f"reload_strip: successfully reloaded FX chain for '{strip.label}'")
             return True
-
-        if is_output:
-            if not node_name:
-                logger.error(f"reload_strip: no node name for output strip {strip.label}")
-                return False
-            fx_sink = self._create_fx_chain(strip, node_name, is_output=True)
-            if not fx_sink:
-                logger.error(f"reload_strip: failed to recreate FX chain for {strip.label}")
-                return False
-            self.fx_sink_names[uid] = fx_sink
-            logger.info(f"reload_strip: set fx_sink_names[{uid}] = {fx_sink}")
-        else:
-            base_source = strip.device_name if is_source else (f"{node_name}.monitor" if node_name else None)
-            if not base_source:
-                logger.error(f"reload_strip: no base source for input strip {strip.label}")
-                return False
-            fx_src = self._create_fx_chain(strip, base_source, is_output=False)
-            if not fx_src:
-                logger.error(f"reload_strip: failed to recreate FX chain for {strip.label}")
-                return False
-            self.fx_source_names[uid] = fx_src
-            logger.info(f"reload_strip: set fx_source_names[{uid}] = {fx_src}")
-
-        # --- 4. Re-link routes involving this strip ---
-        logger.info(f"reload_strip: re-linking {len(routes_to_restore)} routes for '{strip.label}': {routes_to_restore}")
-        for (src_uid, dst_uid) in routes_to_restore:
-            self.update_routing(src_uid, dst_uid, active=True)
-
-        # --- 5. Restart metering for this strip ---
-        target_name = self.fx_source_names.get(uid) or self._resolve_metering_target_name(strip, node_id)
-        if target_name:
-            self.metering.start_monitoring(uid, target_name)
-        else:
-            logger.warning(f"reload_strip: could not resolve metering target for {strip.label}")
-
-        logger.info(f"reload_strip: successfully reloaded FX chain for '{strip.label}'")
-        return True
 
     def _resolve_metering_target_name(self, strip: Strip, node_id: Optional[int]) -> Optional[str]:
         if strip.kind == StripType.INPUT and strip.mode == StripMode.PHYSICAL:
