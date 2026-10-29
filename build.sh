@@ -370,6 +370,27 @@ make_tarball() {
     [[ -f "$ROOT_DIR/packaging/holaf-mix.desktop" ]] && \
         cp "$ROOT_DIR/packaging/holaf-mix.desktop" "$staging/"
 
+    # --- Optional Rust core (holafd + holafctl) --------------------------
+    # The Rust daemon/CLI are built by `scripts/build_rust.sh` (or by CI's
+    # cargo step) into $DIST_DIR. When present, ship them inside the same
+    # tarball so a single download is enough to try `HOLAF_USE_RUST=1`.
+    # When absent (plain local build without cargo), we say so and continue:
+    # the Python-only bundle must keep working exactly as before.
+    local rust_bins=()
+    local b
+    for b in holafd holafctl; do
+        if [[ -x "$DIST_DIR/$b" ]]; then
+            cp "$DIST_DIR/$b" "$staging/"
+            chmod +x "$staging/$b"
+            rust_bins+=("$b")
+        fi
+    done
+    if ((${#rust_bins[@]})); then
+        ok "Rust daemon included: ${rust_bins[*]}"
+    else
+        warn "Rust daemon not built, skipping (run scripts/build_rust.sh first to include it)"
+    fi
+
     tar -czf "$DIST_DIR/$tar_name" -C "$DIST_DIR" "${APP_NAME}-${APP_VERSION}"
     rm -rf "$staging"
 

@@ -1,0 +1,36 @@
+# Holaf-Mix — Rust rewrite workspace.
+#
+# The Python UI and the Rust daemon evolve together inside the same git repo
+# (see docs/rust-rewrite-spec.md).  This workspace will host, in order:
+#
+#   crates/holaf-core  (J0)  pure model/FX/migration/SPA-formatting — this crate
+#   crates/holaf-pw    (J1+) PipeWire layer behind a GraphBackend trait
+#   crates/holaf-ipc   (J3+) IPC protocol types
+#   crates/holafd      (J3+) daemon binary
+#   crates/holafctl    (J3+) CLI
+#
+# J0/J3 have ZERO PipeWire dependency: everything below compiles and is tested
+# without a running PipeWire server.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/holaf-core",
+    "crates/holaf-pw",
+    "crates/holaf-ipc",
+    "crates/holafd",
+    "crates/holafctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"

@@ -1,0 +1,10 @@
+[package]
+name = "holaf-ipc"
+description = "Holaf-Mix IPC protocol types (NDJSON request/response/event envelopes) — pure, no PipeWire."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

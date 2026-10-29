@@ -1,0 +1,10 @@
+[package]
+name = "holafctl"
+description = "Holaf-Mix CLI debug client for the holafd Unix-socket NDJSON protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+holaf-ipc = { path = "../holaf-ipc" }
+serde_json = { workspace = true }

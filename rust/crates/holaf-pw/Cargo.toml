@@ -1,0 +1,23 @@
+[package]
+name = "holaf-pw"
+description = "Holaf-Mix PipeWire layer: the real J2 PipeWireBackend behind the holaf-core Backend trait (filter-chains, null-sinks, links, metadata, volume/mute), plus the J1 FFI module-loading shim and SPA-JSON builders."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+holaf-core = { path = "../holaf-core" }
+pipewire = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+
+[[bin]]
+name = "holaf-spike"
+path = "src/bin/holaf-spike.rs"

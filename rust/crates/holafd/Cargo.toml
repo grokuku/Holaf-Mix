@@ -1,0 +1,17 @@
+[package]
+name = "holafd"
+description = "Holaf-Mix daemon: Unix-socket NDJSON server dispatching IPC to an injectable Backend (fake for J3, PipeWire later)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+holaf-core = { path = "../holaf-core" }
+holaf-ipc = { path = "../holaf-ipc" }
+holaf-pw = { path = "../holaf-pw" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

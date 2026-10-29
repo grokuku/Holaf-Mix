@@ -41,6 +41,26 @@ It features a persistent UI, robust routing logic, and full **MIDI Bidirectional
 *   **Audio Backend**: PipeWire (via `pw-cli` and `pw-dump` wrappers) + `sounddevice` (for VU meters)
 *   **MIDI**: `mido` + `python-rtmidi`
 
+## Rust rewrite (expérimental)
+
+> ⚠️ **Work in progress — n'affecte pas le comportement par défaut.**
+
+Un daemon **`holafd`** écrit en Rust (`rust/`, workspace cargo) est en cours de
+réécriture du cœur audio.  Il est **inactif par défaut** ; pour l'essayer :
+
+```bash
+cd rust && cargo build --release -p holafd
+cd .. && HOLAF_USE_RUST=1 python main.py
+```
+
+Il faut un backend `holafd` qui réponde (`--backend fake` par défaut dans le
+launcher Python) ; le backend PipeWire réel (J1/J2) arrivera sur machine avec
+PipeWire.  État détaillé des jalons (J0–J5), commandes de test et incertitudes
+API pipewire-rs : [`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md),
+avec la spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
+Sans `HOLAF_USE_RUST=1`, `main.py` utilise l'`AudioEngine` Python classique,
+inchangé.
+
 ## Installation
 
 **Note**: This assumes you are on Linux and have **PipeWire** installed and active.

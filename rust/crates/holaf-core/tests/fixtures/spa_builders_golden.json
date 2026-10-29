@@ -1,0 +1,1832 @@
+{
+  "generator": "tools/export_fixtures.py",
+  "method": "Imported the real src/backend/audio_engine.py + src/models/strip_model.py with inert stubs for the unavailable sounddevice/numpy dependencies (metering only). Pure FX functions (_build_fx_graph, _format_params, _resolve_effect_controls, _get_fx_data) are used as-is, NOT copied.",
+  "notes": {
+    "rust_style_floats": "Graph and props values are formatted like Rust f32 Display (shortest round-trip, no trailing '.0'), not like Python _format_params (0.0). Rust is the J2 reference formatter.",
+    "props_shape": "Python _build_fx_props emits a per-node NESTED struct which J1 proved is a silent no-op on PipeWire 0.3.65/1.2.x. props_flat / props_pairs use the corrected FLAT shape { \"params\" = [ \"eq_L:port\" val ... ] } (module emission order: plugin chain order, mono <label>_L then <label>_R, ports in control order).",
+    "availability_override": "os.path.exists was overridden so each case only 'sees' the listed .so files; fixtures therefore do not depend on the ambient plugin directory. The headless container has gate_1410, mbeq_1197, tap_tubewarmth, sc4_1882 (no rnnoise).",
+    "output_kind_divergence": "Python _build_fx_graph ignores strip.kind and would include a bypassed gate on an output chain when gate_1410.so is present. holaf-core restricts chains to EffectKey::for_strip(kind) (output = eq/tube/comp per spec §5). The output fixture restricts availability to {mbeq_1197,tap_tubewarmth,sc4_1882} so both Python and Rust agree."
+  },
+  "default_effect_params": {
+    "gate": [
+      [
+        "LF key filter (Hz)",
+        33.6
+      ],
+      [
+        "HF key filter (Hz)",
+        23520.0
+      ],
+      [
+        "Threshold (dB)",
+        -70.0
+      ],
+      [
+        "Attack (ms)",
+        250.008
+      ],
+      [
+        "Hold (ms)",
+        1500.5
+      ],
+      [
+        "Decay (ms)",
+        2001.0
+      ],
+      [
+        "Range (dB)",
+        -90.0
+      ],
+      [
+        "Output select (-1 = key listen, 0 = gate, 1 = bypass)",
+        0.0
+      ]
+    ],
+    "compressor": [
+      [
+        "RMS/peak",
+        0.0
+      ],
+      [
+        "Attack time (ms)",
+        101.125
+      ],
+      [
+        "Release time (ms)",
+        401.0
+      ],
+      [
+        "Threshold level (dB)",
+        0.0
+      ],
+      [
+        "Ratio (1:n)",
+        1.0
+      ],
+      [
+        "Knee radius (dB)",
+        3.25
+      ],
+      [
+        "Makeup gain (dB)",
+        0.0
+      ]
+    ],
+    "eq": [
+      [
+        "50Hz gain (low shelving)",
+        0.0
+      ],
+      [
+        "100Hz gain",
+        0.0
+      ],
+      [
+        "156Hz gain",
+        0.0
+      ],
+      [
+        "220Hz gain",
+        0.0
+      ],
+      [
+        "311Hz gain",
+        0.0
+      ],
+      [
+        "440Hz gain",
+        0.0
+      ],
+      [
+        "622Hz gain",
+        0.0
+      ],
+      [
+        "880Hz gain",
+        0.0
+      ],
+      [
+        "1250Hz gain",
+        0.0
+      ],
+      [
+        "1750Hz gain",
+        0.0
+      ],
+      [
+        "2500Hz gain",
+        0.0
+      ],
+      [
+        "3500Hz gain",
+        0.0
+      ],
+      [
+        "5000Hz gain",
+        0.0
+      ],
+      [
+        "10000Hz gain",
+        0.0
+      ],
+      [
+        "20000Hz gain",
+        0.0
+      ]
+    ],
+    "noise_cancel": [
+      [
+        "VAD Threshold (%)",
+        74.25
+      ],
+      [
+        "VAD Grace Period (ms)",
+        500
+      ],
+      [
+        "Retroactive VAD Grace (ms)",
+        100
+      ],
+      [
+        "Dry Mix",
+        0.0
+      ]
+    ],
+    "tube": [
+      [
+        "Drive",
+        2.575
+      ],
+      [
+        "Tape--Tube Blend",
+        10.0
+      ]
+    ]
+  },
+  "bypass_params": {
+    "gate": [
+      [
+        "Output select (-1 = key listen, 0 = gate, 1 = bypass)",
+        1.0
+      ],
+      [
+        "Range (dB)",
+        0.0
+      ],
+      [
+        "Threshold (dB)",
+        -100.0
+      ]
+    ],
+    "noise_cancel": [
+      [
+        "Dry Mix",
+        1.0
+      ]
+    ],
+    "eq": [
+      [
+        "50Hz gain (low shelving)",
+        0.0
+      ],
+      [
+        "100Hz gain",
+        0.0
+      ],
+      [
+        "156Hz gain",
+        0.0
+      ],
+      [
+        "220Hz gain",
+        0.0
+      ],
+      [
+        "311Hz gain",
+        0.0
+      ],
+      [
+        "440Hz gain",
+        0.0
+      ],
+      [
+        "622Hz gain",
+        0.0
+      ],
+      [
+        "880Hz gain",
+        0.0
+      ],
+      [
+        "1250Hz gain",
+        0.0
+      ],
+      [
+        "1750Hz gain",
+        0.0
+      ],
+      [
+        "2500Hz gain",
+        0.0
+      ],
+      [
+        "3500Hz gain",
+        0.0
+      ],
+      [
+        "5000Hz gain",
+        0.0
+      ],
+      [
+        "10000Hz gain",
+        0.0
+      ],
+      [
+        "20000Hz gain",
+        0.0
+      ]
+    ],
+    "tube": [
+      [
+        "Drive",
+        0.1
+      ]
+    ],
+    "compressor": [
+      [
+        "Ratio (1:n)",
+        1.0
+      ]
+    ]
+  },
+  "fx_plugin_map": [
+    [
+      "gate",
+      "gate",
+      "gate_1410",
+      "gate",
+      false
+    ],
+    [
+      "noise_cancel",
+      "rnnoise",
+      "librnnoise_ladspa",
+      "noise_suppressor_stereo",
+      true
+    ],
+    [
+      "eq",
+      "eq",
+      "mbeq_1197",
+      "mbeq",
+      false
+    ],
+    [
+      "tube",
+      "tube",
+      "tap_tubewarmth",
+      "tap_tubewarmth",
+      false
+    ],
+    [
+      "compressor",
+      "comp",
+      "sc4_1882",
+      "sc4",
+      true
+    ]
+  ],
+  "stereo_plugins": {
+    "sc4_1882": {
+      "in_l": "Left input",
+      "in_r": "Right input",
+      "out_l": "Left output",
+      "out_r": "Right output"
+    },
+    "librnnoise_ladspa": {
+      "in_l": "Input (L)",
+      "in_r": "Input (R)",
+      "out_l": "Output (L)",
+      "out_r": "Output (R)"
+    }
+  },
+  "cases": [
+    {
+      "id": "eq_active_dualmono_input",
+      "kind": "input",
+      "available": [
+        "mbeq_1197"
+      ],
+      "effects": {
+        "eq": {
+          "active": true,
+          "params": [
+            [
+              "50Hz gain (low shelving)",
+              0.0
+            ],
+            [
+              "100Hz gain",
+              -3.5
+            ],
+            [
+              "156Hz gain",
+              0.0
+            ],
+            [
+              "220Hz gain",
+              0.0
+            ],
+            [
+              "311Hz gain",
+              0.0
+            ],
+            [
+              "440Hz gain",
+              0.0
+            ],
+            [
+              "622Hz gain",
+              0.0
+            ],
+            [
+              "880Hz gain",
+              0.0
+            ],
+            [
+              "1250Hz gain",
+              0.0
+            ],
+            [
+              "1750Hz gain",
+              0.0
+            ],
+            [
+              "2500Hz gain",
+              0.0
+            ],
+            [
+              "3500Hz gain",
+              0.0
+            ],
+            [
+              "5000Hz gain",
+              0.0
+            ],
+            [
+              "10000Hz gain",
+              2.0
+            ],
+            [
+              "20000Hz gain",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"eq_L\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } { type = ladspa name = \"eq_R\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } ] links = [  ] inputs = [ \"eq_L:Input\", \"eq_R:Input\" ] outputs = [ \"eq_L:Output\", \"eq_R:Output\" ] }",
+      "props_flat": "{ \"params\" = [ \"eq_L:50Hz gain (low shelving)\" 0 \"eq_L:100Hz gain\" -3.5 \"eq_L:156Hz gain\" 0 \"eq_L:220Hz gain\" 0 \"eq_L:311Hz gain\" 0 \"eq_L:440Hz gain\" 0 \"eq_L:622Hz gain\" 0 \"eq_L:880Hz gain\" 0 \"eq_L:1250Hz gain\" 0 \"eq_L:1750Hz gain\" 0 \"eq_L:2500Hz gain\" 0 \"eq_L:3500Hz gain\" 0 \"eq_L:5000Hz gain\" 0 \"eq_L:10000Hz gain\" 2 \"eq_L:20000Hz gain\" 0 \"eq_R:50Hz gain (low shelving)\" 0 \"eq_R:100Hz gain\" -3.5 \"eq_R:156Hz gain\" 0 \"eq_R:220Hz gain\" 0 \"eq_R:311Hz gain\" 0 \"eq_R:440Hz gain\" 0 \"eq_R:622Hz gain\" 0 \"eq_R:880Hz gain\" 0 \"eq_R:1250Hz gain\" 0 \"eq_R:1750Hz gain\" 0 \"eq_R:2500Hz gain\" 0 \"eq_R:3500Hz gain\" 0 \"eq_R:5000Hz gain\" 0 \"eq_R:10000Hz gain\" 2 \"eq_R:20000Hz gain\" 0 ] }",
+      "props_pairs": [
+        [
+          "eq_L:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_L:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_L:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_L:20000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_R:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_R:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_R:20000Hz gain",
+          0.0
+        ]
+      ]
+    },
+    {
+      "id": "eq_inactive_dualmono_input",
+      "kind": "input",
+      "available": [
+        "mbeq_1197"
+      ],
+      "effects": {
+        "eq": {
+          "active": false,
+          "params": [
+            [
+              "50Hz gain (low shelving)",
+              0.0
+            ],
+            [
+              "100Hz gain",
+              -9.0
+            ],
+            [
+              "156Hz gain",
+              0.0
+            ],
+            [
+              "220Hz gain",
+              0.0
+            ],
+            [
+              "311Hz gain",
+              0.0
+            ],
+            [
+              "440Hz gain",
+              0.0
+            ],
+            [
+              "622Hz gain",
+              0.0
+            ],
+            [
+              "880Hz gain",
+              0.0
+            ],
+            [
+              "1250Hz gain",
+              0.0
+            ],
+            [
+              "1750Hz gain",
+              0.0
+            ],
+            [
+              "2500Hz gain",
+              0.0
+            ],
+            [
+              "3500Hz gain",
+              0.0
+            ],
+            [
+              "5000Hz gain",
+              0.0
+            ],
+            [
+              "10000Hz gain",
+              0.0
+            ],
+            [
+              "20000Hz gain",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"eq_L\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = 0 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 0 \"20000Hz gain\" = 0 } } { type = ladspa name = \"eq_R\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = 0 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 0 \"20000Hz gain\" = 0 } } ] links = [  ] inputs = [ \"eq_L:Input\", \"eq_R:Input\" ] outputs = [ \"eq_L:Output\", \"eq_R:Output\" ] }",
+      "props_flat": "{ \"params\" = [ \"eq_L:50Hz gain (low shelving)\" 0 \"eq_L:100Hz gain\" 0 \"eq_L:156Hz gain\" 0 \"eq_L:220Hz gain\" 0 \"eq_L:311Hz gain\" 0 \"eq_L:440Hz gain\" 0 \"eq_L:622Hz gain\" 0 \"eq_L:880Hz gain\" 0 \"eq_L:1250Hz gain\" 0 \"eq_L:1750Hz gain\" 0 \"eq_L:2500Hz gain\" 0 \"eq_L:3500Hz gain\" 0 \"eq_L:5000Hz gain\" 0 \"eq_L:10000Hz gain\" 0 \"eq_L:20000Hz gain\" 0 \"eq_R:50Hz gain (low shelving)\" 0 \"eq_R:100Hz gain\" 0 \"eq_R:156Hz gain\" 0 \"eq_R:220Hz gain\" 0 \"eq_R:311Hz gain\" 0 \"eq_R:440Hz gain\" 0 \"eq_R:622Hz gain\" 0 \"eq_R:880Hz gain\" 0 \"eq_R:1250Hz gain\" 0 \"eq_R:1750Hz gain\" 0 \"eq_R:2500Hz gain\" 0 \"eq_R:3500Hz gain\" 0 \"eq_R:5000Hz gain\" 0 \"eq_R:10000Hz gain\" 0 \"eq_R:20000Hz gain\" 0 ] }",
+      "props_pairs": [
+        [
+          "eq_L:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_L:100Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:10000Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:20000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_R:100Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:10000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:20000Hz gain",
+          0.0
+        ]
+      ]
+    },
+    {
+      "id": "compressor_active_stereo_input",
+      "kind": "input",
+      "available": [
+        "sc4_1882"
+      ],
+      "effects": {
+        "compressor": {
+          "active": true,
+          "params": [
+            [
+              "RMS/peak",
+              0.0
+            ],
+            [
+              "Attack time (ms)",
+              20.0
+            ],
+            [
+              "Release time (ms)",
+              401.0
+            ],
+            [
+              "Threshold level (dB)",
+              0.0
+            ],
+            [
+              "Ratio (1:n)",
+              4.0
+            ],
+            [
+              "Knee radius (dB)",
+              3.25
+            ],
+            [
+              "Makeup gain (dB)",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"comp\" plugin = \"/usr/lib/ladspa/sc4_1882.so\" label = \"sc4\" control = { \"RMS/peak\" = 0 \"Attack time (ms)\" = 20 \"Release time (ms)\" = 401 \"Threshold level (dB)\" = 0 \"Ratio (1:n)\" = 4 \"Knee radius (dB)\" = 3.25 \"Makeup gain (dB)\" = 0 } } ] links = [  ] inputs = [ \"comp:Left input\", \"comp:Right input\" ] outputs = [ \"comp:Left output\", \"comp:Right output\" ] }",
+      "props_flat": "{ \"params\" = [ \"comp:RMS/peak\" 0 \"comp:Attack time (ms)\" 20 \"comp:Release time (ms)\" 401 \"comp:Threshold level (dB)\" 0 \"comp:Ratio (1:n)\" 4 \"comp:Knee radius (dB)\" 3.25 \"comp:Makeup gain (dB)\" 0 ] }",
+      "props_pairs": [
+        [
+          "comp:RMS/peak",
+          0.0
+        ],
+        [
+          "comp:Attack time (ms)",
+          20.0
+        ],
+        [
+          "comp:Release time (ms)",
+          401.0
+        ],
+        [
+          "comp:Threshold level (dB)",
+          0.0
+        ],
+        [
+          "comp:Ratio (1:n)",
+          4.0
+        ],
+        [
+          "comp:Knee radius (dB)",
+          3.25
+        ],
+        [
+          "comp:Makeup gain (dB)",
+          0.0
+        ]
+      ]
+    },
+    {
+      "id": "gate_bypassed_eq_active_input",
+      "kind": "input",
+      "available": [
+        "gate_1410",
+        "mbeq_1197"
+      ],
+      "effects": {
+        "gate": {
+          "active": false,
+          "params": [
+            [
+              "LF key filter (Hz)",
+              33.6
+            ],
+            [
+              "HF key filter (Hz)",
+              23520.0
+            ],
+            [
+              "Threshold (dB)",
+              -70.0
+            ],
+            [
+              "Attack (ms)",
+              250.008
+            ],
+            [
+              "Hold (ms)",
+              1500.5
+            ],
+            [
+              "Decay (ms)",
+              2001.0
+            ],
+            [
+              "Range (dB)",
+              -90.0
+            ],
+            [
+              "Output select (-1 = key listen, 0 = gate, 1 = bypass)",
+              0.0
+            ]
+          ]
+        },
+        "eq": {
+          "active": true,
+          "params": [
+            [
+              "50Hz gain (low shelving)",
+              0.0
+            ],
+            [
+              "100Hz gain",
+              -3.5
+            ],
+            [
+              "156Hz gain",
+              0.0
+            ],
+            [
+              "220Hz gain",
+              0.0
+            ],
+            [
+              "311Hz gain",
+              0.0
+            ],
+            [
+              "440Hz gain",
+              0.0
+            ],
+            [
+              "622Hz gain",
+              0.0
+            ],
+            [
+              "880Hz gain",
+              0.0
+            ],
+            [
+              "1250Hz gain",
+              0.0
+            ],
+            [
+              "1750Hz gain",
+              0.0
+            ],
+            [
+              "2500Hz gain",
+              0.0
+            ],
+            [
+              "3500Hz gain",
+              0.0
+            ],
+            [
+              "5000Hz gain",
+              0.0
+            ],
+            [
+              "10000Hz gain",
+              2.0
+            ],
+            [
+              "20000Hz gain",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"gate_L\" plugin = \"/usr/lib/ladspa/gate_1410.so\" label = \"gate\" control = { \"LF key filter (Hz)\" = 33.6 \"HF key filter (Hz)\" = 23520 \"Threshold (dB)\" = -100 \"Attack (ms)\" = 250.008 \"Hold (ms)\" = 1500.5 \"Decay (ms)\" = 2001 \"Range (dB)\" = 0 } } { type = ladspa name = \"gate_R\" plugin = \"/usr/lib/ladspa/gate_1410.so\" label = \"gate\" control = { \"LF key filter (Hz)\" = 33.6 \"HF key filter (Hz)\" = 23520 \"Threshold (dB)\" = -100 \"Attack (ms)\" = 250.008 \"Hold (ms)\" = 1500.5 \"Decay (ms)\" = 2001 \"Range (dB)\" = 0 } } { type = ladspa name = \"eq_L\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } { type = ladspa name = \"eq_R\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } ] links = [ { output = \"gate_L:Output\" input = \"eq_L:Input\" } { output = \"gate_R:Output\" input = \"eq_R:Input\" } ] inputs = [ \"gate_L:Input\", \"gate_R:Input\" ] outputs = [ \"eq_L:Output\", \"eq_R:Output\" ] }",
+      "props_flat": "{ \"params\" = [ \"gate_L:LF key filter (Hz)\" 33.6 \"gate_L:HF key filter (Hz)\" 23520 \"gate_L:Threshold (dB)\" -100 \"gate_L:Attack (ms)\" 250.008 \"gate_L:Hold (ms)\" 1500.5 \"gate_L:Decay (ms)\" 2001 \"gate_L:Range (dB)\" 0 \"gate_R:LF key filter (Hz)\" 33.6 \"gate_R:HF key filter (Hz)\" 23520 \"gate_R:Threshold (dB)\" -100 \"gate_R:Attack (ms)\" 250.008 \"gate_R:Hold (ms)\" 1500.5 \"gate_R:Decay (ms)\" 2001 \"gate_R:Range (dB)\" 0 \"eq_L:50Hz gain (low shelving)\" 0 \"eq_L:100Hz gain\" -3.5 \"eq_L:156Hz gain\" 0 \"eq_L:220Hz gain\" 0 \"eq_L:311Hz gain\" 0 \"eq_L:440Hz gain\" 0 \"eq_L:622Hz gain\" 0 \"eq_L:880Hz gain\" 0 \"eq_L:1250Hz gain\" 0 \"eq_L:1750Hz gain\" 0 \"eq_L:2500Hz gain\" 0 \"eq_L:3500Hz gain\" 0 \"eq_L:5000Hz gain\" 0 \"eq_L:10000Hz gain\" 2 \"eq_L:20000Hz gain\" 0 \"eq_R:50Hz gain (low shelving)\" 0 \"eq_R:100Hz gain\" -3.5 \"eq_R:156Hz gain\" 0 \"eq_R:220Hz gain\" 0 \"eq_R:311Hz gain\" 0 \"eq_R:440Hz gain\" 0 \"eq_R:622Hz gain\" 0 \"eq_R:880Hz gain\" 0 \"eq_R:1250Hz gain\" 0 \"eq_R:1750Hz gain\" 0 \"eq_R:2500Hz gain\" 0 \"eq_R:3500Hz gain\" 0 \"eq_R:5000Hz gain\" 0 \"eq_R:10000Hz gain\" 2 \"eq_R:20000Hz gain\" 0 ] }",
+      "props_pairs": [
+        [
+          "gate_L:LF key filter (Hz)",
+          33.6
+        ],
+        [
+          "gate_L:HF key filter (Hz)",
+          23520.0
+        ],
+        [
+          "gate_L:Threshold (dB)",
+          -100.0
+        ],
+        [
+          "gate_L:Attack (ms)",
+          250.008
+        ],
+        [
+          "gate_L:Hold (ms)",
+          1500.5
+        ],
+        [
+          "gate_L:Decay (ms)",
+          2001.0
+        ],
+        [
+          "gate_L:Range (dB)",
+          0.0
+        ],
+        [
+          "gate_R:LF key filter (Hz)",
+          33.6
+        ],
+        [
+          "gate_R:HF key filter (Hz)",
+          23520.0
+        ],
+        [
+          "gate_R:Threshold (dB)",
+          -100.0
+        ],
+        [
+          "gate_R:Attack (ms)",
+          250.008
+        ],
+        [
+          "gate_R:Hold (ms)",
+          1500.5
+        ],
+        [
+          "gate_R:Decay (ms)",
+          2001.0
+        ],
+        [
+          "gate_R:Range (dB)",
+          0.0
+        ],
+        [
+          "eq_L:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_L:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_L:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_L:20000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_R:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_R:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_R:20000Hz gain",
+          0.0
+        ]
+      ]
+    },
+    {
+      "id": "full_input_chain_no_rnnoise",
+      "kind": "input",
+      "available": [
+        "gate_1410",
+        "mbeq_1197",
+        "tap_tubewarmth",
+        "sc4_1882"
+      ],
+      "effects": {
+        "gate": {
+          "active": false,
+          "params": [
+            [
+              "LF key filter (Hz)",
+              33.6
+            ],
+            [
+              "HF key filter (Hz)",
+              23520.0
+            ],
+            [
+              "Threshold (dB)",
+              -70.0
+            ],
+            [
+              "Attack (ms)",
+              250.008
+            ],
+            [
+              "Hold (ms)",
+              1500.5
+            ],
+            [
+              "Decay (ms)",
+              2001.0
+            ],
+            [
+              "Range (dB)",
+              -90.0
+            ],
+            [
+              "Output select (-1 = key listen, 0 = gate, 1 = bypass)",
+              0.0
+            ]
+          ]
+        },
+        "eq": {
+          "active": true,
+          "params": [
+            [
+              "50Hz gain (low shelving)",
+              0.0
+            ],
+            [
+              "100Hz gain",
+              -3.5
+            ],
+            [
+              "156Hz gain",
+              0.0
+            ],
+            [
+              "220Hz gain",
+              0.0
+            ],
+            [
+              "311Hz gain",
+              0.0
+            ],
+            [
+              "440Hz gain",
+              0.0
+            ],
+            [
+              "622Hz gain",
+              0.0
+            ],
+            [
+              "880Hz gain",
+              0.0
+            ],
+            [
+              "1250Hz gain",
+              0.0
+            ],
+            [
+              "1750Hz gain",
+              0.0
+            ],
+            [
+              "2500Hz gain",
+              0.0
+            ],
+            [
+              "3500Hz gain",
+              0.0
+            ],
+            [
+              "5000Hz gain",
+              0.0
+            ],
+            [
+              "10000Hz gain",
+              2.0
+            ],
+            [
+              "20000Hz gain",
+              0.0
+            ]
+          ]
+        },
+        "tube": {
+          "active": true,
+          "params": [
+            [
+              "Drive",
+              4.5
+            ],
+            [
+              "Tape--Tube Blend",
+              10.0
+            ]
+          ]
+        },
+        "compressor": {
+          "active": false,
+          "params": [
+            [
+              "RMS/peak",
+              0.0
+            ],
+            [
+              "Attack time (ms)",
+              101.125
+            ],
+            [
+              "Release time (ms)",
+              401.0
+            ],
+            [
+              "Threshold level (dB)",
+              0.0
+            ],
+            [
+              "Ratio (1:n)",
+              1.0
+            ],
+            [
+              "Knee radius (dB)",
+              3.25
+            ],
+            [
+              "Makeup gain (dB)",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"gate_L\" plugin = \"/usr/lib/ladspa/gate_1410.so\" label = \"gate\" control = { \"LF key filter (Hz)\" = 33.6 \"HF key filter (Hz)\" = 23520 \"Threshold (dB)\" = -100 \"Attack (ms)\" = 250.008 \"Hold (ms)\" = 1500.5 \"Decay (ms)\" = 2001 \"Range (dB)\" = 0 } } { type = ladspa name = \"gate_R\" plugin = \"/usr/lib/ladspa/gate_1410.so\" label = \"gate\" control = { \"LF key filter (Hz)\" = 33.6 \"HF key filter (Hz)\" = 23520 \"Threshold (dB)\" = -100 \"Attack (ms)\" = 250.008 \"Hold (ms)\" = 1500.5 \"Decay (ms)\" = 2001 \"Range (dB)\" = 0 } } { type = ladspa name = \"eq_L\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } { type = ladspa name = \"eq_R\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } { type = ladspa name = \"tube_L\" plugin = \"/usr/lib/ladspa/tap_tubewarmth.so\" label = \"tap_tubewarmth\" control = { \"Drive\" = 4.5 \"Tape--Tube Blend\" = 10 } } { type = ladspa name = \"tube_R\" plugin = \"/usr/lib/ladspa/tap_tubewarmth.so\" label = \"tap_tubewarmth\" control = { \"Drive\" = 4.5 \"Tape--Tube Blend\" = 10 } } { type = ladspa name = \"comp\" plugin = \"/usr/lib/ladspa/sc4_1882.so\" label = \"sc4\" control = { \"RMS/peak\" = 0 \"Attack time (ms)\" = 101.125 \"Release time (ms)\" = 401 \"Threshold level (dB)\" = 0 \"Ratio (1:n)\" = 1 \"Knee radius (dB)\" = 3.25 \"Makeup gain (dB)\" = 0 } } ] links = [ { output = \"gate_L:Output\" input = \"eq_L:Input\" } { output = \"gate_R:Output\" input = \"eq_R:Input\" } { output = \"eq_L:Output\" input = \"tube_L:Input\" } { output = \"eq_R:Output\" input = \"tube_R:Input\" } { output = \"tube_L:Output\" input = \"comp:Left input\" } { output = \"tube_R:Output\" input = \"comp:Right input\" } ] inputs = [ \"gate_L:Input\", \"gate_R:Input\" ] outputs = [ \"comp:Left output\", \"comp:Right output\" ] }",
+      "props_flat": "{ \"params\" = [ \"gate_L:LF key filter (Hz)\" 33.6 \"gate_L:HF key filter (Hz)\" 23520 \"gate_L:Threshold (dB)\" -100 \"gate_L:Attack (ms)\" 250.008 \"gate_L:Hold (ms)\" 1500.5 \"gate_L:Decay (ms)\" 2001 \"gate_L:Range (dB)\" 0 \"gate_R:LF key filter (Hz)\" 33.6 \"gate_R:HF key filter (Hz)\" 23520 \"gate_R:Threshold (dB)\" -100 \"gate_R:Attack (ms)\" 250.008 \"gate_R:Hold (ms)\" 1500.5 \"gate_R:Decay (ms)\" 2001 \"gate_R:Range (dB)\" 0 \"eq_L:50Hz gain (low shelving)\" 0 \"eq_L:100Hz gain\" -3.5 \"eq_L:156Hz gain\" 0 \"eq_L:220Hz gain\" 0 \"eq_L:311Hz gain\" 0 \"eq_L:440Hz gain\" 0 \"eq_L:622Hz gain\" 0 \"eq_L:880Hz gain\" 0 \"eq_L:1250Hz gain\" 0 \"eq_L:1750Hz gain\" 0 \"eq_L:2500Hz gain\" 0 \"eq_L:3500Hz gain\" 0 \"eq_L:5000Hz gain\" 0 \"eq_L:10000Hz gain\" 2 \"eq_L:20000Hz gain\" 0 \"eq_R:50Hz gain (low shelving)\" 0 \"eq_R:100Hz gain\" -3.5 \"eq_R:156Hz gain\" 0 \"eq_R:220Hz gain\" 0 \"eq_R:311Hz gain\" 0 \"eq_R:440Hz gain\" 0 \"eq_R:622Hz gain\" 0 \"eq_R:880Hz gain\" 0 \"eq_R:1250Hz gain\" 0 \"eq_R:1750Hz gain\" 0 \"eq_R:2500Hz gain\" 0 \"eq_R:3500Hz gain\" 0 \"eq_R:5000Hz gain\" 0 \"eq_R:10000Hz gain\" 2 \"eq_R:20000Hz gain\" 0 \"tube_L:Drive\" 4.5 \"tube_L:Tape--Tube Blend\" 10 \"tube_R:Drive\" 4.5 \"tube_R:Tape--Tube Blend\" 10 \"comp:RMS/peak\" 0 \"comp:Attack time (ms)\" 101.125 \"comp:Release time (ms)\" 401 \"comp:Threshold level (dB)\" 0 \"comp:Ratio (1:n)\" 1 \"comp:Knee radius (dB)\" 3.25 \"comp:Makeup gain (dB)\" 0 ] }",
+      "props_pairs": [
+        [
+          "gate_L:LF key filter (Hz)",
+          33.6
+        ],
+        [
+          "gate_L:HF key filter (Hz)",
+          23520.0
+        ],
+        [
+          "gate_L:Threshold (dB)",
+          -100.0
+        ],
+        [
+          "gate_L:Attack (ms)",
+          250.008
+        ],
+        [
+          "gate_L:Hold (ms)",
+          1500.5
+        ],
+        [
+          "gate_L:Decay (ms)",
+          2001.0
+        ],
+        [
+          "gate_L:Range (dB)",
+          0.0
+        ],
+        [
+          "gate_R:LF key filter (Hz)",
+          33.6
+        ],
+        [
+          "gate_R:HF key filter (Hz)",
+          23520.0
+        ],
+        [
+          "gate_R:Threshold (dB)",
+          -100.0
+        ],
+        [
+          "gate_R:Attack (ms)",
+          250.008
+        ],
+        [
+          "gate_R:Hold (ms)",
+          1500.5
+        ],
+        [
+          "gate_R:Decay (ms)",
+          2001.0
+        ],
+        [
+          "gate_R:Range (dB)",
+          0.0
+        ],
+        [
+          "eq_L:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_L:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_L:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_L:20000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_R:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_R:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_R:20000Hz gain",
+          0.0
+        ],
+        [
+          "tube_L:Drive",
+          4.5
+        ],
+        [
+          "tube_L:Tape--Tube Blend",
+          10.0
+        ],
+        [
+          "tube_R:Drive",
+          4.5
+        ],
+        [
+          "tube_R:Tape--Tube Blend",
+          10.0
+        ],
+        [
+          "comp:RMS/peak",
+          0.0
+        ],
+        [
+          "comp:Attack time (ms)",
+          101.125
+        ],
+        [
+          "comp:Release time (ms)",
+          401.0
+        ],
+        [
+          "comp:Threshold level (dB)",
+          0.0
+        ],
+        [
+          "comp:Ratio (1:n)",
+          1.0
+        ],
+        [
+          "comp:Knee radius (dB)",
+          3.25
+        ],
+        [
+          "comp:Makeup gain (dB)",
+          0.0
+        ]
+      ]
+    },
+    {
+      "id": "output_chain_eq_tube_comp",
+      "kind": "output",
+      "available": [
+        "mbeq_1197",
+        "tap_tubewarmth",
+        "sc4_1882"
+      ],
+      "effects": {
+        "eq": {
+          "active": true,
+          "params": [
+            [
+              "50Hz gain (low shelving)",
+              0.0
+            ],
+            [
+              "100Hz gain",
+              -3.5
+            ],
+            [
+              "156Hz gain",
+              0.0
+            ],
+            [
+              "220Hz gain",
+              0.0
+            ],
+            [
+              "311Hz gain",
+              0.0
+            ],
+            [
+              "440Hz gain",
+              0.0
+            ],
+            [
+              "622Hz gain",
+              0.0
+            ],
+            [
+              "880Hz gain",
+              0.0
+            ],
+            [
+              "1250Hz gain",
+              0.0
+            ],
+            [
+              "1750Hz gain",
+              0.0
+            ],
+            [
+              "2500Hz gain",
+              0.0
+            ],
+            [
+              "3500Hz gain",
+              0.0
+            ],
+            [
+              "5000Hz gain",
+              0.0
+            ],
+            [
+              "10000Hz gain",
+              2.0
+            ],
+            [
+              "20000Hz gain",
+              0.0
+            ]
+          ]
+        },
+        "tube": {
+          "active": false,
+          "params": [
+            [
+              "Drive",
+              2.575
+            ],
+            [
+              "Tape--Tube Blend",
+              10.0
+            ]
+          ]
+        },
+        "compressor": {
+          "active": true,
+          "params": [
+            [
+              "RMS/peak",
+              0.0
+            ],
+            [
+              "Attack time (ms)",
+              101.125
+            ],
+            [
+              "Release time (ms)",
+              401.0
+            ],
+            [
+              "Threshold level (dB)",
+              0.0
+            ],
+            [
+              "Ratio (1:n)",
+              3.0
+            ],
+            [
+              "Knee radius (dB)",
+              3.25
+            ],
+            [
+              "Makeup gain (dB)",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"eq_L\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } { type = ladspa name = \"eq_R\" plugin = \"/usr/lib/ladspa/mbeq_1197.so\" label = \"mbeq\" control = { \"50Hz gain (low shelving)\" = 0 \"100Hz gain\" = -3.5 \"156Hz gain\" = 0 \"220Hz gain\" = 0 \"311Hz gain\" = 0 \"440Hz gain\" = 0 \"622Hz gain\" = 0 \"880Hz gain\" = 0 \"1250Hz gain\" = 0 \"1750Hz gain\" = 0 \"2500Hz gain\" = 0 \"3500Hz gain\" = 0 \"5000Hz gain\" = 0 \"10000Hz gain\" = 2 \"20000Hz gain\" = 0 } } { type = ladspa name = \"tube_L\" plugin = \"/usr/lib/ladspa/tap_tubewarmth.so\" label = \"tap_tubewarmth\" control = { \"Drive\" = 0.1 \"Tape--Tube Blend\" = 10 } } { type = ladspa name = \"tube_R\" plugin = \"/usr/lib/ladspa/tap_tubewarmth.so\" label = \"tap_tubewarmth\" control = { \"Drive\" = 0.1 \"Tape--Tube Blend\" = 10 } } { type = ladspa name = \"comp\" plugin = \"/usr/lib/ladspa/sc4_1882.so\" label = \"sc4\" control = { \"RMS/peak\" = 0 \"Attack time (ms)\" = 101.125 \"Release time (ms)\" = 401 \"Threshold level (dB)\" = 0 \"Ratio (1:n)\" = 3 \"Knee radius (dB)\" = 3.25 \"Makeup gain (dB)\" = 0 } } ] links = [ { output = \"eq_L:Output\" input = \"tube_L:Input\" } { output = \"eq_R:Output\" input = \"tube_R:Input\" } { output = \"tube_L:Output\" input = \"comp:Left input\" } { output = \"tube_R:Output\" input = \"comp:Right input\" } ] inputs = [ \"eq_L:Input\", \"eq_R:Input\" ] outputs = [ \"comp:Left output\", \"comp:Right output\" ] }",
+      "props_flat": "{ \"params\" = [ \"eq_L:50Hz gain (low shelving)\" 0 \"eq_L:100Hz gain\" -3.5 \"eq_L:156Hz gain\" 0 \"eq_L:220Hz gain\" 0 \"eq_L:311Hz gain\" 0 \"eq_L:440Hz gain\" 0 \"eq_L:622Hz gain\" 0 \"eq_L:880Hz gain\" 0 \"eq_L:1250Hz gain\" 0 \"eq_L:1750Hz gain\" 0 \"eq_L:2500Hz gain\" 0 \"eq_L:3500Hz gain\" 0 \"eq_L:5000Hz gain\" 0 \"eq_L:10000Hz gain\" 2 \"eq_L:20000Hz gain\" 0 \"eq_R:50Hz gain (low shelving)\" 0 \"eq_R:100Hz gain\" -3.5 \"eq_R:156Hz gain\" 0 \"eq_R:220Hz gain\" 0 \"eq_R:311Hz gain\" 0 \"eq_R:440Hz gain\" 0 \"eq_R:622Hz gain\" 0 \"eq_R:880Hz gain\" 0 \"eq_R:1250Hz gain\" 0 \"eq_R:1750Hz gain\" 0 \"eq_R:2500Hz gain\" 0 \"eq_R:3500Hz gain\" 0 \"eq_R:5000Hz gain\" 0 \"eq_R:10000Hz gain\" 2 \"eq_R:20000Hz gain\" 0 \"tube_L:Drive\" 0.1 \"tube_L:Tape--Tube Blend\" 10 \"tube_R:Drive\" 0.1 \"tube_R:Tape--Tube Blend\" 10 \"comp:RMS/peak\" 0 \"comp:Attack time (ms)\" 101.125 \"comp:Release time (ms)\" 401 \"comp:Threshold level (dB)\" 0 \"comp:Ratio (1:n)\" 3 \"comp:Knee radius (dB)\" 3.25 \"comp:Makeup gain (dB)\" 0 ] }",
+      "props_pairs": [
+        [
+          "eq_L:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_L:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_L:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_L:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_L:20000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:50Hz gain (low shelving)",
+          0.0
+        ],
+        [
+          "eq_R:100Hz gain",
+          -3.5
+        ],
+        [
+          "eq_R:156Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:220Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:311Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:440Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:622Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:880Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1250Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:1750Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:2500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:3500Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:5000Hz gain",
+          0.0
+        ],
+        [
+          "eq_R:10000Hz gain",
+          2.0
+        ],
+        [
+          "eq_R:20000Hz gain",
+          0.0
+        ],
+        [
+          "tube_L:Drive",
+          0.1
+        ],
+        [
+          "tube_L:Tape--Tube Blend",
+          10.0
+        ],
+        [
+          "tube_R:Drive",
+          0.1
+        ],
+        [
+          "tube_R:Tape--Tube Blend",
+          10.0
+        ],
+        [
+          "comp:RMS/peak",
+          0.0
+        ],
+        [
+          "comp:Attack time (ms)",
+          101.125
+        ],
+        [
+          "comp:Release time (ms)",
+          401.0
+        ],
+        [
+          "comp:Threshold level (dB)",
+          0.0
+        ],
+        [
+          "comp:Ratio (1:n)",
+          3.0
+        ],
+        [
+          "comp:Knee radius (dB)",
+          3.25
+        ],
+        [
+          "comp:Makeup gain (dB)",
+          0.0
+        ]
+      ]
+    },
+    {
+      "id": "noise_cancel_requested_but_missing",
+      "kind": "input",
+      "available": [],
+      "effects": {
+        "noise_cancel": {
+          "active": true,
+          "params": [
+            [
+              "VAD Threshold (%)",
+              74.25
+            ],
+            [
+              "VAD Grace Period (ms)",
+              500
+            ],
+            [
+              "Retroactive VAD Grace (ms)",
+              100
+            ],
+            [
+              "Dry Mix",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "",
+      "props_flat": "",
+      "props_pairs": []
+    },
+    {
+      "id": "noise_cancel_stereo_input",
+      "kind": "input",
+      "available": [
+        "librnnoise_ladspa"
+      ],
+      "effects": {
+        "noise_cancel": {
+          "active": true,
+          "params": [
+            [
+              "VAD Threshold (%)",
+              74.25
+            ],
+            [
+              "VAD Grace Period (ms)",
+              500
+            ],
+            [
+              "Retroactive VAD Grace (ms)",
+              100
+            ],
+            [
+              "Dry Mix",
+              0.0
+            ]
+          ]
+        }
+      },
+      "graph": "{ nodes = [ { type = ladspa name = \"rnnoise\" plugin = \"/usr/lib/ladspa/librnnoise_ladspa.so\" label = \"noise_suppressor_stereo\" control = { \"VAD Threshold (%)\" = 74.25 \"VAD Grace Period (ms)\" = 500 \"Retroactive VAD Grace (ms)\" = 100 \"Dry Mix\" = 0 } } ] links = [  ] inputs = [ \"rnnoise:Input (L)\", \"rnnoise:Input (R)\" ] outputs = [ \"rnnoise:Output (L)\", \"rnnoise:Output (R)\" ] }",
+      "props_flat": "{ \"params\" = [ \"rnnoise:VAD Threshold (%)\" 74.25 \"rnnoise:VAD Grace Period (ms)\" 500 \"rnnoise:Retroactive VAD Grace (ms)\" 100 \"rnnoise:Dry Mix\" 0 ] }",
+      "props_pairs": [
+        [
+          "rnnoise:VAD Threshold (%)",
+          74.25
+        ],
+        [
+          "rnnoise:VAD Grace Period (ms)",
+          500
+        ],
+        [
+          "rnnoise:Retroactive VAD Grace (ms)",
+          100
+        ],
+        [
+          "rnnoise:Dry Mix",
+          0.0
+        ]
+      ]
+    }
+  ]
+}

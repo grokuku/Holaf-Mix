@@ -20,3 +20,5 @@ dist/
 # OS generated files
 .DS_Store
 Thumbs.db
+# Rust workspace build artifacts
+rust/target/

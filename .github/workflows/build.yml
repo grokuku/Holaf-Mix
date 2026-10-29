@@ -19,10 +19,24 @@
 #    - The container is destroyed at the end of the job. Nothing persists
 #      on GitHub's side except the uploaded artifact.
 #
-#  Output:
-#    - holaf-mix-{ref}-{arch}.tar.gz  (the distributable bundle)
-#    - holaf-mix-onedir-{ref}-{arch}.zip (alternative fast-launch build)
-#    - SHA256SUMS (checksums for verification)
+#  Output: two INDEPENDENT artifact sets
+#
+#    Python build (legacy, still the user-facing app):
+#      holaf-mix-{sha}-{arch}
+#        holaf-mix-{version}-{arch}.tar.gz  (the distributable bundle)
+#        SHA256SUMS
+#
+#    Rust build (daemon + CLI, J5 — becoming the new core):
+#      holaf-rust-{sha}-{arch}
+#        holafd, holafctl                    (release binaries, stripped)
+#        holaf-rust-{arch}.tar.gz            (both binaries in one tarball)
+#
+#  Why two separate artifacts (and not one merged bundle)?
+#    The Rust workspace is young; the Python app is what users run today.
+#    Keeping them in separate upload steps means a broken Rust build never
+#    prevents the Python bundle from being published (and vice-versa).
+#    When the Rust rewrite is validated, the Python steps can be deleted
+#    without touching the Rust ones.
 # ============================================================================
 
 name: Build Holaf-Mix
@@ -58,7 +72,9 @@ jobs:
     container:
       image: archlinux:latest
       options: --privileged --init
-    timeout-minutes: 30
+    # 45 min: PyInstaller (2 copies of Qt when mode=both) + a cold cargo
+    # build of the whole workspace + cargo test no longer fit in 30.
+    timeout-minutes: 45
 
     env:
       # Skip the safety guard inside the CI container (no display, no host)
@@ -108,6 +124,18 @@ jobs:
           # sounddevice links against PortAudio at *import* time (not just
           # build time), so we need the shared lib too.
           # base-devel pulls in gcc/g++/make/pkgconf which are also needed.
+          #
+          # Rust workspace deps (rust/crates/holaf-pw):
+          #   pipewire     -> ships libpipewire-0.3.pc AND libspa-0.2.pc
+          #                   (there is no separate -dev/-headers package on
+          #                   Arch: the headers come with the runtime package)
+          #   clang        -> provides libclang.so, required by bindgen
+          #                   (libspa-sys / pipewire-sys generate bindings)
+          #   rustup       -> NOT the `rust` package: we need a toolchain that
+          #                   satisfies rust-version = "1.98" pinned in
+          #                   rust/Cargo.toml, and rustup is the only way to
+          #                   get a guaranteed-stable, self-updating one.
+          # pkgconf is already in the list and is what -sys crates call.
           pacman -S --noconfirm --needed \
             base-devel \
             pkgconf \
@@ -118,7 +146,10 @@ jobs:
             python-pip \
             jack2 \
             alsa-lib \
-            portaudio
+            portaudio \
+            pipewire \
+            clang \
+            rustup
 
           # Arch's `python` package provides /usr/bin/python3; verify
           # before continuing, otherwise the next step fails with a
@@ -130,6 +161,62 @@ jobs:
             exit 1
           fi
           python3 --version
+
+          # Verify the PipeWire / SPA pkg-config files really landed. If this
+          # fails, `cargo build -p holaf-pw` will fail later with an opaque
+          # "pkg-config exited with status code 1" from the -sys crate, so it
+          # is much cheaper to catch it here.
+          export PKG_CONFIG_PATH="/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          for pc in libpipewire-0.3 libspa-0.2; do
+            if pkg-config --exists "$pc"; then
+              echo "  OK   pkg-config: $pc $(pkg-config --modversion "$pc")"
+            else
+              echo "::error::pkg-config cannot find $pc — Rust build will fail."
+              exit 1
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # 1b. Rust toolchain
+      # ------------------------------------------------------------------
+      - name: Initialize Rust toolchain (rustup)
+        # rustup (pacman) installs only the *shim*; the actual toolchain is
+        # downloaded here. `default stable` guarantees >= the 1.98 pinned in
+        # rust/Cargo.toml (cargo hard-fails on an older toolchain).
+        #
+        # PATH pitfall: every `run:` is a FRESH shell, so the ~/.cargo/bin
+        # directory created by rustup is NOT on PATH in later steps.
+        # The robust fix (better than repeating `export PATH=...` in every
+        # step) is to append it once to $GITHUB_PATH: GitHub then prepends it
+        # to the PATH of every subsequent step of this job.
+        # We also export it locally so `cargo --version` below resolves.
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup default stable
+
+          # Persist for every following step (no-op for this shell)
+          if [[ -d "$HOME/.cargo/bin" ]]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          else
+            echo "::error::$HOME/.cargo/bin missing after rustup default stable"
+            exit 1
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          rustup --version
+          cargo --version
+          rustc --version
+
+          # Fail loudly NOW if the toolchain is older than the workspace pin
+          # instead of 10 minutes later inside cargo.
+          req="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' rust/Cargo.toml | head -1)"
+          have="$(rustc --version | awk '{print $2}')"
+          echo "rust-version pin: ${req:-<none>} / toolchain: $have"
+          if [[ -n "$req" ]] && [[ "$(printf '%s\n%s\n' "$req" "$have" | sort -V | head -1)" != "$req" ]]; then
+            echo "::error::Toolchain $have is older than rust-version $req (rust/Cargo.toml)"
+            exit 1
+          fi
 
       - name: Install Python build dependencies
         # Use a venv instead of --break-system-packages. On Arch, the
@@ -189,13 +276,135 @@ jobs:
       - name: Build (onedir, fast launch)
         if: ${{ github.event.inputs.mode == 'onedir' || github.event.inputs.mode == 'both' }}
         run: |
+          # Activate the venv too: each `run:` is a fresh shell, so the
+          # activation done in the onefile step does NOT carry over. Without
+          # this, `pyinstaller` is not found when mode=onedir/both.
+          # shellcheck disable=SC1091
+          source /opt/holaf-venv/bin/activate
           chmod +x build.sh assets/icons/build_icons.sh
           ./build.sh --onedir --tarball
         env:
           HOLAF_BUILD_INSTALL_DEPS: '1'
 
       # ------------------------------------------------------------------
-      # 3. Verify the binary actually runs (smoke test)
+      # 3. Rust build (daemon + CLI)
+      #    Runs AFTER the Python build (so a Rust breakage can never block the
+      #    Python artifact — see the upload steps) and BEFORE the Python smoke
+      #    tests, so each toolchain gets its own shell/env. Output lands in
+      #    dist/ next to the Python bundle; the "Fold" step below then injects
+      #    holafd/holafctl into the already-built Python tarball.
+      # ------------------------------------------------------------------
+      - name: Restore cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build Rust daemon + CLI (release)
+        # PATH: ~/.cargo/bin was appended to $GITHUB_PATH by the rustup step,
+        # so `cargo` resolves here without re-exporting.
+        # LIBCLANG_PATH: Arch puts libclang.so in /usr/lib (no versioned
+        # subdir); bindgen's clang-sys search order is not exhaustive, so we
+        # point at it explicitly — harmless when unnecessary.
+        env:
+          LIBCLANG_PATH: /usr/lib
+        run: |
+          set -euo pipefail
+          cd rust
+          # --locked is intentional and must NOT be dropped if it fails:
+          # a lockfile out of sync with the manifests is a real repository
+          # bug (non-reproducible builds). Let the step fail visibly and fix
+          # Cargo.lock with `cargo update` locally — do not "repair" it here.
+          cargo build --release --locked -p holafd -p holafctl
+          cd ..
+          mkdir -p dist
+          cp rust/target/release/holafd rust/target/release/holafctl dist/
+          chmod +x dist/holafd dist/holafctl
+          strip dist/holafd dist/holafctl || true
+          file dist/holafd dist/holafctl
+          ls -lh dist/holafd dist/holafctl
+
+          # Bundle both binaries for users who want a single download.
+          arch="$(uname -m)"
+          tar -czf "dist/holaf-rust-${arch}.tar.gz" -C dist holafd holafctl
+          ls -lh "dist/holaf-rust-${arch}.tar.gz"
+
+          # Runtime linkage sanity: catches a binary linked against
+          # libpipewire/libspa versions that are not actually installed.
+          # Warning-level on purpose (the Rust core is still experimental and
+          # must not block the Python artifact).
+          for bin in dist/holafd dist/holafctl; do
+            if ldd "$bin" 2>/dev/null | grep -q "not found"; then
+              echo "::warning::missing shared libraries for $bin:"
+              ldd "$bin" | grep "not found" || true
+            else
+              echo "  OK   dynamic dependencies resolve for $bin"
+            fi
+            # The loader running at all proves the ELF is loadable.
+            # `timeout` guards against a future change where --help stops
+            # being a pure parse-and-exit (e.g. it starts a backend).
+            timeout 10 "$bin" --help >/dev/null 2>&1 || true
+          done
+
+      - name: Fold Rust binaries into the Python bundle
+        # build.sh's make_tarball() already copies dist/holafd + dist/holafctl
+        # into the bundle *when they exist* — but in this workflow the Python
+        # build runs BEFORE the Rust build (deliberately: a Rust failure must
+        # not block the Python artifact). So we repack the already-built
+        # tarball here, in place. Result: one download contains the Python app
+        # AND the Rust daemon/CLI (HOLAF_USE_RUST=1 works out of the box).
+        # Tolerant: if no tarball exists (build failed / mode skipped), it
+        # does nothing and never fails the job.
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          tarballs=(dist/holaf-mix-*.tar.gz)
+          if ((${#tarballs[@]} == 0)); then
+            echo "No Python tarball in dist/ — nothing to fold into."
+            exit 0
+          fi
+          if [[ ! -x dist/holafd || ! -x dist/holafctl ]]; then
+            echo "Rust binaries missing — leaving the Python tarball as-is."
+            exit 0
+          fi
+          for tb in "${tarballs[@]}"; do
+            workdir=$(mktemp -d)
+            tar -xzf "$tb" -C "$workdir"
+            # The staging root is holaf-mix-<version>/ (see build.sh)
+            root="$(find "$workdir" -mindepth 1 -maxdepth 1 -type d | head -1)"
+            if [[ -z "$root" ]]; then
+              echo "::warning::$tb has no top-level directory — skipping"
+              rm -rf "$workdir"
+              continue
+            fi
+            cp dist/holafd dist/holafctl "$root/"
+            chmod +x "$root/holafd" "$root/holafctl"
+            tar -czf "$tb" -C "$workdir" "$(basename "$root")"
+            rm -rf "$workdir"
+            echo "Repacked $tb — Rust entries now inside:"
+            tar -tzf "$tb" | grep -E '(holafd|holafctl)$' || echo "  (none!)"
+          done
+
+      - name: cargo test (workspace)
+        # No PipeWire daemon is required: the live tests in
+        # holaf-pw/tests/backend_live.rs self-skip (stderr "SKIP backend_live:
+        # no headless PipeWire configured") unless XDG_RUNTIME_DIR points at a
+        # headless runtime or HOLAF_PW_LIVE=1 is set. Nothing here sets those,
+        # so the job stays hermetic on a stock Arch container.
+        env:
+          LIBCLANG_PATH: /usr/lib
+        run: |
+          set -euo pipefail
+          cd rust
+          cargo test --locked --workspace
+
+      # ------------------------------------------------------------------
+      # 4. Verify the Python binary actually runs (smoke test)
       # ------------------------------------------------------------------
       - name: Smoke test — binary well-formed
         run: |
@@ -246,66 +455,130 @@ jobs:
         # a runtime ModuleNotFoundError on Python 3.12+ — PyInstaller's
         # static analysis misses the lazy-imported submodules.
         # Output is preserved in the workflow log for inspection.
+        #
+        # PATH FIX: this step used to read $PYI_DIST, which is a *local*
+        # variable inside build.sh (PYI_DIST="$BUILD_DIR/dist") and is
+        # therefore EMPTY in the workflow env — every branch fell into
+        # "no _internal dir" and the diagnostic printed nothing. The real
+        # layout, straight from build.sh:
+        #   workpath  = build/pyinstaller     (TOC + warn files, per spec)
+        #   distpath  = build/dist            (raw PyInstaller output)
+        #   published = dist/holaf-mix        (file if onefile, dir if onedir)
+        # Note: build.sh wipes the workpath before each mode, so with
+        # mode=both only the last mode's TOCs survive — the published
+        # on-disk layout check below covers the other mode.
         continue-on-error: true
         run: |
-          # shellcheck disable=SC1091
-          source /opt/holaf-venv/bin/activate
+          set -uo pipefail
           echo "::group::Email module introspection"
-          # Use PyInstaller's own introspection: run the binary in a mode
-          # that just lists bundled modules and grep for email.
-          # We can't actually exec the bundle (no display), but we can
-          # inspect the build artifacts left by PyInstaller.
-          if [[ -d "$PYI_DIST/_internal" ]]; then
-            # onedir mode
-            base="$PYI_DIST/_internal"
-          elif [[ -d "$PYI_DIST" ]]; then
-            base="$PYI_DIST"
-          else
-            base=""
+
+          PYI_WORK="build/pyinstaller"
+          PYI_OUT="build/dist"
+          PUBLISHED="dist/holaf-mix"
+
+          toc_files=()
+          while IFS= read -r f; do toc_files+=("$f"); done \
+            < <(find "$PYI_WORK" -maxdepth 2 -name '*.toc' 2>/dev/null)
+
+          # Real onedir layout, whichever path PyInstaller used
+          internal_dir=""
+          if [[ -d "$PUBLISHED/_internal" ]]; then
+            internal_dir="$PUBLISHED/_internal"
+          elif [[ -d "$PYI_OUT/holaf-mix/_internal" ]]; then
+            internal_dir="$PYI_OUT/holaf-mix/_internal"
           fi
-          echo "Looking in: ${base:-<no _internal dir>}"
-          if [[ -n "$base" ]]; then
-            echo "--- email* files in PYZ/PUP archive ---"
-            find "$base" -name "*.pyz" -o -name "*.toc" 2>/dev/null | head -5
-            echo "--- email* in bundle filesystem ---"
-            find "$base" -path "*email*" 2>/dev/null | head -20
-            echo "--- PYZ contents (if readable) ---"
-            find "$base" -name "*.pyz" 2>/dev/null | while read -r pyz; do
-              echo "  $pyz:"
-              python3 -c "
-              import zipfile, sys
-              try:
-                  with zipfile.ZipFile('$pyz', 'r') as z:
-                      names = [n for n in z.namelist() if 'email' in n.lower()]
-                      for n in sorted(names)[:20]:
-                          print(f'    {n}')
-                      print(f'  ... ({len(names)} total email* files)')
-              except Exception as e:
-                  print(f'  cannot read: {e}')
-              "
-            done
+
+          echo "TOC files found:    ${#toc_files[@]} under $PYI_WORK"
+          echo "_internal dir:      ${internal_dir:-<none — onefile mode>}"
+
+          # 1. Authoritative check: PyInstaller TOCs enumerate every
+          #    collected module (Python modules show up as 'email.foo').
+          if ((${#toc_files[@]})); then
+            echo "--- email* entries in PyInstaller TOCs ---"
+            grep -ho "'email[^']*'" "${toc_files[@]}" 2>/dev/null | sort -u | head -40 || true
+            n=$(grep -ho "'email[^']*'" "${toc_files[@]}" 2>/dev/null | sort -u | wc -l)
+            echo "  -> $n distinct email* entries"
+            if [[ "$n" -eq 0 ]]; then
+              echo "::warning::No email* module collected — the bundled app will fail to import email."
+            elif [[ "$n" -lt 5 ]]; then
+              echo "::warning::Only $n email* module(s) collected — submodules are likely missing."
+            else
+              echo "  OK   $n email* entries collected"
+            fi
+          else
+            echo "::warning::$PYI_WORK/*.toc not found — did a build step run?"
+          fi
+
+          # 2. Onedir mode only: the module files are physically on disk
+          if [[ -n "$internal_dir" ]]; then
+            files_n=$(find "$internal_dir" -path '*email*' 2>/dev/null | wc -l)
+            echo "--- email* paths on disk in _internal: $files_n ---"
+            find "$internal_dir" -path '*email*' 2>/dev/null | head -20 || true
+          fi
+
+          # 3. Sanity: something was actually published to dist/
+          if [[ -e "$PUBLISHED" ]]; then
+            ls -ld "$PUBLISHED"
+          else
+            echo "::warning::$PUBLISHED missing — nothing published to dist/."
           fi
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
-      # 4. Compute checksums
+      # 5. Compute checksums
       # ------------------------------------------------------------------
       - name: Generate checksums
-        if: ${{ hashFiles('dist/*.tar.gz') != '' }}
+        # Tolerant loop: the Rust binaries (and their tarball) only exist if
+        # the Rust build ran, so a missing file must not fail this step.
+        # `!cancelled()` (instead of the implicit success()): we want the
+        # checksums even if a later Rust step failed, as long as a tarball
+        # was produced.
+        if: ${{ !cancelled() && hashFiles('dist/*.tar.gz') != '' }}
         run: |
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          shopt -s nullglob
+          files=(*.tar.gz holafd holafctl)
+          if ((${#files[@]})); then
+            sha256sum "${files[@]}" > SHA256SUMS
+          else
+            : > SHA256SUMS
+          fi
           cat SHA256SUMS
 
       # ------------------------------------------------------------------
-      # 5. Upload artifacts
+      # 6. Upload artifacts — two INDEPENDENT sets
       # ------------------------------------------------------------------
-      - name: Upload tarball
+      - name: Upload Python tarball
+        # `!cancelled()` + hashFiles guard = the Python artifact is published
+        # even when a *later* step (the Rust build, smoke tests, …) failed.
+        # That is what makes the two artifact sets truly independent.
+        if: ${{ !cancelled() && hashFiles('dist/holaf-mix-*.tar.gz') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: holaf-mix-${{ github.sha }}-${{ runner.arch }}
+          # Narrow glob (holaf-mix-*): build.sh names its tarball
+          # holaf-mix-<version>-<arch>.tar.gz, so this avoids also grabbing
+          # dist/holaf-rust-<arch>.tar.gz, which belongs to the other
+          # artifact below.
           path: |
-            dist/*.tar.gz
+            dist/holaf-mix-*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Rust binaries
+        # Kept separate on purpose: if the Rust build breaks, the Python
+        # bundle above is still published (and vice-versa: a PyInstaller
+        # failure leaves the Rust artifact downloadable if cargo succeeded).
+        # Content: holafd + holafctl + a tarball of both + the checksums.
+        if: ${{ !cancelled() && hashFiles('dist/holafd') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: holaf-rust-${{ github.sha }}-${{ runner.arch }}
+          path: |
+            dist/holafd
+            dist/holafctl
+            dist/holaf-rust-*.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30

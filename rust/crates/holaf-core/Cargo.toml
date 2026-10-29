@@ -1,0 +1,12 @@
+[package]
+name = "holaf-core"
+description = "Holaf-Mix core: strip model, FX tables, migrations and SPA-JSON formatting (pure, no PipeWire)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
