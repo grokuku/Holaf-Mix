@@ -11,7 +11,7 @@ rust/
   crates/holafd/             # binaire daemon : machine à états + thread PipeWire + serveur socket Unix
   crates/holafctl/           # (jalon J3+) client CLI de debug
 ```
-Dépendances prévues : pipewire = "0.8", spa = "0.8", serde/serde_json, indexmap, thiserror, log/env_logger, socket Unix via std, pas de runtime async (threads + channels).
+Dépendances : pipewire = "0.10" (l'API SPA vient de libspa, ré-exportée en `pipewire::spa` ; le crate `spa` de la spec n'existe pas à cette version), serde/serde_json, indexmap, thiserror, log/env_logger, socket Unix via std, pas de runtime async (threads + channels).
 
 ## 2. Modèle de données Rust (source de vérité = daemon)
 holaf-core porte : Strip, StripType, StripMode, état FX, tables DEFAULT_EFFECT_PARAMS/BYPASS_PARAMS, migrations from_dict, lecture/écriture config.json. L'UI Python n'envoie que des ordres (intent).
@@ -33,7 +33,7 @@ Config IO: reprend settings.py (écriture atomique tmp+os.replace, résolution c
 - discovery/cleanup zombies: registry globals, identifier nodes "Holaf*", détruire via proxy
 Props anti-WirePlumber à reproduire exactement: node.passive=true, stream.dont-remix=true, audio.channels=2, audio.position=[FL,FR], media.role=comms (output), target.object="<master>" (input: capture; output: playback), media.class=Audio/Source|Sink; node.name=Holaf_FX_<uid>.
 Fonctions pures à porter: _has_active_fx, _build_fx_graph (dual-mono _L/_R vs stereo single node via STEREO_PLUGINS), _build_fx_props, cascade hot-reload→reload strip→full restart, _create_link/_destroy_link/_auto_link_ports (routage exclusif, retries 5×0.1s, mono L→L+L, mono-source→stéréo), _link_physical_source_to_strip.
-5 incertitudes API pipewire-rs à lever au J1 (spike): (1) chargement module filter-chain dans le serveur exposé par pipewire-rs? sinon shim FFI; (2) Node::set_param avec Pod depuis texte SPA-JSON; (3) création Link via factory link-factory exposée?; (4) pw_metadata wrapper?; (5) compat version crate 0.8.x vs libpipewire système (~1.2).
+5 incertitudes API pipewire-rs à lever au J1 (spike): (1) chargement module filter-chain dans le serveur exposé par pipewire-rs? sinon shim FFI; (2) Node::set_param avec Pod depuis texte SPA-JSON; (3) création Link via factory link-factory exposée?; (4) pw_metadata wrapper?; (5) compat version crate vs libpipewire système (~1.2) → ✅ résolue : ce n'était pas l'ABI mais bindgen 0.69/libclang récent (pipewire-rs #112), corrigé par pipewire 0.10 (bindgen 0.72) — voir docs/rust-rewrite-status.md §5.5.
 
 ## 4. Contrat IPC
 Socket Unix + NDJSON (un JSON par ligne). Requêtes {"id":1,"method":"…","params":{…}}; réponses {"id":1,"ok":true,"result":{…}} / {"ok":false,"error":{"code":"…","message":"…"}}; événements {"event":"…","params":{…}}.

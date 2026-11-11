@@ -187,8 +187,26 @@ python -m unittest discover -s tests -v
    pipewire-rs ou par l'API core `create_object` ?
 4. Existe-t-il un **wrapper `pw_metadata`** pour piloter
    `default.audio.sink` (ou faut-il passer par les globals) ?
-5. **Compatibilité versions** : crate `pipewire = "0.8"` face à la lib
-   `libpipewire` système (~1.2) — ABI / symboles.
+5. **Compatibilité versions** — ✅ **RÉSOLU (diagnostic + correctif)**.
+   L'incertitude supposait un écart d'ABI entre le crate `pipewire = "0.8"`
+   et `libpipewire` système (~1.2).  **Ce n'était pas ça.**  Le vrai
+   problème était un bug de *génération de bindings* : `libspa-sys 0.8.0`
+   s'appuie sur **bindgen 0.69.5**, qui échoue à parser certaines structs
+   avec un **libclang récent** (Arch/CachyOS) et émet un champ factice
+   `_address: u8` à la place des vrais champs — d'où l'erreur de compilation
+   *« no field `data` on type `spa_pod_builder` »* (les headers C sont
+   identiques entre PipeWire 0.3.65, 1.4.0 et master).  Bug amont :
+   **pipewire-rs issue #112** (ouverte).
+   Correctif appliqué : passage à `pipewire = "0.10"` → `libspa-sys 0.10.1`,
+   qui embarque **bindgen 0.72.1** + system-deps 7 et parse correctement.
+   MSRV 0.10 = 1.80 (notre pin `rust-version = "1.98"` reste OK), ABI
+   `libpipewire-0.3`/`libspa-0.2` inchangée.  L'API 0.10 a en revanche
+   introduit les wrappers *owning* (`MainLoopRc`/`ContextRc`/`CoreRc`,
+   `PropertiesBox`) : `Node`/`Link` **possèdent** désormais leur proxy, donc
+   les objets créés à distance doivent être conservés puis détruits via
+   `core.destroy_object()` (cf. `holaf-pw/src/engine.rs`, `PwSession`).
+   Vérifiable en un coup d'œil dans la CI (steps « Diagnose Rust build
+   toolchain » et « Verify generated SPA bindings » de `build.yml`).
 
 ---
 

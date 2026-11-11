@@ -279,6 +279,47 @@ jobs:
       #    dist/ next to the Python bundle; the "Fold" step below then injects
       #    holafd/holafctl into the already-built Python tarball.
       # ------------------------------------------------------------------
+      - name: Diagnose Rust build toolchain (PipeWire / libclang / bindgen)
+        # Cheap, best-effort one-stop diagnostic for the *whole* FFI chain, run
+        # BEFORE the cargo build so its output sits right next to any failure.
+        #
+        # Motivation: an Arch-only compile error of the form
+        #   no field `data` on type `spa_pod_builder`
+        # came from libspa-sys 0.8.0 (bindgen 0.69.5), whose libclang
+        # invocation silently degraded some structs to a fake `_address: u8`
+        # field with recent libclang versions (upstream pipewire-rs issue
+        # #112). Nothing in the old log said which bindgen/libclang pair was
+        # in play, so the failure looked like a PipeWire ABI break. One glance
+        # at this group answers that question.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          export PKG_CONFIG_PATH="/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          echo "::group::PipeWire / SPA headers"
+          for pc in libpipewire-0.3 libspa-0.2; do
+            if pkg-config --exists "$pc"; then
+              echo "  $pc = $(pkg-config --modversion "$pc")"
+            else
+              echo "  $pc = MISSING (pkg-config cannot find it)"
+            fi
+          done
+          echo "::endgroup::"
+
+          echo "::group::Compilers / FFI tooling"
+          echo "  cargo    = $(cargo --version 2>/dev/null || echo missing)"
+          echo "  rustc    = $(rustc --version 2>/dev/null || echo missing)"
+          echo "  clang    = $(clang --version 2>/dev/null | head -1 || echo missing)"
+          echo "  libclang = $(ldconfig -p 2>/dev/null | grep -m1 libclang || echo 'not in ldconfig')"
+          echo "  LIBCLANG_PATH=${LIBCLANG_PATH:-<unset>}"
+          echo "::endgroup::"
+
+          echo "::group::bindgen version resolved for this lockfile"
+          # `-i` inverts the tree: who depends on bindgen, and which version won.
+          (cd rust && cargo tree -i bindgen --locked 2>/dev/null | head -15) \
+            || echo "  (bindgen not in the dependency graph yet — first build?)"
+          echo "::endgroup::"
+
       - name: Restore cargo cache
         uses: actions/cache@v4
         with:
@@ -342,6 +383,50 @@ jobs:
             # being a pure parse-and-exit (e.g. it starts a backend).
             timeout 10 "$bin" --help >/dev/null 2>&1 || true
           done
+
+      - name: Verify generated SPA bindings (bindgen sanity)
+        # Regression guard for upstream pipewire-rs issue #112: with an
+        # unlucky bindgen/libclang pair, libspa-sys emits a fake
+        # `_address: u8` field instead of the real struct fields and the
+        # compile later dies on a confusing
+        #   no field `data` on type `spa_pod_builder`
+        # which reads like a PipeWire ABI break but is purely a binding
+        # generation problem. Best effort: never fails the job, but says
+        # loudly what the generated bindings look like.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+
+          echo "::group::bindgen version actually used"
+          (cd rust && cargo tree -i bindgen --locked 2>/dev/null | head -15) \
+            || echo "  (bindgen not in the dependency graph — Rust build skipped?)"
+          echo "::endgroup::"
+
+          echo "::group::generated spa_pod_builder"
+          found=0
+          for f in rust/target/release/build/libspa-sys-*/out/bindings.rs; do
+            found=1
+            # bindgen may pretty-print the file or emit one long line (no
+            # rustfmt in a bare container): flatten both to a single line so
+            # a plain grep can extract the struct body.
+            flat="$(tr '\n' ' ' < "$f" | sed 's/  */ /g')"
+            body="$(printf '%s' "$flat" \
+              | grep -o 'pub struct spa_pod_builder {[^}]*}' | head -1)"
+            echo "--- $f"
+            if [[ -z "$body" ]]; then
+              echo "  WARN spa_pod_builder not found in this bindings file"
+            elif [[ "$body" == *"pub data"* && "$body" == *"pub size"* ]]; then
+              echo "  OK   $body"
+            else
+              echo "  DEGRADED $body"
+              echo "::warning::libspa-sys bindings look degraded (no data/size field): bump the -sys crates or libclang (pipewire-rs issue #112)"
+            fi
+          done
+          if ((found == 0)); then
+            echo "::notice::no libspa-sys bindings out dir under rust/target/release/build — Rust build skipped or failed"
+          fi
+          echo "::endgroup::"
 
       - name: Fold Rust binaries into the Python bundle
         # build.sh's make_tarball() already copies dist/holafd + dist/holafctl
@@ -521,20 +606,41 @@ jobs:
       # ------------------------------------------------------------------
       - name: Generate checksums
         # Tolerant loop: the Rust binaries (and their tarball) only exist if
-        # the Rust build ran, so a missing file must not fail this step.
+        # the Rust build ran, so a missing file must not fail this step
+        # (`sha256sum: holafd: No such file or directory` + exit 1 used to
+        # abort the whole job — and with it both artifact uploads — whenever
+        # the Rust step was skipped or broken).
         # `!cancelled()` (instead of the implicit success()): we want the
         # checksums even if a later Rust step failed, as long as a tarball
         # was produced.
         if: ${{ !cancelled() && hashFiles('dist/*.tar.gz') != '' }}
         run: |
-          cd dist
+          set -uo pipefail
+          if ! cd dist; then
+            echo "::warning::dist/ does not exist — no checksums to generate"
+            exit 0
+          fi
+          # nullglob: the *.tar.gz glob simply disappears when nothing
+          # matched. The literal Rust binary names stay in the array on
+          # purpose, so the -f test below can report them as missing instead
+          # of letting sha256sum abort the step.
           shopt -s nullglob
           files=(*.tar.gz holafd holafctl)
-          if ((${#files[@]})); then
-            sha256sum "${files[@]}" > SHA256SUMS
+          present=()
+          for f in "${files[@]}"; do
+            if [[ -f "$f" ]]; then
+              present+=("$f")
+            else
+              echo "::notice::$f is absent (Rust build skipped or failed) — not checksummed"
+            fi
+          done
+          if ((${#present[@]})); then
+            sha256sum "${present[@]}" > SHA256SUMS
           else
+            echo "::warning::nothing to checksum in dist/ — writing an empty SHA256SUMS"
             : > SHA256SUMS
           fi
+          echo "SHA256SUMS (${#present[@]} file(s)):"
           cat SHA256SUMS
 
       # ------------------------------------------------------------------
