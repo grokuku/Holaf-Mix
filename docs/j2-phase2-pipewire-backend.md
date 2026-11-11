@@ -41,7 +41,9 @@ Nouveaux fichiers :
 
 PipeWire (`Context`/`Core`/`MainLoop`) est `!Send` (Rc interne) alors que le
 trait exige `Send` (le daemon partage `Mutex<Box<dyn Backend>>` entre les
-threads de connexion IPC).  `PipeWireBackend` est donc une **poignée Send**
+threads de connexion IPC — *depuis, `holafd` dispatche via un thread
+propriétaire unique et un `mpsc`, voir `rust-rewrite-status.md` §6.1*).
+`PipeWireBackend` est donc une **poignée Send**
 qui marshalle chaque opération vers un **thread worker dédié** propriétaire
 des objets PipeWire (mpsc + réponse synchrone, timeout 120 s).  Le mainloop
 n'est itéré que quand une opération a besoin d'un round-trip / d'un poll

@@ -126,7 +126,7 @@ pipewire-rs).
 
 * **J0** ✅ `holaf-core` : modèle, FX, migrations, SPA-JSON.  69 tests.
 * **J1 / J2** ✅ spike + `holaf-pw` réel (reconcilieur, `PipeWireBackend`) + `holafd --backend pipewire` — fait sur le conteneur headless (`docs/j2-phase2-pipewire-backend.md`).
-* **J3** ✅ `holaf-ipc` + `holafd` + `holafctl`.  46 tests (96 au total workspace).
+* **J3** ✅ `holaf-ipc` + `holafd` + `holafctl`.  57 tests (146 au total workspace).
 * **J4** ✅ `IpcAudioEngine` Python + `rust_launcher` + bascule `HOLAF_USE_RUST=1`.  21 tests Python (28 après J5 partiel).
 * **J5** ◑ partie sans PipeWire faite : robustesse client (retry borné, timeouts, erreurs `code`/`request_id`), launcher anti-double-spawn + relance si mort, `rust/README.md`, `scripts/build_rust.sh`, doc de bascule.
 * **Machine utilisateur** 🔴 validation multi-plugins sur devices audio réels (strips physiques), PipeWire ~1.2, hotplug, metering natif.
@@ -135,7 +135,7 @@ pipewire-rs).
 
 ```bash
 cd rust
-cargo test                 # workspace complet : 137 tests verts (J0+J1/J2 lib+J3)
+cargo test                 # workspace complet : 146 tests verts (J0+J1/J2 lib+J3)
                            # le test live (backend_live) se saute si aucun daemon headless
 cargo test -p holaf-core   # J0 + graph
 cargo test -p holafd       # J3 (serveur IPC + FakeBackend + tests d'intégration)

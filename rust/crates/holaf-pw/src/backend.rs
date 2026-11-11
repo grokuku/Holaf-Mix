@@ -4,22 +4,41 @@
 //! # Architecture
 //!
 //! PipeWire's `Context`/`Core`/`MainLoop` are `!Send` (they use `Rc`
-//! internally), while the [`Backend`] trait requires `Send` (the daemon holds
-//! `Mutex<Box<dyn Backend>>` shared across connection threads).  The backend
-//! therefore **marshals** every operation to a dedicated worker thread that
-//! owns the PipeWire objects:
+//! internally), while the [`Backend`] trait requires `Send` (the daemon moves
+//! `Box<dyn Backend>` to the thread that owns it).  The backend therefore
+//! **marshals** every operation to a dedicated worker thread that owns the
+//! PipeWire objects:
 //!
 //! ```text
-//! daemon IPC ──&mut PipeWireBackend (Send handle)
-//!                     │ mpsc (op + reply)
-//!                     ▼
-//!              worker thread ── Engine (Context/Core/MainLoop + graph)
+//! daemon IPC ──holafd backend owner thread──► &mut PipeWireBackend (Send handle)
+//!                                                     │ mpsc (op + reply)
+//!                                                     ▼
+//!                                              worker thread ── Engine (Context/Core/MainLoop + graph)
 //! ```
 //!
 //! Each trait method sends one [`EngineOp`] and blocks on the reply channel
 //! (synchronous RPC, bounded by [`REQUEST_TIMEOUT`]).  This mirrors the
 //! Python `RLock` semantics and the rewrite spec §4 serialised-order model;
 //! the mainloop is only iterated while an operation needs a round-trip.
+//!
+//! # TODO: the worker is now redundant (analysis done, refactor not started)
+//!
+//! Since `holafd` dispatches *all* orders through a single backend owner thread
+//! (see `holafd::server`), this second serialisation stage only adds one thread
+//! hop and one timer per order.  Removing it needs three coordinated changes,
+//! hence a dedicated pass:
+//!
+//! 1. `Server::bind_lazy(path, factory)` building the backend **on** the owner
+//!    thread;
+//! 2. drop the `Send` bound from `holaf_core::backend::Backend`;
+//! 3. turn this type into a thin synchronous facade over `Engine` (no worker,
+//!    no `REQUEST_TIMEOUT`; `Drop` → `engine.stop()`), the connection check
+//!    moving into the factory (a failure there must fail the daemon startup
+//!    cleanly).
+//!
+//! Correctness is unaffected today: exactly one order is in flight at any time
+//! either way, and the daemon-side timeout (130 s) intentionally sits above
+//! [`REQUEST_TIMEOUT`] so this backend's precise error wins.
 //!
 //! # Pointing at a daemon
 //!

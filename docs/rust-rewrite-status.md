@@ -20,15 +20,15 @@ seuls points restants dépendent d'une **machine utilisateur avec audio réel**
 |---|---|---|---|
 | **J0** | Workspace cargo + `holaf-core` (modèle, FX, migrations, SPA-JSON, config IO) — pur, 0 dépendance PipeWire | ✅ **fait** | `cargo test -p holaf-core` : **75 tests** verts |
 | **J1** | Spike pipewire-rs + `holaf-pw` (connexion, filter-chain, set-param, null-sink, liens, metadata) | ✅ **fait (conteneur headless)** | `cargo run -p holaf-pw --bin holaf-spike` (docs j1-spike-recon/phase2) |
-| **J2** | `holaf-pw` réel derrière trait `Backend` (déplacé dans holaf-core), reconcilieur de graphe, routing, volume/mute, metadata, cleanup, `holafd --backend pipewire` | ✅ **fait (conteneur headless)** | `cargo test --workspace` 137 verts + `cargo test -p holaf-pw --test backend_live` (voir docs/j2-phase2-pipewire-backend.md) |
-| **J3** | `holaf-ipc` + `holafd` (serveur socket NDJSON) + `holafctl` | ✅ **fait** | `cargo test -p holaf-ipc -p holafd -p holafctl` : **48 tests** verts |
+| **J2** | `holaf-pw` réel derrière trait `Backend` (déplacé dans holaf-core), reconcilieur de graphe, routing, volume/mute, metadata, cleanup, `holafd --backend pipewire` | ✅ **fait (conteneur headless)** | `cargo test --workspace` 146 verts + `cargo test -p holaf-pw --test backend_live` (voir docs/j2-phase2-pipewire-backend.md) |
+| **J3** | `holaf-ipc` + `holafd` (serveur socket NDJSON) + `holafctl` | ✅ **fait** | `cargo test -p holaf-ipc -p holafd -p holafctl` : **57 tests** verts |
 | **J4** | `IpcAudioEngine` Python (même surface publique qu'`AudioEngine`), `rust_launcher`, bascule `HOLAF_USE_RUST=1` | ✅ **fait** | `python -m unittest discover -s tests -v` : **21 tests** verts |
 | **J5** | **Partie sans PipeWire** : robustesse client (retry, timeouts, erreurs structurées), launcher anti-double-spawn/relance, packaging & doc | ◑ **partiel** | 28 tests Python verts + doc (voir §2) |
 | **J5 (suite)** | hotplug devices, metering natif optionnel, intégration binaire Rust dans `build.sh`/`.desktop` | 🔴 reste à faire (dépend en partie de J1/J2) | — |
 
-Total workspace Rust : **137 tests** (`cargo test`), tous verts avec un daemon
+Total workspace Rust : **146 tests** (`cargo test`), tous verts avec un daemon
 PipeWire headless (sans lui, le seul test live `backend_live` est skippé et il
-en reste 136).
+en reste 145).
 Tests Python (client IPC + launcher) : **28 tests** verts.
 
 ---
@@ -58,7 +58,9 @@ Tests Python (client IPC + launcher) : **28 tests** verts.
   * binaire introuvable → `False` + message clair (jamais d'exception
     silencieuse) ;
   * `stop_daemon()` : `terminate()` → `wait(3 s)` → `kill()` → `wait()`,
-    sérialisé par le même verrou.
+    sérialisé par le même verrou.  Depuis l'ajout du handler `SIGTERM` côté
+    daemon (§6.4), `terminate()` déclenche un arrêt **propre** (teardown du
+    graphe, socket supprimé, exit 0) ; `kill()` ne sert plus que de garde-fou.
 * `rust/README.md`, `scripts/build_rust.sh`, `docs/rust-rewrite-status.md`,
   paragraphe README racine.
 
@@ -93,9 +95,9 @@ Décision de review, implémentée dans `main.py` + `rust_launcher.py` :
 
 ```bash
 cd rust
-cargo test                # workspace : 137 tests (J0 75 + J3 48 + J1/J2 14)
+cargo test                # workspace : 146 tests (J0 75 + J3 57 + J1/J2 14)
 cargo test -p holaf-core  # J0 (75)
-cargo test -p holafd      # J3 serveur + FakeBackend + tests d'intégration IPC (36)
+cargo test -p holafd      # J3 serveur + FakeBackend + IPC + arrêt propre (45)
 cargo test -p holafctl    # J3 CLI (4)
 ```
 
@@ -192,18 +194,43 @@ python -m unittest discover -s tests -v
 
 ## 6. Écarts documentés (revue d'intégration)
 
-### 6.1 Écart spec §4 connu : sérialisation sous Mutex (pas de thread backend)
+### 6.1 Modèle de concurrence — ✅ RÉSOLU (spec §4 respectée)
 
-L'implémentation actuelle de `holafd/src/server.rs` ne correspond **pas** encore
-au modèle de concurrence de la spec §4 (« thread pw (mainloop) + thread IPC ;
-ordres → mpsc channel consommé par le thread pw »).  Concrètement, chaque
-connexion tourne sur son propre thread lecteur/écrivain et les requêtes sont
-exécutées **synchroniquement sous un `Mutex`** sur le `Backend` partagé (un
-`mpsc` n'est utilisé que pour pousser réponses/événements vers le writer de
-chaque connexion, pas comme file d'ordres vers un thread backend dédié).
-Fonctionnel avec `FakeBackend` (tous les tests J3 verts), mais à réconcilier au
-**J2** quand le vrai backend PipeWire exigera des appels marshallés sur le
-mainloop de la lib pipewire.
+L'implémentation antérieure de `holafd/src/server.rs` sérialisait les ordres
+sous un `Mutex<Box<dyn Backend>>` tenu par les threads de connexion (écart
+avec la spec §4).  C'est **corrigé** :
+
+```text
+ client A ─┐  thread lecteur par connexion
+ client B ─┼─► mpsc::Sender<Command> ───► thread PROPRIÉTAIRE du backend
+ client C ─┘         ▲                    (possède Box<dyn Backend>)
+                     │ Command::Request { request, reply }
+  thread lecteur ◄──┴──── Response ◄──── dispatch() sous catch_unwind
+        └─► thread écrivain par connexion ─► socket
+
+ Server::notify(event) ─► registre des écrivains ─► socket   (voie séparée)
+```
+
+* **Un seul thread exécute** les ordres → sérialisation naturelle, équivalent
+  exact du `RLock` Python, sans verrou partagé ; l'ordre d'arrivée est l'ordre
+  d'exécution (`engine.stop` compris, il passe après les ordres déjà reçus).
+* **Événements hors du canal d'ordres** : `notify()` ne prend que le registre
+  des écrivains (un `Mutex<HashMap<id, Sender>>`), verrou que le thread
+  propriétaire ne tient jamais pendant une opération → un backend peut
+  broadcaster depuis l'intérieur d'un ordre sans deadlock.
+* **Panique backend** : chaque ordre tourne sous `catch_unwind`; le client
+  reçoit `internal_error`, le thread (et le daemon) survivent.
+* **Backend mort** : canal fermé / réponse déconnectée → `backend_unavailable`
+  immédiat ; backend vivant mais lent → `backend_timeout` côté client borné à
+  130 s (au-dessus des 120 s du backend PipeWire, pour que l'erreur précise du
+  backend gagne).
+* **Arrêt** : `Drop for Server` envoie `Command::Shutdown` au thread
+  propriétaire (qui droppe le backend → teardown PipeWire) puis le rejoint
+  (attente bornée à 5 s, sinon détachement) et supprime le fichier socket.
+
+Conséquence : `holaf_pw::PipeWireBackend` a désormais **deux** niveaux de
+sérialisation empilés (thread propriétaire du serveur + son propre thread
+worker `Engine`).  Ce n'est plus nécessaire mais reste correct — voir 6.3.
 
 ### 6.2 Format des flottants SPA-JSON — divergence actée
 
@@ -219,6 +246,47 @@ SPA-JSON à J2).  Tout croisement avec les sorties Python héritées est
 **normalisé au moment de la comparaison** (troncature d'un `.0` final ou
 comparaison en valeurs flottantes), jamais en modifiant le format de sortie
 Rust.  Aucun changement de comportement de formatage aujourd'hui.
+
+### 6.3 Doublon de sérialisation côté `PipeWireBackend` — ⏳ TODO (analyse faite)
+
+Avec le thread propriétaire du serveur (6.1), le **thread worker interne** de
+`holaf_pw::PipeWireBackend` (`backend.rs` : worker `Engine` + `mpsc` + timeout
+120 s) sérialise ce qui est déjà sérialisé.  C'est correct mais empile deux
+sauts de thread et deux délais par ordre.
+
+Suppression possible (non faite — trop large pour un changement sûr à froid) :
+
+1. ajouter au serveur un constructeur **paresseux**
+   `Server::bind_lazy(path, factory: impl FnOnce() -> Result<Box<dyn Backend>, E> + Send)`
+   qui instancie le backend **sur le thread propriétaire** ;
+2. relâcher la borne `Backend: Send` de `holaf_core::backend` (inutile une fois
+   le backend créé dans son thread) ;
+3. `PipeWireBackend` devient une façade synchrone directe sur `Engine` (plus
+   de worker, plus de `REQUEST_TIMEOUT`, `Drop` → `engine.stop()`), et la
+   vérification de connexion (aujourd'hui l'accusé `ready` avec timeout 20 s)
+   remonte dans la factory (échec = erreur claire de démarrage du daemon).
+
+Coût réel : retirer `Send` ripple dans les docs/tests, réécrire ~300 lignes de
+`holaf-pw/src/backend.rs`, revalider `backend_live` (PipeWire requis à chaque
+itération).  À faire dans une passe dédiée, avec le daemon headless sous la
+main.
+
+### 6.4 Arrêt propre : `SIGTERM` / `SIGINT`
+
+`holafd` installe (crate `signal-hook`, pas de `unsafe` libc) un thread
+« signaux » qui arme l'`AtomicBool` de shutdown déjà sondé par la boucle
+`accept` et logge `received SIGTERM, shutting down`.  Séquence d'arrêt :
+arrêt de l'accept → drop du `Server` → `Command::Shutdown` au thread
+propriétaire → teardown backend (graphe PipeWire détruit, 0 débris) →
+`remove_file` du socket → **exit 0**.  Un **second** signal force la sortie
+(`exit 130`) pour qu'un ordre bloqué ne puisse jamais retenir le processus.
+
+Tests : `crates/holafd/tests/shutdown.rs` lance le vrai binaire
+(`--backend fake`) et vérifie, pour `SIGTERM` et `SIGINT`, le code de sortie 0,
+la ligne de log et la disparition du fichier socket (toutes les attentes sont
+bornées : un daemon bloqué fait échouer le test au lieu de figer la suite).
+Vérifié aussi en E2E sur `--backend pipewire` (arrêt → 0 nœud / 0 lien
+`Holaf_*` restant).
 
 ---
 

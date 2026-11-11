@@ -10,10 +10,24 @@
 //!
 //! Default socket: `$HOLAF_SOCKET`, else `/tmp/holaf-$USER.sock`.  Logging via
 //! `env_logger` (`RUST_LOG`).
+//!
+//! # Shutdown
+//!
+//! `SIGTERM`/`SIGINT` arm the `AtomicBool` polled by the server's accept
+//! loop: the daemon then stops accepting, drops the backend (running its
+//! teardown — the PipeWire graph is client-owned and goes away with it),
+//! removes the socket file and exits with status 0.  A *second* signal is
+//! treated as "force quit" (exit 130) so a wedged order can never trap the
+//! process.
 
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use holaf_pw::PipeWireBackend;
 use holafd::config_check::{load_plan, print_plan};
@@ -149,6 +163,11 @@ fn run_check_config(path: &Path) -> i32 {
 }
 
 fn run_daemon(socket: PathBuf, backend: BackendKind) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // Install the handlers *before* binding/connecting so a Ctrl-C during a
+    // slow PipeWire connect is still honoured.
+    install_signal_handlers(Arc::clone(&shutdown))?;
+
     let server = match backend {
         BackendKind::Fake => Server::bind(&socket, FakeBackend::new())?,
         BackendKind::Unimplemented => Server::bind_boxed(&socket, Box::new(UnimplementedBackend))?,
@@ -164,9 +183,41 @@ fn run_daemon(socket: PathBuf, backend: BackendKind) -> Result<(), Box<dyn std::
         "backend '{backend:?}' — 'fake' simulates in memory; 'pipewire' drives a live daemon"
     );
     log::info!("listening on {}", server.socket_path().display());
-    let shutdown = Arc::new(AtomicBool::new(false));
-    server.run(shutdown)?;
+    server.run(Arc::clone(&shutdown))?;
+    // Dropping the server stops the backend owner thread (which runs the
+    // backend teardown) and removes the socket file.
+    log::info!("daemon stopped");
     Ok(())
+}
+
+/// Arm the graceful-shutdown flag on `SIGTERM`/`SIGINT`.
+///
+/// Runs a small dedicated thread iterating the signals (rather than
+/// `signal_hook::flag::register`) because we also want an explicit log line
+/// naming the signal, and a "force quit" on a second signal.
+fn install_signal_handlers(shutdown: Arc<AtomicBool>) -> io::Result<()> {
+    let mut signals = Signals::new([SIGTERM, SIGINT])?;
+    thread::Builder::new()
+        .name("holafd-signals".into())
+        .spawn(move || {
+            for signal in signals.forever() {
+                let name = match signal {
+                    SIGTERM => "SIGTERM",
+                    SIGINT => "SIGINT",
+                    other => {
+                        // Cannot happen: only the two above are registered.
+                        log::warn!("received unexpected signal {other}, shutting down");
+                        "signal"
+                    }
+                };
+                if shutdown.swap(true, Ordering::SeqCst) {
+                    log::warn!("received a second {name} — exiting immediately");
+                    std::process::exit(130);
+                }
+                log::info!("received {name}, shutting down");
+            }
+        })
+        .map(|_| ())
 }
 
 fn main() {

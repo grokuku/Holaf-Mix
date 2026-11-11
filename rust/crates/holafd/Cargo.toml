@@ -15,3 +15,6 @@ indexmap = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+# SIGTERM / SIGINT handling (main.rs): the safe, standard wrapper around
+# `sigaction` — no hand-written `unsafe` libc in the daemon.
+signal-hook = "0.4"

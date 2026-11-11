@@ -13,8 +13,11 @@
 //! `holafd` re-exports these types from `crate::backend` so its IPC layer and
 //! [`FakeBackend`](crate::fake::FakeBackend) keep compiling unchanged.
 //!
-//! Every method is synchronous and **serialised by the caller** (the daemon
-//! holds one `Mutex<Box<dyn Backend>>`, mirroring the Python `RLock`).
+//! Every method is synchronous and **serialised by the caller**: the daemon
+//! owns one `Box<dyn Backend>` on a dedicated thread and funnels every IPC
+//! order to it through one `mpsc` channel (mirrors the Python `RLock`).  Two
+//! orders are therefore never in flight at the same time, and an implementation
+//! may keep non-`Sync` internals as long as the whole backend is `Send`.
 
 use indexmap::IndexMap;
 use serde_json::Value;

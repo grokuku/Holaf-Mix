@@ -3,20 +3,25 @@
 //! backed by a [`FakeBackend`].
 //!
 //! These tests talk the exact same wire protocol `holafctl` uses, so they
-//! cover the NDJSON framing, per-connection reader/writer threads, dispatch,
-//! error mapping and event broadcast — no PipeWire involved.
+//! cover the NDJSON framing, per-connection reader/writer threads, the single
+//! backend owner thread (orders serialised through one `mpsc` channel),
+//! dispatch, error mapping and event broadcast — no PipeWire involved.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use holaf_ipc::{decode_line, encode, Event, Request, Response, METHOD_FX_SET_ACTIVE,
-    METHOD_STATUS, METHOD_STRIP_SET_VOLUME};
+use holaf_core::model::{EffectKey, Strip};
+use holaf_ipc::{decode_line, encode, Event, Request, Response, METHOD_APPLY_SNAPSHOT,
+    METHOD_FX_SET_ACTIVE,
+    METHOD_STATUS, METHOD_STOP, METHOD_STRIP_SET_VOLUME};
+use indexmap::IndexMap;
 use serde_json::{json, Value};
 
-use holafd::{FakeBackend, Server};
+use holafd::{Backend, BackendError, FakeBackend, Server};
 
 /// A unique socket path per test (process + nanos) so parallel tests never
 /// collide.
@@ -99,6 +104,15 @@ impl TestClient {
                 return event.params;
             }
         }
+    }
+
+    /// Bound the wait on a response so a wedged daemon fails the test instead
+    /// of hanging the whole suite.
+    fn set_read_timeout(&mut self, timeout: Duration) {
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .expect("set read timeout");
     }
 }
 
@@ -291,4 +305,240 @@ fn unimplemented_backend_reports_not_implemented_over_the_wire() {
         handle.join().unwrap();
     });
     let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: one backend owner thread, orders serialised through one mpsc
+// ---------------------------------------------------------------------------
+
+/// A backend whose `apply_snapshot` is slow, to prove that a long order only
+/// delays (in arrival order) the other orders — it never wedges a socket
+/// reader, the accept loop, or the daemon.
+struct SlowBackend {
+    inner: FakeBackend,
+    delay: Duration,
+}
+
+impl SlowBackend {
+    fn new(delay: Duration) -> Self {
+        SlowBackend {
+            inner: FakeBackend::new(),
+            delay,
+        }
+    }
+}
+
+/// Delegate a whole `Backend` method to the wrapped [`FakeBackend`]; only
+/// `apply_snapshot` is overridden below.
+macro_rules! delegate {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty),* $(,)?) => {
+        $(
+            fn $name(&mut self, $($arg: $ty),*) -> $ret {
+                self.inner.$name($($arg),*)
+            }
+        )*
+    };
+}
+
+impl Backend for SlowBackend {
+    fn apply_snapshot(&mut self, strips: &[Strip]) -> Result<Value, BackendError> {
+        std::thread::sleep(self.delay);
+        self.inner.apply_snapshot(strips)
+    }
+
+    delegate! {
+        stop() -> Result<(), BackendError>,
+        status() -> Result<Value, BackendError>,
+        set_volume(uid: &str, value: f32) -> Result<Value, BackendError>,
+        set_mute(uid: &str, muted: bool) -> Result<Value, BackendError>,
+        set_mono(uid: &str, mono: bool) -> Result<Value, BackendError>,
+        fx_set_active(uid: &str, effect: EffectKey, active: bool) -> Result<Value, BackendError>,
+        fx_set_params(uid: &str, effect: EffectKey, params: &IndexMap<String, f32>) -> Result<Value, BackendError>,
+        routing_set(source_uid: &str, target_uid: &str, active: bool) -> Result<Value, BackendError>,
+        routing_list() -> Result<Value, BackendError>,
+        set_default_sink(uid: &str) -> Result<Value, BackendError>,
+        device_list() -> Result<Value, BackendError>,
+        app_list() -> Result<Value, BackendError>,
+        app_move(app_id: &str, sink_name: &str) -> Result<Value, BackendError>,
+    }
+}
+
+/// Several clients hammering the daemon at the same time must each get *their*
+/// responses, in per-connection order (no cross-wiring, no interleaving).
+#[test]
+fn concurrent_clients_get_their_own_responses() {
+    let path = unique_socket("concurrent");
+    run_server(&path, |_server| {
+        let mut seeder = TestClient::connect(&path);
+        seeder.set_read_timeout(Duration::from_secs(10));
+        let resp = seeder.send(
+            METHOD_APPLY_SNAPSHOT,
+            json!({ "strips": json!([
+                { "uid": "a", "label": "A", "kind": "output" },
+                { "uid": "b", "label": "B", "kind": "output" },
+                { "uid": "c", "label": "C", "kind": "output" }
+            ]) }),
+        );
+        assert!(resp.ok, "seeding failed: {resp:?}");
+
+        let socket = path.as_path();
+        std::thread::scope(|scope| {
+            for (uid, value) in [("a", 0.11f32), ("b", 0.22), ("c", 0.33)] {
+                scope.spawn(move || {
+                    let mut client = TestClient::connect(socket);
+                    client.set_read_timeout(Duration::from_secs(20));
+                    for round in 0..20 {
+                        let resp = client.send(
+                            METHOD_STRIP_SET_VOLUME,
+                            json!({ "uid": uid, "value": value }),
+                        );
+                        assert!(resp.ok, "{uid} round {round}: {resp:?}");
+                        let result = resp.result.unwrap();
+                        assert_eq!(result["uid"], uid, "response belongs to another request");
+                        assert_eq!(result["value"], value, "response belongs to another request");
+                    }
+                });
+            }
+        });
+
+        // Every write landed: nothing was lost or mixed up.
+        let mut client = TestClient::connect(&path);
+        let resp = client.send(METHOD_STATUS, json!({}));
+        assert!(resp.ok);
+        let strips = resp.result.unwrap()["strips"].as_array().unwrap().clone();
+        let volume_of = |uid: &str| {
+            strips
+                .iter()
+                .find(|s| s["uid"] == uid)
+                .unwrap_or_else(|| panic!("strip {uid} missing"))["volume"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!((volume_of("a") - 0.11).abs() < 1e-6);
+        assert!((volume_of("b") - 0.22).abs() < 1e-6);
+        assert!((volume_of("c") - 0.33).abs() < 1e-6);
+    });
+}
+
+/// A slow order delays the *other* orders (that serialisation is the point)
+/// but must not deadlock nor block the accept loop / socket reads.
+#[test]
+fn a_slow_order_delays_but_never_deadlocks_other_clients() {
+    const SLOW: Duration = Duration::from_millis(500);
+    const HEAD_START: Duration = Duration::from_millis(100);
+
+    let path = unique_socket("slow");
+    let server = Server::bind(&path, SlowBackend::new(SLOW)).expect("bind server");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let loop_handle = scope.spawn(|| server.run(Arc::clone(&shutdown)).unwrap());
+
+        let slow_socket = path.as_path();
+        let slow = scope.spawn(move || {
+            let mut client = TestClient::connect(slow_socket);
+            client.set_read_timeout(Duration::from_secs(20));
+            let started = Instant::now();
+            let resp = client.send(
+                METHOD_APPLY_SNAPSHOT,
+                json!({ "strips": json!([{ "uid": "s", "label": "S", "kind": "output" }]) }),
+            );
+            (resp.ok, started.elapsed())
+        });
+
+        // Ensure the slow order is already running on the owner thread.
+        std::thread::sleep(HEAD_START);
+
+        let fast_socket = path.as_path();
+        let fast = scope.spawn(move || {
+            let mut client = TestClient::connect(fast_socket);
+            client.set_read_timeout(Duration::from_secs(20));
+            let started = Instant::now();
+            let resp = client.send(METHOD_STATUS, json!({}));
+            (resp.ok, started.elapsed())
+        });
+
+        let (slow_ok, slow_elapsed) = slow.join().expect("slow client thread");
+        let (fast_ok, fast_elapsed) = fast.join().expect("fast client thread");
+
+        assert!(slow_ok, "the slow order failed");
+        assert!(fast_ok, "the concurrent order failed");
+        assert!(
+            slow_elapsed >= SLOW,
+            "the slow order returned in {slow_elapsed:?}, faster than its own sleep"
+        );
+        // The second order queued behind the first one (serialisation) but was
+        // served as soon as it was over: no deadlock, no lost wake-up.
+        assert!(
+            fast_elapsed >= SLOW - HEAD_START - Duration::from_millis(150),
+            "the concurrent order was served in {fast_elapsed:?}, i.e. out of order"
+        );
+        assert!(
+            fast_elapsed < Duration::from_secs(10),
+            "the concurrent order took {fast_elapsed:?} — the daemon is wedged"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        loop_handle.join().expect("accept loop must stop cleanly");
+    });
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `engine.stop` is an ordinary order: it runs *after* the orders already
+/// queued, so the observable state is always the expected one.
+#[test]
+fn stop_is_serialised_behind_the_previous_orders() {
+    let path = unique_socket("stop-order");
+    run_server(&path, |_server| {
+        let mut client = TestClient::connect(&path);
+        client.set_read_timeout(Duration::from_secs(10));
+
+        assert!(client
+            .send(
+                METHOD_APPLY_SNAPSHOT,
+                json!({ "strips": json!([{ "uid": "x", "label": "X", "kind": "output" }]) }),
+            )
+            .ok);
+        assert!(client.send(METHOD_STRIP_SET_VOLUME, json!({ "uid": "x", "value": 0.5 })).ok);
+        assert!(client.send(METHOD_STOP, json!({})).ok);
+
+        let status = client.send(METHOD_STATUS, json!({}));
+        assert!(status.ok);
+        let result = status.result.unwrap();
+        assert_eq!(result["running"], false, "stop must have been applied");
+        assert_eq!(result["strips"][0]["volume"], 0.5, "the volume order was lost");
+    });
+}
+
+/// Every method the daemon accepts must survive the order hand-off: a quick
+/// smoke test over the less used ones.
+#[test]
+fn misc_methods_round_trip_through_the_owner_thread() {
+    let path = unique_socket("misc");
+    run_server(&path, |_server| {
+        let mut client = TestClient::connect(&path);
+        client.set_read_timeout(Duration::from_secs(10));
+        assert!(client
+            .send(
+                METHOD_APPLY_SNAPSHOT,
+                json!({ "strips": json!([
+                    { "uid": "in-1", "label": "Micro", "kind": "input" },
+                    { "uid": "out-1", "label": "HP", "kind": "output" }
+                ]) }),
+            )
+            .ok);
+
+        for (method, params) in [
+            ("strip.set_mono", json!({ "uid": "in-1", "mono": true })),
+            ("fx.set_params", json!({ "uid": "in-1", "effect": "eq", "params": { "60Hz gain": 3.0 } })),
+            ("routing.set", json!({ "source_uid": "in-1", "target_uid": "out-1", "active": true })),
+            ("routing.list", json!({})),
+            ("system.set_default_sink", json!({ "uid": "out-1" })),
+            ("device.list", json!({})),
+            ("app.list", json!({})),
+            ("app.move", json!({ "app_id": "player", "sink_name": "Holaf" })),
+        ] {
+            let resp = client.send(method, params);
+            assert!(resp.ok, "{method} failed: {resp:?}");
+        }
+    });
 }
