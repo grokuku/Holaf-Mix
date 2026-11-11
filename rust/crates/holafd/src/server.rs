@@ -66,8 +66,9 @@ use holaf_core::model::{EffectKey, Strip};
 use holaf_ipc::{
     decode_line, encode, Event, Request, Response, METHOD_APPLY_SNAPSHOT, METHOD_APP_LIST,
     METHOD_APP_MOVE, METHOD_DEVICE_LIST, METHOD_FX_SET_ACTIVE, METHOD_FX_SET_PARAMS,
-    METHOD_ROUTING_LIST, METHOD_ROUTING_SET, METHOD_STATUS, METHOD_STOP, METHOD_STRIP_SET_MONO,
-    METHOD_STRIP_SET_MUTE, METHOD_STRIP_SET_VOLUME, METHOD_SYSTEM_SET_DEFAULT_SINK,
+    METHOD_METER_SOURCES, METHOD_ROUTING_LIST, METHOD_ROUTING_SET, METHOD_STATUS, METHOD_STOP,
+    METHOD_STRIP_SET_MONO, METHOD_STRIP_SET_MUTE, METHOD_STRIP_SET_VOLUME,
+    METHOD_SYSTEM_SET_DEFAULT_SINK,
 };
 
 use crate::backend::{Backend, BackendError};
@@ -565,6 +566,7 @@ fn dispatch(backend: &mut dyn Backend, request: Request) -> Response {
         }
         METHOD_DEVICE_LIST => respond(id, backend.device_list()),
         METHOD_APP_LIST => respond(id, backend.app_list()),
+        METHOD_METER_SOURCES => respond(id, backend.meter_sources()),
         METHOD_APP_MOVE => {
             let p = match parse_params::<AppMoveParams>(id, params) {
                 Ok(p) => p,
@@ -719,6 +721,36 @@ mod tests {
         assert_eq!(s["effects"]["compressor"]["active"], true);
     }
 
+    #[test]
+    fn dispatch_meter_sources_maps_every_strip() {
+        let mut b = FakeBackend::new();
+        let mut mic = Strip::with_uid("in-1", "Micro", StripType::Input);
+        mic.device_name = Some("alsa_input.usb-mic.analog-stereo".into());
+        let desktop = Strip::with_uid("in-2", "Desktop", StripType::Input);
+        let mut out = Strip::with_uid("out-1", "Casque", StripType::Output);
+        out.device_name = Some("alsa_output.usb-dac.analog-stereo".into());
+        b.apply_snapshot(&[mic, desktop, out]).unwrap();
+
+        let resp = dispatch_one(&mut b, METHOD_METER_SOURCES, json!({}));
+        assert!(resp.ok, "meter.sources failed: {resp:?}");
+        let result = resp.result.unwrap();
+        assert_eq!(result["running"], true);
+        let sources = &result["sources"];
+        // Physical input → its device source; virtual input → null-sink
+        // monitor; physical output → that sink's monitor.
+        assert_eq!(sources["in-1"], "alsa_input.usb-mic.analog-stereo");
+        assert_eq!(sources["in-2"], "Holaf_Strip_in-2.monitor");
+        assert_eq!(sources["out-1"], "alsa_output.usb-dac.analog-stereo.monitor");
+
+        // Toggling an effect does not move the metered source: a virtual
+        // strip is always metered on its null-sink monitor (never on the FX
+        // chain's passive Audio/Source, which is unroutable/unreadable).
+        b.fx_set_active("in-2", EffectKey::Eq, true).unwrap();
+        let resp = dispatch_one(&mut b, METHOD_METER_SOURCES, json!({}));
+        let sources = resp.result.unwrap()["sources"].clone();
+        assert_eq!(sources["in-2"], "Holaf_Strip_in-2.monitor");
+    }
+
     /// A backend panic must be turned into an `internal_error` response, not
     /// kill the owner thread (nor the daemon).
     #[test]
@@ -781,6 +813,9 @@ mod tests {
             }
             fn app_move(&mut self, _app_id: &str, _sink_name: &str) -> Result<Value, BackendError> {
                 unreachable!()
+            }
+            fn meter_sources(&mut self) -> Result<Value, BackendError> {
+                Ok(json!({ "running": true, "sources": {} }))
             }
         }
 

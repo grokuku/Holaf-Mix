@@ -7,6 +7,7 @@
 //! holafctl [--socket <path>] mute <uid> <true|false>
 //! holafctl [--socket <path>] fx-active <uid> <effect> <true|false>
 //! holafctl [--socket <path>] fx-params <uid> <effect> <key=value>...
+//! holafctl [--socket <path>] meter-sources
 //! ```
 //!
 //! Each command opens a fresh connection, sends one request (id 1), prints the
@@ -20,7 +21,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use holaf_ipc::{encode, Event, Request, Response, METHOD_APPLY_SNAPSHOT, METHOD_FX_SET_ACTIVE,
-    METHOD_FX_SET_PARAMS, METHOD_STATUS, METHOD_STRIP_SET_MUTE, METHOD_STRIP_SET_VOLUME};
+    METHOD_FX_SET_PARAMS, METHOD_METER_SOURCES, METHOD_STATUS, METHOD_STRIP_SET_MUTE,
+    METHOD_STRIP_SET_VOLUME};
 use serde_json::{json, Value};
 
 const USAGE: &str = "\
@@ -40,6 +42,7 @@ COMMANDS:
     mute    <uid> <true|false>
     fx-active <uid> <effect> <true|false>
     fx-params <uid> <effect> <key=value>...
+    meter-sources          (uid → source the VU meters must record)
 ";
 
 /// Resolve the daemon socket the same way `holafd` does.
@@ -265,6 +268,19 @@ fn cmd_fx_active(socket: &Path, tail: &[String]) -> i32 {
     }
 }
 
+/// `meter.sources`: the `uid → PulseAudio/PipeWire source` map the Python VU
+/// meters record from (`IpcAudioEngine.get_meter_levels`).
+fn cmd_meter_sources(socket: &Path) -> i32 {
+    let req = Request::with_params(1, METHOD_METER_SOURCES, json!({}));
+    match call(socket, &req) {
+        Ok(resp) => finish(resp),
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_fx_params(socket: &Path, tail: &[String]) -> i32 {
     if tail.len() < 3 {
         eprintln!("usage: holafctl fx-params <uid> <effect> <key=value>...");
@@ -330,6 +346,7 @@ fn run(args: &[String]) -> i32 {
         "mute" => cmd_mute(&socket, &tail[1..]),
         "fx-active" => cmd_fx_active(&socket, &tail[1..]),
         "fx-params" => cmd_fx_params(&socket, &tail[1..]),
+        "meter-sources" => cmd_meter_sources(&socket),
         "--help" | "-h" => {
             print!("{USAGE}");
             0

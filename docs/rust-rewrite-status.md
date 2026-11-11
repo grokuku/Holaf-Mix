@@ -24,12 +24,12 @@ seuls points restants dépendent d'une **machine utilisateur avec audio réel**
 | **J3** | `holaf-ipc` + `holafd` (serveur socket NDJSON) + `holafctl` | ✅ **fait** | `cargo test -p holaf-ipc -p holafd -p holafctl` : **57 tests** verts |
 | **J4** | `IpcAudioEngine` Python (même surface publique qu'`AudioEngine`), `rust_launcher`, bascule `HOLAF_USE_RUST=1` | ✅ **fait** | `python -m unittest discover -s tests -v` : **21 tests** verts |
 | **J5** | **Partie sans PipeWire** : robustesse client (retry, timeouts, erreurs structurées), launcher anti-double-spawn/relance, packaging & doc | ◑ **partiel** | 28 tests Python verts + doc (voir §2) |
+| **J5 (metering)** | VU-mètres avec le backend Rust : `meter.sources` (uid → nom de source), `IpcAudioEngine.get_meter_levels` sur `MeteringEngine` local, durcissement `metering.py` (staleness, backoff, re-probe PortAudio) | ✅ **fait** | `holafctl meter-sources`, E2E sine → niveaux 1.0/0.0 |
 | **J5 (suite)** | hotplug devices, metering natif optionnel, intégration binaire Rust dans `build.sh`/`.desktop` | 🔴 reste à faire (dépend en partie de J1/J2) | — |
 
-Total workspace Rust : **146 tests** (`cargo test`), tous verts avec un daemon
-PipeWire headless (sans lui, le seul test live `backend_live` est skippé et il
-en reste 145).
-Tests Python (client IPC + launcher) : **28 tests** verts.
+Total workspace Rust : **151 tests** (`cargo test`), tous verts avec un daemon
+PipeWire headless (sans lui, les 2 tests live `backend_live` sont skippés).
+Tests Python (client IPC + launcher + metering) : **41 tests** verts.
 
 ---
 
@@ -164,7 +164,8 @@ python -m unittest discover -s tests -v
    PipeWire ~1.2 / mono-client (`--reuse-core`), hotplug.
 2. **J5 — suite** :
    * hotplug devices (événements `device_list_changed`, rescan) ;
-   * metering natif optionnel (spec §6) — sinon garder le metering Python ;
+   * metering natif optionnel (spec §6) — le metering Python est désormais
+     alimenté par le daemon (`meter.sources`), un metering natif reste optionnel ;
    * intégrer `scripts/build_rust.sh` dans `build.sh` et embarquer `holafd`
      dans `packaging/holaf-mix.spec` / PKGBUILD / `.desktop` ;
    * migrer la discovery devices/apps de la UI (`pipewire_utils`) vers le

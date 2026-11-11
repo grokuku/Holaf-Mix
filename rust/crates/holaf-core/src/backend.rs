@@ -124,6 +124,16 @@ pub trait Backend: Send {
     /// List applications currently playing audio.
     fn app_list(&mut self) -> Result<Value, BackendError>;
 
+    /// Map `strip uid → PulseAudio/PipeWire source name` the Python VU-meter
+    /// engine must record from (spec §6: metering itself stays Python-local,
+    /// the daemon only names the sources).
+    ///
+    /// Payload: `{ "running": bool, "sources": { "<uid>": "<source>" } }`.
+    /// The name depends on the strip kind, whether it is physical and whether
+    /// its FX chain is live — see [`holaf_core::graph::meter_source_name`].
+    /// A strip with no resolvable source is omitted.
+    fn meter_sources(&mut self) -> Result<Value, BackendError>;
+
     /// Move an application to another sink.
     fn app_move(&mut self, app_id: &str, sink_name: &str) -> Result<Value, BackendError>;
 }
@@ -199,6 +209,10 @@ impl Backend for UnimplementedBackend {
 
     fn app_list(&mut self) -> Result<Value, BackendError> {
         Err(BackendError::not_implemented("app.list"))
+    }
+
+    fn meter_sources(&mut self) -> Result<Value, BackendError> {
+        Err(BackendError::not_implemented("meter.sources"))
     }
 
     fn app_move(&mut self, _app_id: &str, _sink_name: &str) -> Result<Value, BackendError> {

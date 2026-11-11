@@ -83,6 +83,11 @@ pub const METHOD_APP_LIST: &str = "app.list";
 /// `{"app_id":…,"sink_name":…}`.
 pub const METHOD_APP_MOVE: &str = "app.move";
 
+/// Map `strip uid → PulseAudio/PipeWire source name` to record for the VU
+/// meters (spec §6: metering itself stays Python-local).
+/// Result: `{"running":bool,"sources":{"<uid>":"<source>"}}`.
+pub const METHOD_METER_SOURCES: &str = "meter.sources";
+
 /// Every method name implemented in the current protocol.
 pub const ALL_METHODS: &[&str] = &[
     METHOD_APPLY_SNAPSHOT,
@@ -99,6 +104,7 @@ pub const ALL_METHODS: &[&str] = &[
     METHOD_DEVICE_LIST,
     METHOD_APP_LIST,
     METHOD_APP_MOVE,
+    METHOD_METER_SOURCES,
 ];
 
 // ---------------------------------------------------------------------------
@@ -346,7 +352,7 @@ mod tests {
         for m in ALL_METHODS {
             assert!(seen.insert(*m), "duplicate method {m}");
         }
-        assert_eq!(ALL_METHODS.len(), 14);
+        assert_eq!(ALL_METHODS.len(), 15);
 
         let mut seen = std::collections::HashSet::new();
         for e in ALL_EVENTS {

@@ -8,6 +8,7 @@
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 
+use holaf_core::graph::meter_source_name;
 use holaf_core::model::{EffectKey, Strip};
 
 use crate::backend::{Backend, BackendError};
@@ -283,6 +284,18 @@ impl Backend for FakeBackend {
             .map(|(id, sink)| json!({"app_id": id, "sink_name": sink}))
             .collect();
         Ok(json!({ "apps": apps }))
+    }
+
+    /// Meter sources follow the same naming rules as the real engine
+    /// ([`holaf_core::graph::meter_source_name`]) — the mapping is pure, so the
+    /// fake reproduces it exactly without any audio graph.
+    fn meter_sources(&mut self) -> Result<Value, BackendError> {
+        self.log("meter_sources".to_string());
+        let mut sources = serde_json::Map::new();
+        for strip in self.strips.values() {
+            sources.insert(strip.uid.clone(), Value::String(meter_source_name(strip)));
+        }
+        Ok(json!({ "running": self.running, "sources": sources }))
     }
 
     fn app_move(&mut self, app_id: &str, sink_name: &str) -> Result<Value, BackendError> {

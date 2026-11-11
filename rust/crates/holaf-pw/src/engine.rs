@@ -344,6 +344,7 @@ impl Engine {
             EngineOp::DeviceList => self.device_list(),
             EngineOp::AppList => Ok(app_list_stub()),
             EngineOp::AppMove { .. } => Ok(app_move_stub()),
+            EngineOp::MeterSources => Ok(self.meter_sources_json()),
         }
     }
 
@@ -752,9 +753,11 @@ impl Engine {
 
         let want_chain = graph::wants_fx_chain(&clone, &self.avail);
         let chain_exists = self.modules.contains_key(uid);
+        let mut topology_changed = false;
         if want_chain && !chain_exists {
             // First activation → build the chain and wire it.
             self.create_chain(&clone)?;
+            topology_changed = true;
         } else if chain_exists {
             // Chain already exists (kept after a previous disable): hot-reload
             // the flat Props with the new effective controls (bypass for the
@@ -770,6 +773,14 @@ impl Engine {
         }
         // When !want_chain and no chain exists: nothing to do (no audible
         // effect either) — the state is stored for a future activation.
+
+        // A brand-new chain moves the endpoints of every route this strip is
+        // part of (`Holaf_Strip_<uid>` → `output.Holaf_FX_<uid>` / …): re-derive
+        // them, otherwise the fresh chain would never be fed / listened to.
+        if topology_changed {
+            let wanted = self.routes.clone();
+            self.reconcile_routes(&wanted)?;
+        }
 
         let state_json = serde_json::to_value(&self.strips[uid].effects[&effect])
             .map_err(|e| BackendError::internal("fx serialization", e))?;
@@ -933,6 +944,15 @@ impl Engine {
             );
             return Ok(());
         }
+        // Exhausted the retries without ever seeing a usable port pair: the
+        // nodes exist but PipeWire never published their ports (observed after
+        // many create/destroy cycles on a long-lived daemon — run the live tests
+        // right after a headless restart).  Stay forgiving (the route is
+        // retried on the next snapshot) but make it visible.
+        log::warn!(
+            "cannot link '{source_name}' → '{target_name}': no usable port pair after \
+             {LINK_RETRIES} attempts — route NOT created"
+        );
         Ok(())
     }
 
@@ -972,6 +992,13 @@ impl Engine {
 
     /// Unlink an existing route (does **not** touch the route-set bookkeeping;
     /// callers decide membership).
+    ///
+    /// Every candidate endpoint pair is torn down, not just the currently
+    /// effective one: a chain created (or unloaded) while the route stays moves
+    /// the strip's endpoint to/from `output.Holaf_FX_<uid>` /
+    /// `input.Holaf_FX_<uid>`, and the link created under the previous topology
+    /// would otherwise survive — the signal would then travel through *both*
+    /// paths (measured: doubled level, +5 dB, plus comb filtering).
     fn unroute(&mut self, source_uid: &str, target_uid: &str) {
         let Some(source_strip) = self.strips.get(source_uid).cloned() else {
             return;
@@ -979,13 +1006,11 @@ impl Engine {
         let Some(target_strip) = self.strips.get(target_uid).cloned() else {
             return;
         };
-        let (Some(src), Some(dst)) = (
-            self.effective_source_name(&source_strip),
-            self.effective_target_name(&target_strip),
-        ) else {
-            return;
-        };
-        self.unlink_nodes(&src, &dst);
+        for src in graph::route_source_candidates(&source_strip) {
+            for dst in graph::route_target_candidates(&target_strip) {
+                self.unlink_nodes(&src, &dst);
+            }
+        }
     }
 
     fn routing_set(
@@ -1099,6 +1124,7 @@ impl Engine {
             .collect();
 
         let routes = self.routing_list_json();
+        let meter_sources = self.meter_sources_payload();
         Ok(json!({
             "running": self.running,
             "strips": strips,
@@ -1107,7 +1133,33 @@ impl Engine {
             "default_sink": self.default_sink,
             "holaf_nodes": holaf_nodes,
             "fx_chains": chains,
+            "meter_sources": meter_sources,
         }))
+    }
+
+    /// `{uid: source_name}` for the Python VU-meter engine (spec §6).
+    ///
+    /// The naming rule lives in [`graph::meter_source_name`] (pure, unit
+    /// tested): device source for physical inputs, `<node>.monitor` otherwise.
+    /// It does not depend on the chain state, but the *existence* of the
+    /// underlying sink does — hence callers re-query after a snapshot rebuild.
+    fn meter_sources_payload(&self) -> JsonValue {
+        let mut sources = serde_json::Map::new();
+        for strip in self.strips.values() {
+            sources.insert(
+                strip.uid.clone(),
+                JsonValue::String(graph::meter_source_name(strip)),
+            );
+        }
+        sources.into()
+    }
+
+    /// Full `meter.sources` reply: the map plus the running flag.
+    fn meter_sources_json(&self) -> JsonValue {
+        json!({
+            "running": self.running,
+            "sources": self.meter_sources_payload(),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1335,4 +1387,5 @@ pub enum EngineOp {
     DeviceList,
     AppList,
     AppMove { app_id: String, sink_name: String },
+    MeterSources,
 }

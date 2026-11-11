@@ -360,6 +360,7 @@ impl Backend for SlowBackend {
         device_list() -> Result<Value, BackendError>,
         app_list() -> Result<Value, BackendError>,
         app_move(app_id: &str, sink_name: &str) -> Result<Value, BackendError>,
+        meter_sources() -> Result<Value, BackendError>,
     }
 }
 

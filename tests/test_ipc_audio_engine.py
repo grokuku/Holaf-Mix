@@ -31,7 +31,9 @@ if REPO_ROOT not in sys.path:
 from src.backend.ipc_audio_engine import (  # noqa: E402
     IpcAudioEngine,
     IpcEngineError,
+    METER_SYNC_INTERVAL_POLLS,
     METHOD_APPLY_SNAPSHOT,
+    METHOD_METER_SOURCES,
     METHOD_STOP,
     METHOD_STATUS,
     METHOD_STRIP_SET_VOLUME,
@@ -47,6 +49,37 @@ from src.backend.rust_launcher import (  # noqa: E402
 from src.models.strip_model import Strip, StripType, StripMode  # noqa: E402
 
 logging.disable(logging.CRITICAL)  # Keep unittest output clean.
+
+
+class FakeMetering:
+    """Stand-in for the sounddevice-backed `MeteringEngine`.
+
+    Records the start/stop calls `IpcAudioEngine` makes so the tests can assert
+    the exact source names handed to the capture streams, without opening any
+    audio device.
+    """
+
+    def __init__(self):
+        self.levels: Dict[str, Tuple[float, float]] = {}
+        self.started: List[Tuple[str, str]] = []
+        self.stopped: List[str] = []
+        self.retry_calls = 0
+        self.stop_all_called = False
+
+    def start_monitoring(self, uid: str, source_name: str):
+        self.started.append((uid, source_name))
+
+    def stop_monitoring(self, uid: str):
+        self.stopped.append(uid)
+
+    def retry_pending(self):
+        self.retry_calls += 1
+
+    def stop_all(self):
+        self.stop_all_called = True
+
+    def get_levels(self) -> Dict[str, Tuple[float, float]]:
+        return dict(self.levels)
 
 
 class ScriptedFakeDaemon:
@@ -74,6 +107,9 @@ class ScriptedFakeDaemon:
         self.close_once_methods = set(close_once_methods)
         self._close_count: Dict[str, int] = {}
         self.requests: List[Dict[str, Any]] = []
+        # uid → source name the daemon hands to the VU meters (test-settable so
+        # a chain-creation/unload can be simulated mid-test).
+        self.meter_sources: Dict[str, str] = {}
         self._tmpdir = tempfile.mkdtemp(prefix="holaf-ipc-test-")
         self.path = os.path.join(self._tmpdir, "daemon.sock")
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -157,6 +193,8 @@ class ScriptedFakeDaemon:
             result = {"devices": []}
         elif method == "app.list":
             result = {"apps": []}
+        elif method == METHOD_METER_SOURCES:
+            result = {"running": True, "sources": dict(self.meter_sources)}
         else:
             # Generic echo for simple mutations (like the real daemon's
             # ``{ok, uid, value, …}`` replies).
@@ -243,7 +281,12 @@ class IpcRequestTest(unittest.TestCase):
         engine = IpcAudioEngine(socket_path=daemon.path)
         try:
             engine.start_engine(sample_strips())
-            self.assertEqual(len(daemon.requests), 1)
+            # The snapshot comes first, then the metering-source refresh (the
+            # snapshot may have (re)built FX chains, which renames sources).
+            self.assertEqual(
+                [r["method"] for r in daemon.requests],
+                [METHOD_APPLY_SNAPSHOT, METHOD_METER_SOURCES],
+            )
             req = daemon.requests[0]
             self.assertEqual(req["method"], METHOD_APPLY_SNAPSHOT)
             self.assertEqual(req["id"], 1)
@@ -474,10 +517,11 @@ class IpcErrorTest(unittest.TestCase):
             self.assertTrue(engine.reload_strip(strips[0]))
 
             tail = daemon.requests[count_before:]
-            self.assertEqual(tail[-1]["method"], METHOD_APPLY_SNAPSHOT)
-            self.assertEqual(
-                len(tail[-1]["params"]["strips"]), len(strips)
-            )
+            snapshot = [r for r in tail if r["method"] == METHOD_APPLY_SNAPSHOT]
+            self.assertEqual(len(snapshot), 1)
+            self.assertEqual(len(snapshot[0]["params"]["strips"]), len(strips))
+            # …and the metering sources are re-read afterwards.
+            self.assertEqual(tail[-1]["method"], METHOD_METER_SOURCES)
         finally:
             daemon.close()
 
@@ -496,14 +540,107 @@ class IpcEventAndStubTest(unittest.TestCase):
         finally:
             daemon.close()
 
-    def test_get_meter_levels_is_a_stub(self):
+    def test_get_meter_levels_reads_the_local_metering_engine(self):
         daemon = ScriptedFakeDaemon()
         engine = IpcAudioEngine(socket_path=daemon.path)
+        metering = FakeMetering()
+        metering.levels = {"mic-1": (0.5, 0.25)}
+        engine.metering = metering
         try:
-            self.assertEqual(engine.get_meter_levels(), {})
-            # A stub must not touch the socket at all.
+            # The UI polls at 25 Hz: a single poll must be a pure local read
+            # (no socket traffic) and must return the meter levels unchanged.
+            self.assertEqual(engine.get_meter_levels(), {"mic-1": (0.5, 0.25)})
             self.assertEqual(daemon.requests, [])
         finally:
+            daemon.close()
+
+    def test_start_engine_starts_one_stream_per_meter_source(self):
+        daemon = ScriptedFakeDaemon()
+        daemon.meter_sources = {
+            "desktop": "output.Holaf_FX_desktop",
+            "out-1": "Holaf_Strip_out-1.monitor",
+            "ghost": "",  # unresolvable → must be ignored, not monitored
+        }
+        engine = IpcAudioEngine(socket_path=daemon.path)
+        metering = engine.metering = FakeMetering()
+        try:
+            engine.start_engine(sample_strips())
+            self.assertIn(METHOD_METER_SOURCES, [r["method"] for r in daemon.requests])
+            self.assertEqual(
+                metering.started,
+                [
+                    ("desktop", "output.Holaf_FX_desktop"),
+                    ("out-1", "Holaf_Strip_out-1.monitor"),
+                ],
+            )
+        finally:
+            daemon.close()
+            metering.stop_all()
+
+    def test_changed_meter_source_restarts_only_that_stream(self):
+        daemon = ScriptedFakeDaemon()
+        daemon.meter_sources = {"desktop": "Holaf_Strip_desktop.monitor"}
+        engine = IpcAudioEngine(socket_path=daemon.path)
+        metering = engine.metering = FakeMetering()
+        try:
+            engine.start_engine(sample_strips())
+            self.assertEqual(
+                metering.started, [("desktop", "Holaf_Strip_desktop.monitor")]
+            )
+            # An FX toggle created the chain → the metering source moves to the
+            # chain's virtual Audio/Source for that strip only.
+            daemon.meter_sources = {
+                "desktop": "output.Holaf_FX_desktop",
+                "out-1": "Holaf_Strip_out-1.monitor",
+            }
+            self.assertTrue(engine._sync_meter_sources())
+            self.assertEqual(metering.stopped, ["desktop"])
+            self.assertIn(("desktop", "output.Holaf_FX_desktop"), metering.started)
+            self.assertIn(("out-1", "Holaf_Strip_out-1.monitor"), metering.started)
+            # Re-syncing the same map must be a no-op (no stream churn).
+            started_before = list(metering.started)
+            self.assertTrue(engine._sync_meter_sources())
+            self.assertEqual(metering.started, started_before)
+        finally:
+            daemon.close()
+            metering.stop_all()
+
+    def test_meter_sync_survives_a_dead_daemon_and_shutdown_stops_streams(self):
+        daemon = ScriptedFakeDaemon()
+        daemon.meter_sources = {"desktop": "Holaf_Strip_desktop.monitor"}
+        engine = IpcAudioEngine(socket_path=daemon.path)
+        metering = engine.metering = FakeMetering()
+        engine.start_engine(sample_strips())
+        daemon.close()  # daemon gone
+        try:
+            # No VU meters without a daemon, but never an exception either.
+            self.assertFalse(engine._sync_meter_sources())
+            self.assertEqual(engine.get_meter_levels(), {})
+            self.assertTrue(metering.stop_all_called is False)
+            engine.shutdown()
+            self.assertTrue(metering.stop_all_called)
+        finally:
+            metering.stop_all()
+
+    def test_meter_source_refresh_is_due_every_sync_interval(self):
+        daemon = ScriptedFakeDaemon()
+        engine = IpcAudioEngine(socket_path=daemon.path)
+        metering = engine.metering = FakeMetering()
+        metering.levels = {"desktop": (0.9, 0.9)}
+        try:
+            for _ in range(METER_SYNC_INTERVAL_POLLS - 1):
+                self.assertEqual(
+                    engine.get_meter_levels(), {"desktop": (0.9, 0.9)}
+                )
+            self.assertEqual(metering.retry_calls, 0)
+            # The Nth poll triggers a retry sweep + a background source refresh
+            # (which must not block the poll itself).
+            self.assertEqual(
+                engine.get_meter_levels(), {"desktop": (0.9, 0.9)}
+            )
+            self.assertEqual(metering.retry_calls, 1)
+        finally:
+            engine.stop_metering()
             daemon.close()
 
     def test_device_and_app_helpers(self):

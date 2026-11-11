@@ -37,7 +37,7 @@ Fonctions pures à porter: _has_active_fx, _build_fx_graph (dual-mono _L/_R vs s
 
 ## 4. Contrat IPC
 Socket Unix + NDJSON (un JSON par ligne). Requêtes {"id":1,"method":"…","params":{…}}; réponses {"id":1,"ok":true,"result":{…}} / {"ok":false,"error":{"code":"…","message":"…"}}; événements {"event":"…","params":{…}}.
-Méthodes: engine.apply_snapshot {strips:[…]} (=start_engine), engine.stop, engine.status, strip.set_volume {uid,value}, strip.set_mute {uid,muted}, strip.set_mono {uid,mono}, fx.set_active {uid,effect,active}, fx.set_params {uid,effect,params}, routing.set {source_uid,target_uid,active}, routing.list, system.set_default_sink {uid}, device.list, app.list, app.move {app_id,sink_name}, meter.get {uid} (optionnel J5).
+Méthodes: engine.apply_snapshot {strips:[…]} (=start_engine), engine.stop, engine.status, strip.set_volume {uid,value}, strip.set_mute {uid,muted}, strip.set_mono {uid,mono}, fx.set_active {uid,effect,active}, fx.set_params {uid,effect,params}, routing.set {source_uid,target_uid,active}, routing.list, system.set_default_sink {uid}, device.list, app.list, app.move {app_id,sink_name}, meter.sources {→ {running, sources:{uid: <nom de source>}}} (implémenté, voir §6), meter.get {uid} (optionnel J5, non implémenté).
 Événements: state_changed, device_list_changed, strip_fx_ready {uid}.
 Concurrence: thread pw (mainloop) + thread IPC; ordres → mpsc channel consommé par thread pw (sérialisé, équiv. RLock Python); événements → broadcast clients. Pas de runtime async.
 
@@ -52,7 +52,30 @@ Règle de fusion quand inactif: params = defaults ⊕ bypass (TOUS les ports re�
 Formatage SPA-JSON: { "key" = value … }, clés contenant '=' exclues, pas de inf/nan.
 
 ## 6. VU meters
-Garder metering Python (sounddevice) jusqu'à J4 au moins. Daemon expose les noms effectifs (fx_source_names/monitor/device) dans engine.status/strip_fx_ready. Option native documentée J5+: lire Props audio.peak ou pw_stream passifs sur monitors.
+**État (implémenté)** : le metering reste Python (sounddevice + `PULSE_SOURCE`,
+inchangé) ; le daemon expose la correspondance `uid → nom de source` via la méthode
+IPC `meter.sources` (et la clé `meter_sources` de `engine.status`).  Règle de nommage
+(`holaf-core::graph::meter_source_name`, pur, testé) :
+
+| cas | source à écouter |
+|---|---|
+| entrée, physique | `<device_name>` (le nœud source lui-même) |
+| entrée, virtuelle | `Holaf_Strip_<uid>.monitor` |
+| sortie, physique | `<device_name>.monitor` |
+| sortie, virtuelle | `Holaf_Strip_<uid>.monitor` |
+
+Le nom ne dépend pas de l'état du filtre : pour une sortie, la chaîne joue dans le
+même nœud (le monitor est donc post-FX) ; pour une entrée, le VU affiche le signal
+présent sur le strip (pré-FX, comme l'entrée d'une console).
+`output.Holaf_FX_<uid>` (utilisé par le moteur Python historique) **n'est pas** utilisé
+comme cible de capture : c'est un flux *passif*, inactif tant que le strip n'est routé
+nulle part, et mesuré non capturable de façon fiable (capture ouverte, liée, mais
+silencieuse sur PipeWire 0.3.65 + WirePlumber 0.4.13 ; ~30 s d'attente puis timeout
+d'ouverture de flux PulseAudio sur un nœud suspendu).
+Côté Python, `IpcAudioEngine.get_meter_levels()` pilote un `MeteringEngine` local
+(streams ouverts/fermés en tâche de fond quand la carte `meter.sources` change) :
+aucune modification de `main_window.py`.  Option native J5+ (lire Props `audio.peak`
+ou `pw_stream` passifs sur monitors) : toujours non implémentée.
 
 ## 7. Jalons (estimations heures agent)
 J0 (6-10h): workspace + holaf-core complet (model, enums, tables, migrations, config IO atomique, formateurs SPA) + tests unitaires. 0 dépendance PipeWire. Livrable: cargo test vert.

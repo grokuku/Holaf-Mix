@@ -298,6 +298,10 @@ impl Backend for PipeWireBackend {
             sink_name: sink_name.to_string(),
         })
     }
+
+    fn meter_sources(&mut self) -> Result<Value, BackendError> {
+        self.call(EngineOp::MeterSources)
+    }
 }
 
 impl Drop for PipeWireBackend {

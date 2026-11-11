@@ -37,8 +37,12 @@ Wire format (holaf-ipc, spec §4)::
     response: {"id":1,"ok":false,"error":{"code":"unknown_strip","message":…}}
     event:    {"event":"state_changed","params":{…}}
 
-Metering (VU bars) stays Python-local; `get_meter_levels` is a stub returning
-``{}`` until the optional native metering lands (J5+, spec §6).
+Metering (VU bars) stays Python-local (spec §6): the daemon exposes the
+**source name** to record per strip (`meter.sources`) and
+:class:`MeteringEngine` (sounddevice + ``PULSE_SOURCE``) does the capture, so
+the UI keeps working unchanged.  The name changes with the FX chain lifecycle
+(an input strip exports ``output.Holaf_FX_<uid>`` only while its chain is
+live), hence the periodic re-sync in :meth:`IpcAudioEngine.get_meter_levels`.
 """
 
 import errno
@@ -49,6 +53,7 @@ import socket
 import threading
 from typing import Any, Dict, List, Optional
 
+from src.backend.metering import MeteringEngine
 from src.models.strip_model import Strip
 
 logger = logging.getLogger("IpcAudioEngine")
@@ -67,6 +72,18 @@ REQUEST_TIMEOUT_S = 5.0
 # (``retries=1`` => at most 2 tries in total).  Heavy orders such as
 # engine.apply_snapshot pass ``retries=0`` and never auto-retry.
 DEFAULT_RETRIES = 1
+
+# Budget of the background `meter.sources` refresh: it runs on a dedicated
+# thread (never on the UI thread) and only needs the daemon's cached map, so a
+# short ceiling keeps a hung daemon from piling refresh threads up.
+METER_SYNC_TIMEOUT_S = 2.0
+
+# How many `get_meter_levels()` polls between two `retry_pending()` sweeps and
+# `meter.sources` refreshes.  At the UI's 25 Hz meter timer this is ~2 s — the
+# same cadence as the classic engine (`METER_RETRY_INTERVAL_CYCLES` in
+# audio_engine.py).  The refresh is what picks up a chain created/destroyed by
+# an FX toggle: it changes a strip's metering source.
+METER_SYNC_INTERVAL_POLLS = 50
 
 # Transport failures worth one bounded retry.  They mean "the daemon may
 # simply have been busy / the socket dropped" and a fresh connection has a
@@ -92,6 +109,8 @@ METHOD_SYSTEM_SET_DEFAULT_SINK = "system.set_default_sink"
 METHOD_DEVICE_LIST = "device.list"
 METHOD_APP_LIST = "app.list"
 METHOD_APP_MOVE = "app.move"
+# uid → PulseAudio/PipeWire source name to record for the VU meters (spec §6).
+METHOD_METER_SOURCES = "meter.sources"
 
 # Canonical effect ordering (mirrors FX_PLUGIN_MAP in audio_engine.py and
 # EffectKey::all() in holaf-core).  The Strip model keeps all five effects
@@ -204,6 +223,10 @@ class IpcAudioEngine:
     helpers (`get_audio_nodes`, `get_sink_inputs`, `move_sink_input`) expose
     the daemon's device/app IPC methods; device/app discovery in the UI is
     still served by `pipewire_utils` until the mapping milestone.
+
+    VU meters keep the same surface too: `get_meter_levels()` is served by a
+    local :class:`MeteringEngine` (spec §6) whose targets come from the
+    daemon's ``meter.sources`` order.
     """
 
     def __init__(self, socket_path: Optional[str] = None):
@@ -219,6 +242,20 @@ class IpcAudioEngine:
         # daemon.  Strip objects are shared with the caller, so their live
         # state is always current.
         self._strips: List[Strip] = []
+
+        # --- VU meters (spec §6: capture stays Python-local) ---
+        # One sounddevice capture stream per strip, exactly like the classic
+        # engine.  The daemon only tells us *which source* to listen to.
+        self.metering = MeteringEngine()
+        # uid → source name currently monitored.  Kept apart from
+        # `MeteringEngine.active_streams` (which also tracks retries) so the
+        # diff below only reacts to real target changes.
+        self._meter_sources: Dict[str, str] = {}
+        self._meter_lock = threading.Lock()
+        # One background refresh at a time — the meter timer must never block.
+        self._meter_sync_lock = threading.Lock()
+        self._meter_sync_running = False
+        self._meter_poll_counter = 0
 
     # ------------------------------------------------------------------ IPC
     def _connect(self, timeout: Optional[float] = None) -> socket.socket:
@@ -407,9 +444,13 @@ class IpcAudioEngine:
         result = self._request(METHOD_APPLY_SNAPSHOT, payload, retries=0)
         applied = int((result or {}).get("applied", len(strips)))
         logger.info("start_engine: applied snapshot (%d strips)", applied)
+        # The snapshot may have (re)built FX chains, so the metering sources
+        # have to be re-read before the first meter poll.
+        self._sync_meter_sources()
 
     def shutdown(self):
         """Stop the engine and tear down the audio graph (best effort)."""
+        self.stop_metering()
         try:
             # engine.stop is a teardown order — no auto-retry.
             self._request(METHOD_STOP, retries=0)
@@ -418,16 +459,31 @@ class IpcAudioEngine:
             logger.debug("shutdown: %s", exc)
 
     def get_meter_levels(self) -> Dict[str, Any]:
-        """STUB — returns ``{}`` (no VU meters) until J5.
+        """Return ``{strip_uid: (left, right)}`` VU levels (0.0–1.0).
 
-        The rewrite spec §6 keeps metering Python-local (sounddevice) for now:
-        the daemon does not expose per-strip peak levels until the optional
-        native metering lands.  main_window's meter timer polls this method
-        and simply finds no widgets to update.
+        Same contract as `AudioEngine.get_meter_levels`, which
+        `main_window._update_meters` polls at 25 Hz: the levels come from the
+        local :class:`MeteringEngine` capture streams (spec §6 keeps metering
+        Python-local), and this method therefore **never blocks** on IPC — it
+        only reads the shared level dict.
+
+        The daemon's ``meter.sources`` mapping (uid → PulseAudio/PipeWire
+        source to record) is (re)fetched on a background thread every
+        :data:`METER_SYNC_INTERVAL_POLLS` polls: strips can appear/disappear
+        (snapshot), the daemon can be restarted, and a device can be
+        plugged/unplugged — all of which change the set of listenable sources.
+        The name itself does not depend on the FX state (the daemon always
+        points at a monitor, see `holaf_core::graph::meter_source_name`).
         """
-        # TODO(J5): either keep a local MeteringEngine fed by
-        # engine.status/fx names, or read native meter.get (spec §6).
-        return {}
+        self._meter_poll_counter += 1
+        if self._meter_poll_counter >= METER_SYNC_INTERVAL_POLLS:
+            self._meter_poll_counter = 0
+            # Streams that failed to open (e.g. the source did not exist yet)
+            # are retried by MeteringEngine itself — same cadence as the
+            # classic engine.
+            self.metering.retry_pending()
+            self._refresh_meter_sources_async()
+        return self.metering.get_levels()
 
     def set_volume(self, strip_uid: str, volume: float):
         self._safe_request(
@@ -480,6 +536,10 @@ class IpcAudioEngine:
         except IpcEngineError as exc:
             logger.warning("update_fx_params(%s): %s", strip.uid, exc)
             return False
+        finally:
+            # A chain may have been created/unloaded by the order above, which
+            # moves the strip's metering source.
+            self._sync_meter_sources()
 
     def reload_strip(self, strip: Strip) -> bool:
         """Rebuild one strip's FX state on the daemon.
@@ -497,7 +557,10 @@ class IpcAudioEngine:
             return True
         except IpcEngineError as exc:
             logger.warning("reload_strip(%s): FX push failed (%s); resyncing snapshot", strip.uid, exc)
-        return self._resync_snapshot()
+        try:
+            return self._resync_snapshot()
+        finally:
+            self._sync_meter_sources()
 
     # ----------------------------------------------------- device/app reads
     def status(self) -> Dict[str, Any]:
@@ -530,6 +593,89 @@ class IpcAudioEngine:
             return False
 
     # ------------------------------------------------------------- internal
+    # --- metering target sync (see the module docstring) ---
+    def _sync_meter_sources(self) -> bool:
+        """Blocking refresh of the ``uid → source`` map (worker threads only).
+
+        Called from the lifecycle methods that can change the graph
+        (`start_engine`, `update_fx_params`, `reload_strip`), i.e. always on a
+        `BackendWorker` thread — never from the UI thread.  Returns ``True``
+        when the daemon answered.
+        """
+        try:
+            result = self._request(
+                METHOD_METER_SOURCES, timeout=METER_SYNC_TIMEOUT_S
+            )
+        except IpcEngineError as exc:
+            # No VU meters without a daemon — but never break the engine API
+            # for it (the graph itself may still be alive).
+            logger.debug("_sync_meter_sources: %s", exc)
+            return False
+
+        raw = (result or {}).get("sources")
+        desired: Dict[str, str] = {}
+        if isinstance(raw, dict):
+            for uid, name in raw.items():
+                if isinstance(uid, str) and isinstance(name, str) and name:
+                    desired[uid] = name
+        elif raw is not None:
+            logger.warning(
+                "meter.sources: unexpected payload %r (ignored)", raw
+            )
+        self._apply_meter_sources(desired)
+        return True
+
+    def _refresh_meter_sources_async(self):
+        """Non-blocking refresh for the 25 Hz meter timer (UI thread).
+
+        Only one refresh may be in flight: the daemon answers within
+        :data:`METER_SYNC_TIMEOUT_S`, and the next poll is 2 s away anyway.
+        """
+        with self._meter_sync_lock:
+            if self._meter_sync_running:
+                return
+            self._meter_sync_running = True
+
+        def worker():
+            try:
+                self._sync_meter_sources()
+            finally:
+                with self._meter_sync_lock:
+                    self._meter_sync_running = False
+
+        try:
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+        except RuntimeError as exc:  # thread creation refused (low resources)
+            logger.debug("meter source refresh not started: %s", exc)
+            with self._meter_sync_lock:
+                self._meter_sync_running = False
+
+    def _apply_meter_sources(self, desired: Dict[str, str]):
+        """Reconcile the monitored strips with `desired` (uid → source)."""
+        with self._meter_lock:
+            # Stop streams whose strip disappeared or whose source moved
+            # (an FX chain switch changes the effective source).
+            for uid, current in list(self._meter_sources.items()):
+                if desired.get(uid) != current:
+                    self.metering.stop_monitoring(uid)
+                    del self._meter_sources[uid]
+            # Start the new / moved ones.  `start_monitoring` is non-blocking:
+            # it opens the capture stream on its own thread (a slow ALSA/Pulse
+            # connect must not stall a state apply).
+            for uid, name in desired.items():
+                if uid in self._meter_sources:
+                    continue
+                self._meter_sources[uid] = name
+                self.metering.start_monitoring(uid, name)
+                logger.info("metering '%s' from source '%s'", uid, name)
+
+    def stop_metering(self):
+        """Stop every VU capture stream (idempotent)."""
+        with self._meter_lock:
+            self._meter_sources.clear()
+        self.metering.stop_all()
+
     def _safe_request(self, method: str, params: Dict[str, Any], op: str):
         """Send a lightweight order; log-and-swallow like `AudioEngine`, which
         never raises for missing nodes (it just early-returns)."""

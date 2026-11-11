@@ -16,11 +16,22 @@
 //! sandbox (`/tmp/pw-runtime` / `…holaf…`) or `HOLAF_PW_LIVE=1` must be set.
 
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use holaf_core::backend::Backend;
 use holaf_core::model::{EffectKey, Strip, StripType};
 use holaf_pw::PipeWireBackend;
+
+/// Both live tests drive the *same* daemon (one shared graph, `stop()` between
+/// phases), so they must never overlap: cargo runs tests in parallel by
+/// default.  Acquire this guard first in every live test.
+fn live_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Is the test allowed to talk to a live PipeWire daemon?
 fn live_allowed() -> bool {
@@ -90,6 +101,38 @@ fn link_count(out_node: u32, in_node: u32) -> usize {
         .unwrap_or(0)
 }
 
+/// Number of links between *any* node of `from` and *any* node of `to`, by node
+/// name (used to prove that a topology change leaves no stale route behind).
+fn link_count_between(from: &[&str], to: &[&str]) -> usize {
+    let Some(dump) = pw_dump() else { return 0 };
+    let Some(arr) = dump.as_array() else { return 0 };
+    let name_of = |id: &serde_json::Value| -> Option<String> {
+        let wanted = id.as_u64()?;
+        arr.iter().find_map(|o| {
+            if o.get("id")?.as_u64()? != wanted {
+                return None;
+            }
+            Some(o.get("info")?.get("props")?.get("node.name")?.as_str()?.to_string())
+        })
+    };
+    arr.iter()
+        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Link"))
+        .filter(|o| {
+            let props = o.get("info").and_then(|i| i.get("props"));
+            let (Some(out), Some(inn)) = (
+                props.and_then(|p| p.get("link.output.node")),
+                props.and_then(|p| p.get("link.input.node")),
+            ) else {
+                return false;
+            };
+            let (Some(out), Some(inn)) = (name_of(out), name_of(inn)) else {
+                return false;
+            };
+            from.contains(&out.as_str()) && to.contains(&inn.as_str())
+        })
+        .count()
+}
+
 /// Read the current value of an EQ band back from the daemon via
 /// `pw-cli enum-params` on the given chain stream node.
 fn eq_band_value(node_id: u32, band: &str) -> Option<f32> {
@@ -124,6 +167,7 @@ fn input_strip(uid: &str, routes: &[&str]) -> Strip {
 
 #[test]
 fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
+    let _guard = live_lock();
     let _ = env_logger::try_init();
     if !live_allowed() {
         eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
@@ -237,6 +281,28 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
         "input must be re-linked directly to the (chain-less) output null-sink (got {direct_links})"
     );
 
+    // 3b) Re-enabling the chain while the route stays must NOT leave the
+    //     previous (chain-less) direct link behind: the strip would otherwise
+    //     feed the output through two paths at once (doubled level, comb
+    //     filtering).
+    let res = backend
+        .apply_snapshot(&[output_strip(o1, true), input_strip(i1, &[o1])])
+        .expect("apply_snapshot (eq active again)");
+    assert_eq!(res["applied"], 2);
+    std::thread::sleep(Duration::from_millis(400));
+    let sources = [format!("Holaf_Strip_{i1}"), format!("output.Holaf_FX_{i1}")];
+    let targets = [
+        format!("Holaf_Strip_{o1}"),
+        format!("input.Holaf_FX_{o1}"),
+    ];
+    let sources_ref: Vec<&str> = sources.iter().map(String::as_str).collect();
+    let targets_ref: Vec<&str> = targets.iter().map(String::as_str).collect();
+    let routed = link_count_between(&sources_ref, &targets_ref);
+    assert_eq!(
+        routed, 2,
+        "a route must be exactly one stereo pair of links, never the stale one plus the new one          (got {routed}: {sources_ref:?} -> {targets_ref:?})"
+    );
+
     // 4) volume / mute / default-sink are accepted.
     backend.set_volume(o1, 0.5).expect("set_volume");
     backend.set_mute(o1, true).expect("set_mute");
@@ -256,4 +322,101 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
             "cleanup left debris node '{name}'"
         );
     }
+}
+
+/// `pactl list short sources` → the source names the PulseAudio API exposes.
+/// `None` when no `pipewire-pulse` server (or no `pactl`) is reachable, in
+/// which case the external cross-check below is skipped: the plain PipeWire
+/// daemon alone does not publish pulse-level names.
+fn pulse_source_names() -> Option<Vec<String>> {
+    let text = run("pactl", &["list", "short", "sources"])?;
+    let names: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1).map(str::to_string))
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+/// `meter.sources` must hand the Python VU-meter engine names it can actually
+/// record from (`PULSE_SOURCE=<name>`): a `<node>.monitor` source for every
+/// virtual strip (chain or not), the device source for a physical input — and
+/// each name must exist as a pulse source once the graph is built.
+#[test]
+fn meter_sources_expose_recordable_pulse_sources() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    let vin = "meter-in"; // virtual input, EQ active → chain exports a source
+    let vout = "meter-out"; // virtual output → null-sink monitor
+    let mut in_strip = input_strip(vin, &[]);
+    in_strip.effects.get_mut(&EffectKey::Eq).unwrap().active = true;
+    let out_strip = output_strip(vout, true);
+    backend
+        .apply_snapshot(&[in_strip, out_strip])
+        .expect("apply_snapshot");
+
+    let res = backend.meter_sources().expect("meter.sources");
+    assert_eq!(res["running"], true, "engine must report running: {res:?}");
+    let sources = res["sources"].as_object().expect("sources object");
+    assert_eq!(
+        sources[vin],
+        format!("Holaf_Strip_{vin}.monitor"),
+        "a virtual strip is metered on its null-sink monitor"
+    );
+    assert_eq!(
+        sources[vout],
+        format!("Holaf_Strip_{vout}.monitor"),
+        "an output strip is metered on its master node's monitor"
+    );
+
+    // The names must be real: every metered source exists in the pulse source
+    // list (the exact API the Python metering uses through PortAudio).
+    std::thread::sleep(Duration::from_millis(400));
+    match pulse_source_names() {
+        Some(names) => {
+            for (uid, name) in sources {
+                let name = name.as_str().unwrap();
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "meter source '{name}' (strip '{uid}') is not a pulse source: {names:?}"
+                );
+            }
+        }
+        None => eprintln!(
+            "SKIP pulse cross-check: no pipewire-pulse server / pactl available \
+             (names asserted structurally only)"
+        ),
+    }
+
+    // The mapping is chain-independent: unloading the chain must not change
+    // the metered source (the null-sink stays the strip's signal entry point).
+    let mut no_eq = input_strip(vin, &[]);
+    no_eq.effects.get_mut(&EffectKey::Eq).unwrap().active = false;
+    backend
+        .apply_snapshot(&[no_eq, output_strip(vout, false)])
+        .expect("apply_snapshot (no fx)");
+    let res = backend.meter_sources().expect("meter.sources (no fx)");
+    assert_eq!(
+        res["sources"][vin],
+        format!("Holaf_Strip_{vin}.monitor"),
+        "the metered source survives a chain teardown"
+    );
+
+    backend.stop().expect("stop");
 }
