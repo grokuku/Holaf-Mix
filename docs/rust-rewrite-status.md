@@ -18,15 +18,17 @@ seuls points restants dépendent d'une **machine utilisateur avec audio réel**
 
 | Jalon | Description | Statut | Preuve |
 |---|---|---|---|
-| **J0** | Workspace cargo + `holaf-core` (modèle, FX, migrations, SPA-JSON, config IO) — pur, 0 dépendance PipeWire | ✅ **fait** | `cargo test -p holaf-core` : **51 tests** verts |
+| **J0** | Workspace cargo + `holaf-core` (modèle, FX, migrations, SPA-JSON, config IO) — pur, 0 dépendance PipeWire | ✅ **fait** | `cargo test -p holaf-core` : **75 tests** verts |
 | **J1** | Spike pipewire-rs + `holaf-pw` (connexion, filter-chain, set-param, null-sink, liens, metadata) | ✅ **fait (conteneur headless)** | `cargo run -p holaf-pw --bin holaf-spike` (docs j1-spike-recon/phase2) |
 | **J2** | `holaf-pw` réel derrière trait `Backend` (déplacé dans holaf-core), reconcilieur de graphe, routing, volume/mute, metadata, cleanup, `holafd --backend pipewire` | ✅ **fait (conteneur headless)** | `cargo test --workspace` 137 verts + `cargo test -p holaf-pw --test backend_live` (voir docs/j2-phase2-pipewire-backend.md) |
-| **J3** | `holaf-ipc` + `holafd` (serveur socket NDJSON) + `holafctl` | ✅ **fait** | `cargo test -p holaf-ipc -p holafd -p holafctl` : **47 tests** verts |
+| **J3** | `holaf-ipc` + `holafd` (serveur socket NDJSON) + `holafctl` | ✅ **fait** | `cargo test -p holaf-ipc -p holafd -p holafctl` : **48 tests** verts |
 | **J4** | `IpcAudioEngine` Python (même surface publique qu'`AudioEngine`), `rust_launcher`, bascule `HOLAF_USE_RUST=1` | ✅ **fait** | `python -m unittest discover -s tests -v` : **21 tests** verts |
 | **J5** | **Partie sans PipeWire** : robustesse client (retry, timeouts, erreurs structurées), launcher anti-double-spawn/relance, packaging & doc | ◑ **partiel** | 28 tests Python verts + doc (voir §2) |
 | **J5 (suite)** | hotplug devices, metering natif optionnel, intégration binaire Rust dans `build.sh`/`.desktop` | 🔴 reste à faire (dépend en partie de J1/J2) | — |
 
-Total workspace Rust : **98 tests** (`cargo test`), tous verts sans PipeWire.
+Total workspace Rust : **137 tests** (`cargo test`), tous verts avec un daemon
+PipeWire headless (sans lui, le seul test live `backend_live` est skippé et il
+en reste 136).
 Tests Python (client IPC + launcher) : **28 tests** verts.
 
 ---
@@ -91,11 +93,18 @@ Décision de review, implémentée dans `main.py` + `rust_launcher.py` :
 
 ```bash
 cd rust
-cargo test                # workspace : 98 tests (J0 51 + J3 47)
-cargo test -p holaf-core  # J0 (51)
-cargo test -p holafd      # J3 serveur + FakeBackend + tests d'intégration IPC (35)
+cargo test                # workspace : 137 tests (J0 75 + J3 48 + J1/J2 14)
+cargo test -p holaf-core  # J0 (75)
+cargo test -p holafd      # J3 serveur + FakeBackend + tests d'intégration IPC (36)
 cargo test -p holafctl    # J3 CLI (4)
 ```
+
+Tests live (backend PipeWire réel) reproductibles : lancer d'abord
+`./scripts/start-pipewire-headless.sh` (daemon PipeWire + WirePlumber + session
+bus privés, sans session graphique), puis
+`eval "$(./scripts/start-pipewire-headless.sh --export)"` dans le shell des
+tests ; `./scripts/start-pipewire-headless.sh stop` arrête tout. C'est cette
+mise en place qui fait passer `backend_live` au lieu de le skipper.
 
 ### 3.2 Daemon fake + holafctl (end-to-end sans PipeWire)
 

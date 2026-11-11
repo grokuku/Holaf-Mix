@@ -131,10 +131,18 @@ jobs:
           #                   Arch: the headers come with the runtime package)
           #   clang        -> provides libclang.so, required by bindgen
           #                   (libspa-sys / pipewire-sys generate bindings)
-          #   rustup       -> NOT the `rust` package: we need a toolchain that
-          #                   satisfies rust-version = "1.98" pinned in
-          #                   rust/Cargo.toml, and rustup is the only way to
-          #                   get a guaranteed-stable, self-updating one.
+          #   rust         -> the Arch package: prebuilt, self-consistent
+          #                   toolchain with /usr/bin/cargo and /usr/bin/rustc.
+          #                   We install this rather than a version-manager
+          #                   shim: in a container job the shim has no default
+          #                   toolchain and drops its proxies into a cargo
+          #                   home that is neither on PATH nor at a
+          #                   predictable location. `rust` needs no
+          #                   CARGO_HOME/HOME/PATH juggling at all.
+          #                   Requirement: this package must be >= the
+          #                   rust-version pin in rust/Cargo.toml (currently
+          #                   1.98; Arch ships 1.99.x), otherwise cargo
+          #                   refuses the whole workspace.
           # pkgconf is already in the list and is what -sys crates call.
           pacman -S --noconfirm --needed \
             base-devel \
@@ -149,7 +157,7 @@ jobs:
             portaudio \
             pipewire \
             clang \
-            rustup
+            rust
 
           # Arch's `python` package provides /usr/bin/python3; verify
           # before continuing, otherwise the next step fails with a
@@ -179,44 +187,21 @@ jobs:
       # ------------------------------------------------------------------
       # 1b. Rust toolchain
       # ------------------------------------------------------------------
-      - name: Initialize Rust toolchain (rustup)
-        # rustup (pacman) installs only the *shim*; the actual toolchain is
-        # downloaded here. `default stable` guarantees >= the 1.98 pinned in
-        # rust/Cargo.toml (cargo hard-fails on an older toolchain).
+      - name: Verify Rust toolchain
+        # The toolchain comes from the Arch `rust` package installed above:
+        # binaries live in /usr/bin, always on PATH, no CARGO_HOME/HOME
+        # assumptions and nothing to persist into $GITHUB_PATH.
         #
-        # PATH pitfall: every `run:` is a FRESH shell, so the ~/.cargo/bin
-        # directory created by rustup is NOT on PATH in later steps.
-        # The robust fix (better than repeating `export PATH=...` in every
-        # step) is to append it once to $GITHUB_PATH: GitHub then prepends it
-        # to the PATH of every subsequent step of this job.
-        # We also export it locally so `cargo --version` below resolves.
+        # This step only fails fast when the package is missing. The MSRV is
+        # NOT re-checked by hand: cargo enforces rust-version itself with an
+        # explicit message ("package ... requires rustc 1.98 or newer"), so a
+        # duplicate shell comparison would only add a way to get it wrong.
         run: |
           set -euo pipefail
-          rustup set profile minimal
-          rustup default stable
-
-          # Persist for every following step (no-op for this shell)
-          if [[ -d "$HOME/.cargo/bin" ]]; then
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          else
-            echo "::error::$HOME/.cargo/bin missing after rustup default stable"
-            exit 1
-          fi
-          export PATH="$HOME/.cargo/bin:$PATH"
-
-          rustup --version
+          command -v cargo || { echo "::error::cargo not found in PATH (pacman 'rust' missing?)"; exit 1; }
+          command -v rustc || { echo "::error::rustc not found"; exit 1; }
           cargo --version
           rustc --version
-
-          # Fail loudly NOW if the toolchain is older than the workspace pin
-          # instead of 10 minutes later inside cargo.
-          req="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' rust/Cargo.toml | head -1)"
-          have="$(rustc --version | awk '{print $2}')"
-          echo "rust-version pin: ${req:-<none>} / toolchain: $have"
-          if [[ -n "$req" ]] && [[ "$(printf '%s\n%s\n' "$req" "$have" | sort -V | head -1)" != "$req" ]]; then
-            echo "::error::Toolchain $have is older than rust-version $req (rust/Cargo.toml)"
-            exit 1
-          fi
 
       - name: Install Python build dependencies
         # Use a venv instead of --break-system-packages. On Arch, the
@@ -297,6 +282,11 @@ jobs:
       - name: Restore cargo cache
         uses: actions/cache@v4
         with:
+          # CARGO_HOME is unset in this container, so cargo falls back to
+          # its default ($HOME/.cargo): the Arch `rust` package changes
+          # nothing here. Only the registry/git caches are worth keeping
+          # (rust/target is cached too — it makes the cold build fast on a
+          # lockfile-identical rerun, at the cost of a fatter cache entry).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -306,8 +296,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build Rust daemon + CLI (release)
-        # PATH: ~/.cargo/bin was appended to $GITHUB_PATH by the rustup step,
-        # so `cargo` resolves here without re-exporting.
+        # PATH: `cargo` is /usr/bin/cargo (Arch `rust` package), so it
+        # resolves in this fresh shell with no export and no $GITHUB_PATH
+        # entry. Never prepend a custom PATH before this step: it could
+        # shadow /usr/bin/cargo with a stale/partial toolchain.
         # LIBCLANG_PATH: Arch puts libclang.so in /usr/lib (no versioned
         # subdir); bindgen's clang-sys search order is not exhaustive, so we
         # point at it explicitly — harmless when unnecessary.

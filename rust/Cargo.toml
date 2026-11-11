@@ -25,6 +25,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# MSRV floor enforced by cargo: any toolchain older than this refuses to
+# build the workspace. The release workflow installs Arch's `rust` package,
+# so this pin MUST stay <= the rustc version that package ships (1.99.x as of
+# 2026-11). Bumping it above Arch's version breaks CI outright; lowering it
+# is safe but pointless unless a contributor is stuck on an older toolchain.
 rust-version = "1.98"
 
 [workspace.dependencies]
