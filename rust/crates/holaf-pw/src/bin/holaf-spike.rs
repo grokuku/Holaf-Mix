@@ -53,7 +53,7 @@ use holaf_pw::sys::{self, LocalModule};
 use holaf_pw::{build_filter_chain_config, build_props_python_style};
 
 /// Registry-global snapshot used for discovery.
-type OwnedGlobal = GlobalObject<pw::properties::Properties>;
+type OwnedGlobal = GlobalObject<pw::properties::PropertiesBox>;
 
 /// PipeWire objects we create during the run (kept to destroy at cleanup).
 #[derive(Default)]
@@ -67,8 +67,8 @@ struct OwnedObjects {
 }
 
 struct Session {
-    _core: pw::core::Core,
-    _mainloop: pw::main_loop::MainLoop,
+    _core: pw::core::CoreRc,
+    _mainloop: pw::main_loop::MainLoopRc,
 }
 
 impl Session {
@@ -196,9 +196,9 @@ fn demo(
     banner(&format!("STEP 1/6 — connect to the PipeWire daemon + discovery (uid={uid}, flavour={}, reuse-core={reuse_core})", if is_output {"output"} else {"input"}));
 
     pw::init();
-    let mainloop = pw::main_loop::MainLoop::new(None)?;
-    let context = pw::context::Context::new(&mainloop)?;
-    let core = context.connect(None)?;
+    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let context = pw::context::ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
 
     if reuse_core {
         // SAFETY: context + core are alive and `core` belongs to `context`.

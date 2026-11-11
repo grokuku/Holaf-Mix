@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 use pipewire as pw;
-use pipewire::properties::Properties;
+use pipewire::properties::PropertiesBox;
+use pipewire::proxy::ProxyT;
 use pipewire::registry::GlobalObject;
 use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Pod, Value};
@@ -59,14 +60,28 @@ const LINK_RETRY_DELAY_MS: u64 = 100;
 const CHAIN_TEARDOWN_ROUNDTRIPS: u32 = 4;
 
 /// A connected PipeWire session owned by the worker thread.
+///
+/// The `Rc`-flavoured wrappers (pipewire-rs 0.10) are the ones that can be
+/// stored together: each one keeps its dependencies (`Loop` → `Context` →
+/// `Core`) alive through internal reference counting, so `PwSession` stays a
+/// plain struct instead of a self-referential one.
 struct PwSession {
-    _mainloop: pw::main_loop::MainLoop,
-    context: pw::context::Context,
-    core: pw::core::Core,
+    _mainloop: pw::main_loop::MainLoopRc,
+    context: pw::context::ContextRc,
+    core: pw::core::CoreRc,
+    /// Proxies for the objects *we* created remotely (null-sinks, links).
+    ///
+    /// Since pipewire-rs 0.10 `Node`/`Link` are **owning** proxies: dropping
+    /// one calls `pw_proxy_destroy()` and tears the PipeWire object down.
+    /// We must therefore hold on to them for as long as the object should
+    /// live (i.e. until `destroy_global`/teardown) instead of letting them
+    /// fall out of scope right after creation.
+    created_nodes: RefCell<Vec<pw::node::Node>>,
+    created_links: RefCell<Vec<pw::link::Link>>,
 }
 
 /// Owned registry snapshot type (matches the spike).
-type OwnedGlobal = GlobalObject<Properties>;
+type OwnedGlobal = GlobalObject<PropertiesBox>;
 
 impl PwSession {
     /// Block the current (worker) thread until the core acknowledges a sync.
@@ -135,7 +150,7 @@ impl PwSession {
     }
 
     fn create_null_sink(&self, name: &str, description: &str) -> Result<(), BackendError> {
-        let _node = self
+        let node = self
             .core
             .create_object::<pw::node::Node>(
                 "adapter",
@@ -150,6 +165,8 @@ impl PwSession {
                 },
             )
             .map_err(|e| BackendError::internal("create null sink", e))?;
+        // Keep the owning proxy alive: dropping it would destroy the node.
+        self.created_nodes.borrow_mut().push(node);
         if self.wait_node(name, NODE_POLL_ATTEMPTS, NODE_POLL_DELAY_MS).is_none() {
             return Err(BackendError::new(
                 "node_not_ready",
@@ -160,7 +177,39 @@ impl PwSession {
         Ok(())
     }
 
+    /// Destroy a registry global.
+    ///
+    /// Objects *we* created are torn down through [`Core::destroy_object`],
+    /// which consumes the owning proxy: that is the lifecycle pipewire-rs
+    /// 0.10 documents, and it keeps the local proxy and the remote object in
+    /// lock-step (dropping an owning proxy calls `pw_proxy_destroy()`).
+    /// Everything else — other clients' objects, debris from a previous run,
+    /// WirePlumber links — goes through the registry.
     fn destroy_global(&self, id: u32) {
+        let node = {
+            let mut nodes = self.created_nodes.borrow_mut();
+            let pos = nodes.iter().position(|n| n.upcast_ref().id() == id);
+            pos.map(|i| nodes.remove(i))
+        };
+        if let Some(node) = node {
+            if let Err(e) = self.core.destroy_object(node) {
+                log::warn!("destroy null-sink (id {id}) failed: {e}");
+            }
+            return;
+        }
+
+        let link = {
+            let mut links = self.created_links.borrow_mut();
+            let pos = links.iter().position(|l| l.upcast_ref().id() == id);
+            pos.map(|i| links.remove(i))
+        };
+        if let Some(link) = link {
+            if let Err(e) = self.core.destroy_object(link) {
+                log::warn!("destroy link (id {id}) failed: {e}");
+            }
+            return;
+        }
+
         if let Ok(registry) = self.core.get_registry() {
             let _ = registry.destroy_global(id);
         }
@@ -236,17 +285,19 @@ impl Engine {
     /// purely an environment concern).
     pub fn connect() -> Result<Engine, BackendError> {
         pw::init();
-        let mainloop = pw::main_loop::MainLoop::new(None)
+        let mainloop = pw::main_loop::MainLoopRc::new(None)
             .map_err(|e| BackendError::new("pipewire_error", format!("mainloop: {e}")))?;
-        let context = pw::context::Context::new(&mainloop)
+        let context = pw::context::ContextRc::new(&mainloop, None)
             .map_err(|e| BackendError::new("pipewire_error", format!("context: {e}")))?;
         let core = context
-            .connect(None)
+            .connect_rc(None)
             .map_err(|e| BackendError::new("pipewire_error", format!("connect: {e}")))?;
         let session = PwSession {
             _mainloop: mainloop,
             context,
             core,
+            created_nodes: RefCell::new(Vec::new()),
+            created_links: RefCell::new(Vec::new()),
         };
         session.roundtrip();
         let avail = PluginSet::on_disk();
@@ -865,10 +916,14 @@ impl Engine {
                         "object.linger" => "1",
                     },
                 );
-                if let Err(e) = link {
-                    log::warn!("create link {source_name}→{target_name} failed: {e}");
-                } else {
-                    created += 1;
+                match link {
+                    Err(e) => log::warn!("create link {source_name}→{target_name} failed: {e}"),
+                    Ok(link) => {
+                        // Keep the owning proxy alive: dropping it would
+                        // destroy the link we just created.
+                        self.session.created_links.borrow_mut().push(link);
+                        created += 1;
+                    }
                 }
             }
             self.session.roundtrip();

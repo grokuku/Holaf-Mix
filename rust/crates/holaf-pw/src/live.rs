@@ -7,7 +7,7 @@
 //! against that pure snapshot.
 //!
 //! [`collect_view`] is a pure mapping — a unit test can fabricate
-//! [`GlobalObject`]s with [`pw::properties::Properties`] and assert the exact
+//! [`GlobalObject`]s with [`pw::properties::PropertiesBox`] and assert the exact
 //! `LiveView` that results, without any daemon.
 //!
 //! Property keys mirror what a real registry snapshot exposes (verified live
@@ -21,7 +21,7 @@
 //!   `link.input.node`, `link.input.port` — all **global** object ids of the
 //!   port proxies (verified live).
 
-use pipewire::properties::Properties;
+use pipewire::properties::PropertiesBox;
 use pipewire::registry::GlobalObject;
 use pipewire::types::ObjectType;
 
@@ -85,7 +85,7 @@ pub struct LiveView {
     links: Vec<LiveLink>,
 }
 
-fn prop(g: &GlobalObject<Properties>, key: &str) -> Option<String> {
+fn prop(g: &GlobalObject<PropertiesBox>, key: &str) -> Option<String> {
     g.props
         .as_ref()
         .and_then(|p| p.get(key))
@@ -96,7 +96,7 @@ fn prop(g: &GlobalObject<Properties>, key: &str) -> Option<String> {
 ///
 /// Pure: given the same globals it always produces the same view, so it is
 /// unit-tested with fabricated globals and never needs a PipeWire daemon.
-pub fn collect_view(globals: &[GlobalObject<Properties>]) -> LiveView {
+pub fn collect_view(globals: &[GlobalObject<PropertiesBox>]) -> LiveView {
     let mut view = LiveView::default();
     for g in globals {
         match g.type_ {
@@ -222,7 +222,7 @@ mod tests {
     use super::*;
     use pipewire::properties::properties;
 
-    fn node(id: u32, name: &str, media_class: &str) -> GlobalObject<Properties> {
+    fn node(id: u32, name: &str, media_class: &str) -> GlobalObject<PropertiesBox> {
         GlobalObject {
             id,
             permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
@@ -235,7 +235,7 @@ mod tests {
         }
     }
 
-    fn port(id: u32, node_id: u32, dir: &str, idx: u32, channel: &str, name: &str) -> GlobalObject<Properties> {
+    fn port(id: u32, node_id: u32, dir: &str, idx: u32, channel: &str, name: &str) -> GlobalObject<PropertiesBox> {
         GlobalObject {
             id,
             permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
@@ -251,7 +251,7 @@ mod tests {
         }
     }
 
-    fn link(id: u32, out_node: u32, out_port: u32, in_node: u32, in_port: u32) -> GlobalObject<Properties> {
+    fn link(id: u32, out_node: u32, out_port: u32, in_node: u32, in_port: u32) -> GlobalObject<PropertiesBox> {
         GlobalObject {
             id,
             permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
