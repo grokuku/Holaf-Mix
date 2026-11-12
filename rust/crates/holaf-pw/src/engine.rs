@@ -6,8 +6,12 @@
 //! PipeWire's mainloop/context/core are `!Send` (they use `Rc` internally), so
 //! this whole engine lives on a **dedicated worker thread** and is driven by
 //! the `PipeWireBackend` handle (`backend.rs`) through an mpsc channel.  Each
-//! operation is processed synchronously: the worker runs its mainloop only
-//! when a round-trip / registry poll is needed, mirroring the J1 spike.
+//! operation is processed synchronously: the worker runs its mainloop when a
+//! round-trip / registry poll is needed **and continuously while it is idle**
+//! ([`Engine::pump_mainloop`]), because the filter-chain modules loaded into
+//! this context only get scheduled through mainloop traffic.  Every internal
+//! wait goes through [`PwSession::sleep_pumping`] for the same reason: a plain
+//! `thread::sleep` in the worker freezes a live chain.
 //!
 //! # Reconciliation model
 //!
@@ -30,7 +34,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::thread;
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -55,6 +58,10 @@ use crate::sys::{self, LocalModule};
 /// Polling knobs (same order of magnitude as the Python audio_engine).
 const NODE_POLL_ATTEMPTS: u32 = 40;
 const NODE_POLL_DELAY_MS: u64 = 50;
+/// Longest single mainloop iteration used while "sleeping" inside the engine
+/// (see [`PwSession::sleep_pumping`]).  Small enough that a hosted filter-chain
+/// never misses a deadline, large enough not to spin.
+const PUMP_SLICE: Duration = Duration::from_millis(2);
 const LINK_RETRIES: u32 = 5;
 const LINK_RETRY_DELAY_MS: u64 = 100;
 const CHAIN_TEARDOWN_ROUNDTRIPS: u32 = 4;
@@ -112,6 +119,51 @@ impl PwSession {
         }
     }
 
+    /// Service the mainloop once, blocking up to `timeout` for PipeWire
+    /// events, and return the number of dispatched sources.
+    ///
+    /// # Why this exists (real-time correctness)
+    ///
+    /// The filter-chain modules we host live **in this process** (see
+    /// [`Engine::create_chain`]): `module-filter-chain` exports two client
+    /// nodes whose protocol traffic — format/buffer negotiation, node
+    /// activation, `set_param` delivery — is dispatched by the **mainloop**
+    /// (the RT `process` callbacks run on libpipewire's data-loop thread, but
+    /// everything that makes a node *schedulable* needs the mainloop).
+    ///
+    /// The Python engine never had this problem because it hosts the chain in
+    /// a dedicated `pw-cli` process whose only job is running its mainloop.
+    /// A daemon that only iterates its mainloop *inside* an IPC operation
+    /// leaves the chain unserviced the rest of the time: measured on PipeWire
+    /// 0.3.65, a playback stream connecting to `input.Holaf_FX_<uid>` while
+    /// the worker sits in `recv()` stays in `connecting` **forever** (the
+    /// graph is never started), and when the loop is pumped only by periodic
+    /// polls the node misses its deadlines (the audible symptom: a continuous
+    /// fast on/off chopping on timing-sensitive devices such as USB cards).
+    pub fn pump_mainloop(&self, timeout: Duration) -> i32 {
+        self._mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(timeout))
+    }
+
+    /// Sleep for `total` while keeping the mainloop serviced.
+    ///
+    /// Used by every polling/settling wait inside the engine: a plain
+    /// `thread::sleep` freezes a live chain for its whole duration (a
+    /// `wait_node` retry loop can sleep for hundreds of milliseconds), which
+    /// is audible as a dropout on an already-running graph.
+    fn sleep_pumping(&self, total: Duration) {
+        let deadline = std::time::Instant::now() + total;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let slice = (deadline - now).min(PUMP_SLICE);
+            self.pump_mainloop(slice);
+        }
+    }
+
     /// Fresh registry snapshot (a new registry proxy each time so globals are
     /// replayed — the spike's proven pattern).
     fn snapshot(&self) -> Vec<OwnedGlobal> {
@@ -144,7 +196,9 @@ impl PwSession {
             if let Some(n) = self.view().node_named(name).cloned() {
                 return Some(n);
             }
-            thread::sleep(Duration::from_millis(delay_ms));
+            // Pump rather than sleep: a live chain must keep being serviced
+            // while we wait for a registry object to show up.
+            self.sleep_pumping(Duration::from_millis(delay_ms));
         }
         None
     }
@@ -276,6 +330,12 @@ pub struct Engine {
     routes: HashSet<(String, String)>,
     default_sink: Option<String>,
     running: bool,
+    /// Mainloop iterations performed while no order was in flight.
+    ///
+    /// Diagnostics only (reported by `status`): a daemon that hosts filter
+    /// chains must keep this growing while it is idle — a frozen counter means
+    /// the mainloop is starved and every hosted chain is starving with it.
+    idle_pumps: u64,
 }
 
 impl Engine {
@@ -313,7 +373,28 @@ impl Engine {
             routes: HashSet::new(),
             default_sink: None,
             running: false,
+            idle_pumps: 0,
         })
+    }
+
+    /// Does this process currently host at least one filter-chain module?
+    ///
+    /// Drives the worker's idle policy: chains only get scheduled through
+    /// mainloop traffic, so the loop must be pumped while any is loaded (and
+    /// may block on the order channel otherwise, at zero CPU cost).
+    pub fn hosts_chains(&self) -> bool {
+        !self.modules.is_empty()
+    }
+
+    /// Service the PipeWire mainloop once, blocking up to `timeout` for events.
+    ///
+    /// The worker loop calls this whenever no order is pending: the process
+    /// **hosts** the filter-chain modules of the strips, so its mainloop must
+    /// keep running even when the daemon has nothing to do (see
+    /// [`PwSession::pump_mainloop`] for the full rationale and measurements).
+    pub fn pump_mainloop(&mut self, timeout: Duration) -> i32 {
+        self.idle_pumps = self.idle_pumps.wrapping_add(1);
+        self.session.pump_mainloop(timeout)
     }
 
     /// Execute one backend operation (called by the worker loop).
@@ -554,7 +635,7 @@ impl Engine {
             }
             for _ in 0..CHAIN_TEARDOWN_ROUNDTRIPS {
                 self.session.roundtrip();
-                thread::sleep(Duration::from_millis(40));
+                self.session.sleep_pumping(Duration::from_millis(40));
             }
             return Err(BackendError::new(
                 "fx_node_not_ready",
@@ -604,7 +685,7 @@ impl Engine {
         }
         for _ in 0..CHAIN_TEARDOWN_ROUNDTRIPS {
             self.session.roundtrip();
-            thread::sleep(Duration::from_millis(40));
+            self.session.sleep_pumping(Duration::from_millis(40));
         }
         log::info!("unloaded FX chain for strip '{uid}'");
     }
@@ -907,7 +988,8 @@ impl Engine {
             };
 
             if pairs.is_empty() {
-                thread::sleep(Duration::from_millis(LINK_RETRY_DELAY_MS));
+                self.session
+                    .sleep_pumping(Duration::from_millis(LINK_RETRY_DELAY_MS));
                 continue;
             }
 
@@ -1134,6 +1216,10 @@ impl Engine {
             "holaf_nodes": holaf_nodes,
             "fx_chains": chains,
             "meter_sources": meter_sources,
+            // Idle mainloop service (see `idle_pumps`): lets a live test — or
+            // a user debugging a crackling chain — prove the daemon is really
+            // servicing the modules it hosts.
+            "mainloop_pumps": self.idle_pumps,
         }))
     }
 
@@ -1211,7 +1297,7 @@ impl Engine {
         }
         for _ in 0..CHAIN_TEARDOWN_ROUNDTRIPS {
             self.session.roundtrip();
-            thread::sleep(Duration::from_millis(40));
+            self.session.sleep_pumping(Duration::from_millis(40));
         }
         self.strips.clear();
         self.routes.clear();
@@ -1239,7 +1325,7 @@ impl Engine {
         }
         for _ in 0..CHAIN_TEARDOWN_ROUNDTRIPS {
             self.session.roundtrip();
-            thread::sleep(Duration::from_millis(40));
+            self.session.sleep_pumping(Duration::from_millis(40));
         }
     }
 }

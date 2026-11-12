@@ -18,8 +18,14 @@
 //!
 //! Each trait method sends one [`EngineOp`] and blocks on the reply channel
 //! (synchronous RPC, bounded by [`REQUEST_TIMEOUT`]).  This mirrors the
-//! Python `RLock` semantics and the rewrite spec §4 serialised-order model;
-//! the mainloop is only iterated while an operation needs a round-trip.
+//! Python `RLock` semantics and the rewrite spec §4 serialised-order model.
+//!
+//! The worker thread never blocks on the order channel: between orders it
+//! iterates the PipeWire mainloop ([`worker_loop`]).  That is a **real-time
+//! requirement**, not a nicety — the filter-chain modules we host live in this
+//! process and their client nodes are only schedulable through mainloop
+//! traffic, so a blocked mainloop silences (or, when partially served, chops)
+//! every FX chain.
 //!
 //! # TODO: the worker is now redundant (analysis done, refactor not started)
 //!
@@ -53,7 +59,7 @@
 //! holafd --backend pipewire
 //! ```
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -69,6 +75,19 @@ use crate::engine::{Engine, EngineOp};
 /// reports `backend_timeout`.  Real graph ops (chain loads, registry polls)
 /// can take a few seconds each.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Idle mainloop iteration budget of the worker thread (see [`worker_loop`]).
+///
+/// While this process hosts at least one filter-chain, the worker never blocks
+/// on the command channel: between orders it services the PipeWire mainloop
+/// with `iterate(IDLE_PUMP_TIMEOUT)`, which returns **as soon as a PipeWire
+/// event arrives** — audio is therefore serviced with the mainloop's own
+/// wake-up latency, never with this timeout.  The timeout only bounds how late
+/// a *new order* may be noticed when the graph is completely silent (≤5 ms,
+/// i.e. the pre-existing behaviour) and costs 200 epoll wake-ups per second
+/// (measured 0.7 % CPU with a chain loaded).  With no chain hosted there is
+/// nothing to service, so the worker blocks on the channel instead: 0 %.
+const IDLE_PUMP_TIMEOUT: Duration = Duration::from_millis(5);
 
 /// Message sent to the worker thread.
 enum WorkerMsg {
@@ -171,21 +190,92 @@ impl PipeWireBackend {
     }
 }
 
+/// Worker-thread loop: serve the PipeWire mainloop **and** the order queue.
+///
+/// # Why the loop does not block on `recv()`
+///
+/// This thread owns the `Context`/`Core`/`MainLoop`, and the filter-chain
+/// modules of the strips are loaded **into this context**
+/// ([`Engine::create_chain`] → `pw_context_load_module`).  A module's two
+/// client nodes (capture/playback streams) only become schedulable through
+/// mainloop traffic: format and buffer negotiation, node activation, and
+/// `set_param` delivery are all dispatched from `pw_loop_iterate`, and the
+/// RT `process` callbacks afterwards run on libpipewire's data-loop thread —
+/// which the mainloop has to arm first.
+///
+/// A blocking `recv()` here leaves those nodes unserviced for as long as no
+/// IPC order arrives.  Measured on the headless PipeWire 0.3.65 sandbox, the
+/// consequences are:
+///
+/// | mainloop service | observed behaviour of a live EQ chain |
+/// |---|---|
+/// | none (idle `recv()`) | the graph **never starts**: `pw-cat` into `input.Holaf_FX_<uid>` hangs in `connecting` forever, chain nodes stay `suspended`, capture is silent |
+/// | only inside IPC orders (a 25 Hz `status` poll) | the chain runs and the DSP is exact (RMS/THD identical to the Python path), but the node is starved between polls — a timing-sensitive device (USB card, 1 ms packets) drops packets → continuous fast on/off chopping |
+/// | continuously (`iterate`) | chain runs, `pw-top` ERR stays 0, output bit-identical to the Python engine |
+///
+/// The Python engine never hit this because it hosts its chains in a dedicated
+/// `pw-cli` process whose whole job is running the mainloop.  We keep one
+/// thread (the PipeWire objects are `!Send`) but stop blocking it.
 fn worker_loop(rx: Receiver<WorkerMsg>, mut engine: Engine) {
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            WorkerMsg::Op { op, reply } => {
-                let result = engine.handle(op);
-                if reply.send(result).is_err() {
-                    // The caller disconnected (daemon shutting down) — stop.
-                    break;
+    loop {
+        // Run every order that is already queued before going back to the
+        // mainloop, so a burst of orders never interleaves with audio service.
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if run_order(&mut engine, msg) == Flow::Stop {
+                        return;
+                    }
                 }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
             }
-            WorkerMsg::Quit { reply } => {
-                let result = engine.stop();
-                let _ = reply.send(result);
-                break;
+        }
+
+        if engine.hosts_chains() {
+            // Keep the hosted filter-chains serviced (see the doc comment).
+            // A negative return means the loop could not be iterated (e.g. a
+            // signal interrupted it): back off instead of spinning hot.
+            if engine.pump_mainloop(IDLE_PUMP_TIMEOUT) < 0 {
+                thread::sleep(Duration::from_millis(1));
             }
+        } else {
+            // Nothing of ours runs in this process: block on the channel
+            // (zero CPU) and wake up as soon as an order arrives.
+            match rx.recv() {
+                Ok(msg) => {
+                    if run_order(&mut engine, msg) == Flow::Stop {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+/// Whether the worker loop must keep running after an order was executed.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stop,
+}
+
+/// Execute one queued order / shutdown request and report what to do next.
+fn run_order(engine: &mut Engine, msg: WorkerMsg) -> Flow {
+    match msg {
+        WorkerMsg::Op { op, reply } => {
+            let result = engine.handle(op);
+            if reply.send(result).is_err() {
+                // The caller disconnected (daemon shutting down).
+                return Flow::Stop;
+            }
+            Flow::Continue
+        }
+        WorkerMsg::Quit { reply } => {
+            let result = engine.stop();
+            let _ = reply.send(result);
+            Flow::Stop
         }
     }
 }

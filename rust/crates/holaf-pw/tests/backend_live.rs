@@ -420,3 +420,89 @@ fn meter_sources_expose_recordable_pulse_sources() {
 
     backend.stop().expect("stop");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: the daemon must service its PipeWire mainloop while it is IDLE
+// ---------------------------------------------------------------------------
+
+/// Number of mainloop iterations the daemon performed while idle (status).
+fn mainloop_pumps(backend: &mut PipeWireBackend) -> u64 {
+    backend.status().expect("status")["mainloop_pumps"]
+        .as_u64()
+        .expect("status.mainloop_pumps")
+}
+
+/// The daemon must keep servicing its PipeWire mainloop **while no IPC order is
+/// in flight**.
+///
+/// # The bug this guards
+///
+/// The filter-chains live in this process: `module-filter-chain` is loaded into
+/// our own `pw_context`, so its two client nodes (capture/playback streams) are
+/// negotiated, activated and kept alive by mainloop traffic — only then does
+/// their RT `process` callback (libpipewire's data-loop thread) get scheduled.
+/// The Python engine never hit this because it hosts chains in a dedicated
+/// `pw-cli` process whose whole job is running its mainloop.
+///
+/// When the backend worker loop blocked on its order channel (`recv()`), the
+/// chain was serviced *only inside* IPC orders.  Measured on the headless
+/// 0.3.65 sandbox: with the loop blocked, a playback stream connecting to
+/// `input.Holaf_FX_<uid>` stayed in `connecting` forever (the graph never
+/// started); pumped only by a 25 Hz `status` poll, the chain ran but was
+/// starved between polls — on a timing-sensitive device (USB card with 1 ms
+/// packets) that is heard as a continuous fast on/off chopping, while a
+/// null-sink tolerates the gaps, which is exactly why the symptom looked
+/// "device-specific" (headphones crackle, speakers do not).
+///
+/// # What is asserted
+///
+/// With a chain hosted and **no order issued at all**, the idle pump counter
+/// must keep growing (the worker is servicing the mainloop instead of blocking
+/// on the channel); without a chain it must stay frozen (the worker blocks and
+/// costs 0 % CPU).  Both directions are checked so the test cannot be satisfied
+/// by a busy loop.
+#[test]
+fn mainloop_is_pumped_while_the_daemon_is_idle() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    // --- with a hosted chain: the mainloop must be serviced -----------------
+    let uid = "idle-live";
+    backend
+        .apply_snapshot(&[output_strip(uid, true)])
+        .expect("apply_snapshot");
+    let before = mainloop_pumps(&mut backend);
+    // Nothing talks to the daemon during this window — exactly the state the
+    // user is in when the UI is idle and a chain keeps playing.
+    std::thread::sleep(Duration::from_millis(400));
+    let after = mainloop_pumps(&mut backend);
+    assert!(
+        after - before >= 20,
+        "the daemon serviced its PipeWire mainloop only {} time(s) in 400 ms with a \
+         filter-chain loaded: a hosted chain is starved outside IPC orders \
+         ('FX chain crackles / chops only in Rust mode')",
+        after - before
+    );
+
+    // --- with no chain hosted: block on the channel, cost 0 % CPU -----------
+    backend.stop().expect("stop");
+    let idle_before = mainloop_pumps(&mut backend);
+    std::thread::sleep(Duration::from_millis(400));
+    let idle_after = mainloop_pumps(&mut backend);
+    assert_eq!(
+        idle_before, idle_after,
+        "with no chain hosted the worker must block on its order channel (no idle pumping)"
+    );
+}
