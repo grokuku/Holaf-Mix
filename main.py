@@ -15,11 +15,22 @@ Backend selection (see :func:`create_audio_engine`)
 Qt is imported lazily inside :func:`main` so the backend factory stays
 importable (and unit-testable) on machines without PySide6 / mido, e.g. a
 headless CI container.
+
+Shutdown (two entry points, one teardown)
+-----------------------------------------
+``shutdown_all()`` — engine stop, MIDI port closed, Rust daemon stopped when
+this process spawned it — is connected to ``QApplication.aboutToQuit`` *and*
+run by the POSIX signal handlers installed by
+:class:`src.backend.signal_shutdown.ShutdownController` (SIGTERM / SIGINT /
+SIGHUP).  It is idempotent, so a clean quit and a signal can never tear the
+app down twice.  The third net is the kernel: holafd is spawned with
+``PR_SET_PDEATHSIG``, so it also dies when the app is SIGKILLed.
 """
 
 import logging
 import os
 import sys
+import threading
 
 # Centralized logging configuration. Done here (not at module level in
 # audio_engine.py) so the first-call-wins behavior of basicConfig doesn't
@@ -174,6 +185,62 @@ def _show_fallback_notice(window, reason: str) -> None:
     logger.info("%s", message)
 
 
+def make_shutdown_all(audio, midi):
+    """Build the **idempotent** application teardown.
+
+    The returned callable is used by both exit paths:
+
+    * ``QApplication.aboutToQuit`` — clean window close / ``app.quit()``;
+    * the POSIX signal handlers installed by
+      :class:`src.backend.signal_shutdown.ShutdownController` (SIGTERM,
+      SIGINT, SIGHUP) — a session logout, a closed terminal, ``kill``…
+
+    so it must run at most once, and it must be safe to re-enter from a signal
+    handler that interrupts the main thread mid-teardown: the guard lock is
+    taken *without blocking*, so a nested call returns immediately instead of
+    deadlocking (which would orphan the daemon).
+
+    The Rust daemon is stopped only when this process spawned it
+    (``_rust_daemon_spawned_by_us``); a daemon the user started manually is
+    deliberately left running.  A Python-engine fallback has no such attribute,
+    so nothing is ever stopped there.
+    """
+    lock = threading.Lock()
+    state = {"done": False}
+
+    def shutdown_all():
+        if not lock.acquire(blocking=False):
+            logger.info("shutdown already in progress — ignoring the extra call")
+            return
+        try:
+            if state["done"]:
+                logger.debug("shutdown already completed — ignoring the extra call")
+                return
+            state["done"] = True
+        finally:
+            lock.release()
+
+        print("Application stopping...")
+        try:
+            audio.shutdown()
+        except Exception:  # noqa: BLE001 - a broken engine must not block the daemon stop
+            logger.exception("audio engine shutdown failed")
+        try:
+            midi.close_port()
+        except Exception:  # noqa: BLE001 - idem for MIDI
+            logger.exception("MIDI port close failed")
+        if getattr(audio, "_rust_daemon_spawned_by_us", False):
+            from src.backend.rust_launcher import stop_daemon
+            try:
+                stop_daemon()
+            except Exception:  # noqa: BLE001 - exit path: never crash here
+                logging.exception(
+                    "Failed to stop the Rust daemon on exit"
+                )
+
+    return shutdown_all
+
+
 def main():
     # Qt / mido are imported here (not at module level) so create_audio_engine()
     # stays importable without PySide6 (headless tests, CLI tools).
@@ -201,28 +268,37 @@ def main():
         # 3. Start Audio Engine with loaded configuration
         audio.start_engine(window.strips)
 
-        # 4. Connect Shutdown Signal
-        def shutdown_all():
-            print("Application stopping...")
-            audio.shutdown()
-            midi.close_port()
-            # Rust daemon lifecycle: now that the engine is stopped, tear down
-            # the daemon — but ONLY when this process spawned it.  A daemon
-            # already running before launch (started manually by the user) is
-            # deliberately left alone.  After a fallback on the Python engine
-            # the attribute is absent/False, so nothing is ever stopped.
-            if getattr(audio, "_rust_daemon_spawned_by_us", False):
-                from src.backend.rust_launcher import stop_daemon
-                try:
-                    stop_daemon()
-                except Exception:
-                    logging.exception(
-                        "Failed to stop the Rust daemon on exit"
-                    )
+        # 4. Connect Shutdown Signal (clean Qt quit: window closed, app.quit())
+        shutdown_all = make_shutdown_all(audio, midi)
 
         app.aboutToQuit.connect(shutdown_all)
 
-        sys.exit(app.exec())
+        # 5. POSIX signals (SIGTERM / SIGINT / SIGHUP).
+        # ``aboutToQuit`` is a Qt signal: it only fires when Qt itself decides
+        # the app is done.  A session logout (SIGTERM), a closed terminal
+        # (SIGHUP) or Ctrl-C (SIGINT) bypasses Qt entirely, which used to leave
+        # the holafd daemon orphaned.  The controller runs the same teardown
+        # from the signal handler, guards it with a watchdog thread, and lets
+        # the kernel (PR_SET_PDEATHSIG on the daemon) cover SIGKILL.
+        from src.backend.signal_shutdown import ShutdownController
+
+        def _hard_stop_daemon():
+            """Lock-free last resort: force-stop the daemon we spawned."""
+            from src.backend.rust_launcher import kill_daemon_now
+
+            kill_daemon_now()
+
+        shutdown_controller = ShutdownController(
+            cleanup=shutdown_all,
+            hard_cleanup=_hard_stop_daemon,
+            quit_ui=app.quit,
+        )
+        shutdown_controller.install()
+
+        try:
+            sys.exit(app.exec())
+        finally:
+            shutdown_controller.restore()
     except Exception as e:
         # A crash during startup (e.g. missing PipeWire daemon, broken
         # config, no display) previously left a raw traceback with no

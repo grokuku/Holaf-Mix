@@ -63,24 +63,61 @@ holafd --backend pipewire
 
 ## 3. Reconciliation
 
-`apply_snapshot` = **sync complet diff** du désiré :
+`apply_snapshot` = **sync complet diff** du désiré, exécuté en **phases
+ordonnées** (rien n'est câblé avant d'exister) :
 
-1. teardown des strips qui ont disparu (chaîne déchargée, liens détruits,
-   null-sink détruit) ;
-2. pour chaque strip : null-sink `Holaf_Strip_<uid>` créé si virtuel (un
-   device physique est adressé par `device_name`, nœud absent → warning, pas
-   de node créé) ; chaîne `Holaf_FX_<uid>` chargée **iff**
-   `graph::wants_fx_chain` (au moins un effet actif *applicable* + plugin
-   dispo) ; chaîne obsolète **détruite** ; volume/mute poussés ;
-3. routes = union des `.routes` des strips input, **reliées/ré-liées** : on
-   délie puis relie toujours, car le nœud effectif d'un strip change quand sa
-   chaîne apparaît/disparaît dans le même snapshot (cible = `input.Holaf_FX_*`
-   si chaîne, sinon le null-sink/device) ;
-4. default sink d'après `is_default` (sinon premier input), via metadata.
+| phase | contenu |
+|---|---|
+| P0 | premier apply seulement : décharger les chaînes qu'on héberge, puis `sweep_zombies` (débris `Holaf_*` d'un run précédent) |
+| P1 | teardown des strips qui ont disparu (chaîne, null-sink, liens) |
+| P2 | **publication de l'état désiré** dans `Engine::strips` |
+| P3 | nœuds de strip (null-sinks) — **tous les nœuds avant tout lien** |
+| P4 | chaînes FX `Holaf_FX_<uid>` (chargées **iff** `graph::wants_fx_chain`, ancrées à un nœud qui existe vraiment) |
+| P5 | matrice de routage (liens entre strips — **les liens en dernier**) |
+| P6 | passe de vérification : liens intra-strip de chaîne + volume/mute (idempotents) |
+| P7 | default sink (metadata `default`) |
 
-Anti-doublon WirePlumber : `link_nodes` vérifie l'existence du lien
-(`LiveView::link_exists`) avant de créer via `link-factory` — exactement le
-pattern validé au J1 phase 2 (« ne pas dupliquer les liens de WP »).
+**Aucune phase n'avorte le snapshot.**  Tout ce qui ne peut pas être fait
+maintenant (device pas encore énuméré, paire de ports pas publiée, null-sink
+qui n'apparaît pas) devient un *pending* (`PendingIssue`) :
+
+- retourné par `engine.apply_snapshot` (`degraded`/`pending`) et exposé par
+  `status` (`degraded`, `pending: [{key, message}]`) ;
+- **retenté automatiquement** par le worker (`Engine::repair_pending`, backoff
+  200 ms → 5 s) : un casque USB qui s'énumère 300 ms après le snapshot est
+  recâblé **sans aucune commande client** ;
+- un toggle (`fx.set_active`) re-dérive **toujours** la topologie, donc
+  l'utilisateur peut aussi réparer à la main.
+
+Deux invariants nés de bugs mesurés (à ne pas casser) :
+
+1. **les strips sont publiés avant tout accès** — le volume, les routes et la
+   résolution des chaînes passent par `Engine::strips` ; l'ancien code ne le
+   publiait qu'à la fin, donc le **premier** `apply_snapshot` n'appliquait
+   aucun volume (nœuds laissés à 1.0 = +14 dB) ;
+2. **le lien intra-strip d'une chaîne n'est jamais créé une seule fois** : il
+   est vérifié à chaque apply/toggle/repair (`ensure_chain_links`).  Créé
+   uniquement dans `create_chain`, il restait absent pour toujours si la cible
+   n'existait pas à cet instant (symptôme : « EQ actif au lancement → ça
+   hachait, et toggler l'EQ ne changeait rien »).
+
+Règles de câblage :
+
+- routes = union des `.routes` des strips input, **reliées/ré-liées** : on
+  délie puis relie toujours, car le nœud effectif d'un strip change quand sa
+  chaîne apparaît/disparaît (cible = `input.Holaf_FX_*` si chaîne, sinon le
+  null-sink/device).  `unroute` détruit **toutes** les paires candidates
+  (ancienne et nouvelle topologie), sinon deux chemins audio coexistent.
+- chaîne non créée tant que son **nœud d'ancrage** (`graph::master_node_name`)
+  est absent : `module-filter-chain` reçoit un `target.object` irrésoluble et
+  WirePlumber relie alors son stream au *sink par défaut* — mesuré : la chaîne
+  d'un strip output jouait dans le null-sink d'un **autre** strip.
+- anti-doublon WirePlumber : `link_nodes` vérifie l'existence du lien
+  (`LiveView::link_exists`) avant de créer via `link-factory`, et renvoie un
+  `LinkReport` (créés / déjà présents).  Un rapport vide n'est pas un succès :
+  la route est marquée *pending*.
+- `LinkReport`/`ensure_route` : une route dont un port manque n'est plus
+  silencieusement considérée comme créée.
 
 ## 4. FX toggles / hot-reload
 
@@ -95,11 +132,37 @@ pattern validé au J1 phase 2 (« ne pas dupliquer les liens de WP »).
 
 ## 5. Volume / mute / mono / default sink / devices / apps
 
-- `set_volume`/`set_mute` : `Props` `channelVolumes=[v,v]` + `mute` sur le
-  nœud maître (null-sink pour virtuel, device pour physique).  Chaque
-  `set_param` est suivi d'un **round-trip** : sans itération du mainloop, la
-  requête reste dans la file du proxy et n'atteint jamais le daemon (bug
-  réellement observé puis corrigé pendant la tâche).
+- `set_volume`/`set_mute` : `Props` `channelVolumes` + `monitorVolumes` +
+  `mute` + `monitorMute` sur le nœud maître (null-sink pour virtuel, device
+  pour physique).  Chaque `set_param` est suivi d'un **round-trip** : sans
+  itération du mainloop, la requête reste dans la file du proxy et n'atteint
+  jamais le daemon.
+- **Courbe de volume PulseAudio** (parité Python, mesuré) : le volume d'un
+  strip est le *pourcentage* affiché par l'UI, et le moteur Python l'applique
+  avec `pactl set-sink-volume <node> <int(v*100)>%`.  La sémantique PulseAudio
+  est **cubique** : `channelVolumes = v³` (0.44 → 0.08518, soit −21,4 dB).
+  Écrire `0.44` en linéaire = −7,1 dB = **+14,3 dB plus fort** que Python
+  (mesuré : `pactl 44%` et le Rust corrigé donnent −21,39 dB sur le même banc ;
+  l'ancien code −7,13 dB).  Conversion centralisée :
+  `holaf_core::model::pulse_linear_gain`.
+- **`monitorVolumes` aussi** : le tap `<node>.monitor` (ce que lit le VU-mètre
+  Python) a son propre gain, que le moteur Python règle via
+  `pactl set-source-volume <monitor> …%`.  Le laisser à 1.0 faisait lire aux
+  VU-mètres le niveau *pré-fader* (« les deux VU collés en butée alors que les
+  sliders sont bas »).
+- Le volume est **ré-asserté** ~40 ms après le premier `set_param` : WirePlumber
+  restaure son état par-nœud (`~/.local/state/wireplumber/restore-stream`,
+  clé = `node.name`) de façon asynchrone juste après l'apparition du nœud, et
+  peut écraser la valeur qu'on vient d'écrire (mesuré sur le banc).
+- `set_default_sink` : bind de la metadata `default` du daemon + écriture de
+  `default.audio.sink` (`{"name": "Holaf_Strip_<uid>"}` / device), pattern J1.
+- `set_mono` : ré-émission des liens sortants (force mono = FL dupliqué sur
+  FL+FR, sans sommation — identique à `_auto_link_ports(force_mono=True)` du
+  moteur Python).
+- `device_list` : registry → nœuds `media.class` Audio/Sink|Source hors
+  Holaf/streams.
+- `app_list`/`app_move` : **STUB documenté** (JSON `stub:true`) — pas de
+  gestion des sink-inputs en J2.
 - `set_default_sink` : bind de la metadata `default` du daemon + écriture de
   `default.audio.sink` (`{"name": "Holaf_Strip_<uid>"}` / device), pattern J1.
 - `set_mono` : ré-émission des liens sortants (force mono = FL dupliqué sur
@@ -123,11 +186,24 @@ pattern validé au J1 phase 2 (« ne pas dupliquer les liens de WP »).
   EQ inactif → chaîne détruite, routage re-pointé direct, null-sink conservé ;
   volume/mute/default-sink acceptés ; `stop()` → 0 débris Holaf.
 
+- **Live, robustesse du démarrage** (`holaf-pw/tests/apply_robustness.rs`) :
+  volume appliqué **au premier** apply et avec la courbe cubique (read-back
+  `pw-cli enum-params` : `channelVolumes` **et** `monitorVolumes` = 0.44³) ;
+  device absent → apply non fatal, `degraded`/`pending` renseignés, aucun lien
+  vers un mauvais nœud, puis **auto-réparation** dès que le device apparaît
+  (sans aucune commande) ; strip cassé → les autres strips gardent chaînes,
+  liens et routes ; toggle → liens intra-strip et routes re-dérivés ;
+  câblage stéréo exact FL→FL / FR→FR et mono FL→FL+FR.
+  Ces tests redémarrent le daemon headless entre eux (jamais sur une vraie
+  session) : PipeWire 0.3.65 cesse de publier ses globals `Port` après
+  beaucoup de cycles create/destroy, et le partage du daemon entre tests
+  fausserait les mesures.
+
 Résultat sur ce conteneur :
-`cargo test --workspace` (avec env headless) : **137 tests verts** (69 core +
-13 holaf-pw + 8 main + 21 holafd lib + 6 ipc + 4 holafctl + 6 config_check +
-…), incluant le test live (2.5 s).  Sans env headless, le test live passe en
-« SKIP » et le workspace reste 100 % vert.
+`cargo test --workspace` (avec env headless) : **164 tests verts**, dont
+6 live de robustesse et 3 live `backend_live`.  Sans env headless, les tests
+live passent en « SKIP » et le workspace reste 100 % vert.  Côté Python :
+`python3 -m unittest discover -s tests` → **89 tests verts**.
 
 ## 7. Branchement holafd
 

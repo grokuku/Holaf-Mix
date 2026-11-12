@@ -210,6 +210,34 @@ impl Default for Strip {
     }
 }
 
+/// Linear gain to write into a node's `Props.channelVolumes` for a strip's
+/// user-facing [`Strip::volume`], following the **PulseAudio/PipeWire software
+/// volume curve**.
+///
+/// `Strip.volume` is a percentage as the UI shows it (0.44 = "44 %"), and the
+/// Python engine applies it exactly like the desktop volume slider:
+/// `pactl set-sink-volume <node> <int(volume*100)>%`.  PulseAudio's percentage is
+/// **cubic** in the linear gain (`pa_sw_volume_to_linear`), so 44 % is
+/// −21,4 dB — *not* −7 dB.
+///
+/// `Props.channelVolumes` is a plain **linear** multiplier array, so writing the
+/// raw `0.44` into it is **+14,3 dB louder** than the Python engine — measured
+/// live on PipeWire 0.3.65: `pactl set-sink-volume x 44%` leaves
+/// `channelVolumes = 0.085177` (= 0.44³), while the daemon used to write 0.44.
+/// Symptom reported by users: "much louder than before, with both output strips'
+/// VU meters pinned even at low slider positions".
+///
+/// The percentage is truncated like Python's `int(volume * 100)` so both engines
+/// compute the very same gain; non-finite values fall back to unity and values
+/// above 1.0 keep working (1.5 = "150 %" = +10,6 dB, like `pactl … 150%`).
+pub fn pulse_linear_gain(volume: f32) -> f32 {
+    if !volume.is_finite() {
+        return 1.0;
+    }
+    let pct = (volume.max(0.0) * 100.0).trunc() / 100.0;
+    pct * pct * pct
+}
+
 /// A fresh effects map: all five keys, each inactive with the plugin's default
 /// control values (like Python's `copy.deepcopy(DEFAULT_EFFECT_PARAMS[..])`).
 pub fn default_effects() -> IndexMap<EffectKey, EffectState> {
@@ -389,5 +417,33 @@ mod tests {
         for k in EffectKey::all() {
             assert!(effects.contains_key(&k));
         }
+    }
+
+    /// The volume curve is the PulseAudio one, not a raw linear multiplier:
+    /// `pactl set-sink-volume <node> 44%` leaves `channelVolumes = 0.44³`
+    /// (measured: 0.085177).  Pinned values are the ones the Python engine
+    /// produces, so both engines sound identical.
+    #[test]
+    fn volume_uses_the_pulseaudio_cubic_curve() {
+        // Unity and silence are exact fixed points.
+        assert_eq!(pulse_linear_gain(1.0), 1.0);
+        assert_eq!(pulse_linear_gain(0.0), 0.0);
+        // 44 % → −21.4 dB, NOT −7.1 dB (the +14 dB "much louder" bug).
+        let g = pulse_linear_gain(0.44);
+        assert!((g - 0.085_184).abs() < 1e-6, "0.44 → {g}");
+        let db = 20.0 * g.log10();
+        assert!((db - (-21.4)).abs() < 0.1, "0.44 → {db} dB");
+        // 50 % is the textbook −18.06 dB (not −6 dB).
+        let g50 = pulse_linear_gain(0.5);
+        assert!((20.0 * g50.log10() - (-18.06)).abs() < 0.05);
+        // Boost above unity stays proportional (150 % = +10.6 dB).
+        assert!((20.0 * pulse_linear_gain(1.5).log10() - 10.57).abs() < 0.05);
+        // Python truncates the percentage (`int(volume * 100)`): 0.339 must
+        // behave exactly like 0.33.
+        assert_eq!(pulse_linear_gain(0.339), pulse_linear_gain(0.33));
+        // Degenerate inputs never panic or produce a NaN gain.
+        assert_eq!(pulse_linear_gain(f32::NAN), 1.0);
+        assert_eq!(pulse_linear_gain(f32::INFINITY), 1.0);
+        assert_eq!(pulse_linear_gain(-1.0), 0.0);
     }
 }

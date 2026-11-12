@@ -257,6 +257,9 @@ class IpcAudioEngine:
         self._meter_sync_running = False
         self._meter_poll_counter = 0
 
+        # Last `degraded` report of an apply (see `_report_graph_health`).
+        self.degraded: bool = False
+
     # ------------------------------------------------------------------ IPC
     def _connect(self, timeout: Optional[float] = None) -> socket.socket:
         """Open a fresh Unix-socket connection to the daemon.
@@ -444,9 +447,42 @@ class IpcAudioEngine:
         result = self._request(METHOD_APPLY_SNAPSHOT, payload, retries=0)
         applied = int((result or {}).get("applied", len(strips)))
         logger.info("start_engine: applied snapshot (%d strips)", applied)
+        self._report_graph_health(result)
         # The snapshot may have (re)built FX chains, so the metering sources
         # have to be re-read before the first meter poll.
         self._sync_meter_sources()
+
+    def _report_graph_health(self, result):
+        """Log the daemon's `degraded`/`pending` report of an apply.
+
+        The daemon never fails a snapshot because one device is missing: it
+        records the incomplete items (device not enumerated yet, route whose
+        ports never appeared, FX chain that could not be anchored), keeps the
+        rest of the graph running, retries them in the background and reports
+        them here.  Surfacing that in the log is what turns a graph that
+        "sounds wrong but looks fine" into a diagnosable message — the exact
+        situation of the "continuous chopping with the EQ active" report,
+        where nothing was logged as an error.
+
+        Payload (see `holafd` `apply_snapshot`):
+        ``{"applied": n, "running": bool, "degraded": bool, "pending": [{"key",
+        "message"}]}``.
+        """
+        if not isinstance(result, dict):
+            return
+        items = result.get("pending") or []
+        degenerate = bool(result.get("degraded"))
+        self.degraded = degenerate
+        if not degenerate:
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            logger.warning(
+                "graph degraded — %s: %s",
+                item.get("key", "?"),
+                item.get("message", ""),
+            )
 
     def shutdown(self):
         """Stop the engine and tear down the audio graph (best effort)."""

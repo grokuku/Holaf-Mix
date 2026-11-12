@@ -157,6 +157,48 @@ Décision de review, implémentée dans `main.py` + `rust_launcher.py` :
   sinon — la décision est donc exprimée à deux niveaux (retour de
   `ensure_daemon_running` + comportement de `stop_daemon`).
 
+### 2.2 Aucun daemon orphelin, quel que soit le mode de mort de l'app
+
+`aboutToQuit` est un signal **Qt** : il ne part que sur une fermeture propre
+(dernière fenêtre fermée, `app.quit()`).  Un `SIGTERM` d'arrêt de session, un
+`SIGHUP` de terminal fermé, un `SIGINT` ou un `kill` ne passent pas par Qt :
+l'app mourait sans nettoyage et `holafd` survivait.  Trois filets imbriqués
+règlent le problème :
+
+1. `main.make_shutdown_all()` reste branché sur `aboutToQuit` (fermeture
+   propre) ; la fonction est désormais **idempotente** (verrou pris sans
+   blocage) donc un signal survenant pendant un arrêt propre ne déclenche pas
+   un second teardown ;
+2. `src/backend/signal_shutdown.py` installe des handlers `SIGTERM`,
+   `SIGINT`, `SIGHUP` qui exécutent ce même teardown puis demandent à la
+   boucle Qt de sortir (`app.quit()`) — l'app sort en code 0.  Un second
+   signal sort immédiatement (code 130), comme `holafd`.  Deux garde-fous :
+   un **thread watchdog** force la sortie (et `kill_daemon_now()`, sans verrou)
+   si le teardown ne finit pas, et un **lecteur de wakeup fd**
+   (`signal.set_wakeup_fd`) arme ce watchdog même quand le thread principal est
+   bloqué dans du code C (boucle Qt au repos) ;
+3. **PR_SET_PDEATHSIG** : `holafd` est lancé avec
+   `prctl(PR_SET_PDEATHSIG, SIGTERM)` (`rust_launcher._make_pdeathsig_preexec`),
+   donc le **noyau** le termine quand l'app meurt — y compris sur `SIGKILL`, où
+   aucun handler ne peut s'exécuter.  Le `fork` est fait depuis un thread
+   permanent (`holafd-spawner`) car PDEATHSIG est lié au **thread** qui fork ; le
+   fils garde la session/groupe de l'app (donc Ctrl-C et signaux de terminal
+   l'atteignent aussi) ; `$HOLAF_NO_PDEATHSIG=1` désactive le filet (debug).
+
+Un daemon **préexistant** (`spawned_by_us=False`) n'est jamais concerné : le
+filet noyau n'est armé qu'au moment du spawn, et `kill_daemon_now()` comme
+`stop_daemon()` ne touchent que le `_process` du module.
+
+Preuves automatisées : `tests/test_daemon_lifecycle.py` — dont deux tests
+**live** (vrai `holafd` + vrai PipeWire) qui tuent l'app en `SIGKILL` puis en
+`SIGTERM`/`SIGHUP`/`SIGINT` et vérifient la mort du daemon (< 2 s), le code de
+sortie 0 et l'absence de nœud `Holaf_*` résiduel :
+
+```bash
+eval "$(./scripts/start-pipewire-headless.sh --export)"
+python3 -m unittest tests.test_daemon_lifecycle -v
+```
+
 ---
 
 ## 3. Comment tester chaque brique

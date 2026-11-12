@@ -86,6 +86,28 @@ pub fn is_physical(strip: &Strip) -> bool {
         .unwrap_or(false)
 }
 
+/// The single node a strip's audio crosses — its **master node**: the physical
+/// device for a physical strip, the `Holaf_Strip_<uid>` null-sink otherwise.
+///
+/// Three call sites derive it and they must never diverge:
+///
+/// 1. volume / mute are pushed to it (`Props.channelVolumes`);
+/// 2. an FX chain is **anchored** to it — an output chain's playback stream
+///    drives it (`target.object`), an input chain's capture stream reads it;
+/// 3. it is the endpoint of the *intra-strip* link
+///    (`output.Holaf_FX_<uid>` → master / master → `input.Holaf_FX_<uid>`).
+///
+/// It is a pure function of the strip (never of the engine state) on purpose:
+/// the reconciler must be able to resolve it *before* the strip has been
+/// published in its own state map — that lookup was empty during the first
+/// `apply_snapshot`, so no strip's volume was ever applied at startup.
+pub fn master_node_name(strip: &Strip) -> String {
+    match strip.device_name.as_deref().filter(|d| !d.is_empty()) {
+        Some(device) => device.to_string(),
+        None => strip_node_name(&strip.uid),
+    }
+}
+
 /// PulseAudio/PipeWire name of a sink node's monitor stream, `<node>.monitor`.
 ///
 /// The `pipewire-pulse` server synthesises one monitor source per sink under
@@ -276,6 +298,26 @@ mod tests {
             route_target_candidates(&out),
             vec!["Holaf_Strip_vo", "input.Holaf_FX_vo"]
         );
+    }
+
+    #[test]
+    fn master_node_name_is_device_or_strip_sink() {
+        // Virtual strips own a null-sink.
+        let virt = Strip::with_uid("v1", "Web", StripType::Input);
+        assert_eq!(master_node_name(&virt), "Holaf_Strip_v1");
+        // Physical strips address the device node in both kinds (an output
+        // chain drives the device, an input chain reads it).
+        let mut phys_out = Strip::with_uid("p1", "Casque", StripType::Output);
+        phys_out.device_name = Some("alsa_output.usb-headset".into());
+        assert_eq!(master_node_name(&phys_out), "alsa_output.usb-headset");
+        let mut phys_in = Strip::with_uid("p2", "Mic", StripType::Input);
+        phys_in.device_name = Some("alsa_input.usb-mic".into());
+        assert_eq!(master_node_name(&phys_in), "alsa_input.usb-mic");
+        // An empty device_name means virtual (same convention as is_physical)
+        // — never an empty node name.
+        let mut blank = Strip::with_uid("b1", "B", StripType::Output);
+        blank.device_name = Some(String::new());
+        assert_eq!(master_node_name(&blank), "Holaf_Strip_b1");
     }
 
     #[test]

@@ -192,8 +192,7 @@ impl PipeWireBackend {
 
 /// Worker-thread loop: serve the PipeWire mainloop **and** the order queue.
 ///
-/// # Why the loop does not block on `recv()`
-///
+/// # Why the loop does not block on `recv()`///
 /// This thread owns the `Context`/`Core`/`MainLoop`, and the filter-chain
 /// modules of the strips are loaded **into this context**
 /// ([`Engine::create_chain`] → `pw_context_load_module`).  A module's two
@@ -239,9 +238,29 @@ fn worker_loop(rx: Receiver<WorkerMsg>, mut engine: Engine) {
             if engine.pump_mainloop(IDLE_PUMP_TIMEOUT) < 0 {
                 thread::sleep(Duration::from_millis(1));
             }
+            if engine.repair_due() {
+                // Finish whatever the last snapshot could not build (a device
+                // that appeared late, ports published late …) without waiting
+                // for another client order.
+                engine.repair_pending();
+            }
+        } else if let Some(delay) = engine.repair_delay() {
+            // Nothing of ours runs in this process, but the graph is
+            // incomplete: wake up for the next order *or* the repair deadline,
+            // whichever comes first (no mainloop pumping needed here).
+            match rx.recv_timeout(delay.max(Duration::from_millis(1))) {
+                Ok(msg) => {
+                    if run_order(&mut engine, msg) == Flow::Stop {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => engine.repair_pending(),
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         } else {
-            // Nothing of ours runs in this process: block on the channel
-            // (zero CPU) and wake up as soon as an order arrives.
+            // Nothing of ours runs in this process and the graph is complete:
+            // block on the channel (zero CPU) and wake up as soon as an order
+            // arrives.
             match rx.recv() {
                 Ok(msg) => {
                     if run_order(&mut engine, msg) == Flow::Stop {
