@@ -36,30 +36,42 @@ It features a persistent UI, robust routing logic, and full **MIDI Bidirectional
 
 ## Tech Stack
 
-*   **Language**: Python 3.10+
+*   **Language**: Python 3.10+ (UI) + Rust (audio core daemon `holafd`)
 *   **GUI**: PySide6 (Qt)
-*   **Audio Backend**: PipeWire (via `pw-cli` and `pw-dump` wrappers) + `sounddevice` (for VU meters)
+*   **Audio Backend**: Rust `holafd` daemon over a Unix-socket NDJSON protocol
+    (PipeWire via `pipewire-rs`).  Classic Python engine available as opt-out
+    (PipeWire via `pw-cli`/`pw-dump`) — `sounddevice` is used for VU meters in
+    both modes.
 *   **MIDI**: `mido` + `python-rtmidi`
 
-## Rust rewrite (expérimental)
+## Rust audio core (mode par défaut)
 
-> ⚠️ **Work in progress — n'affecte pas le comportement par défaut.**
-
-Un daemon **`holafd`** écrit en Rust (`rust/`, workspace cargo) est en cours de
-réécriture du cœur audio.  Il est **inactif par défaut** ; pour l'essayer :
+Le cœur audio est un daemon **`holafd`** écrit en Rust (`rust/`, workspace
+cargo).  **C'est le mode par défaut** : `main.py` le lance au démarrage
+(`holafd --backend pipewire`) et lui parle en NDJSON sur un socket Unix.
 
 ```bash
-cd rust && cargo build --release -p holafd
-cd .. && HOLAF_USE_RUST=1 python main.py
+# build de dev : publie dist/holafd (build.sh le fait aussi automatiquement)
+./scripts/build_rust.sh
+python main.py                     # → daemon Rust (défaut)
 ```
 
-Il faut un backend `holafd` qui réponde (`--backend fake` par défaut dans le
-launcher Python) ; le backend PipeWire réel (J1/J2) arrivera sur machine avec
-PipeWire.  État détaillé des jalons (J0–J5), commandes de test et incertitudes
-API pipewire-rs : [`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md),
-avec la spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
-Sans `HOLAF_USE_RUST=1`, `main.py` utilise l'`AudioEngine` Python classique,
-inchangé.
+*   **Opt-out** — `HOLAF_USE_PYTHON=1 python main.py` : `AudioEngine` Python
+    classique (aucun daemon lancé).  `HOLAF_USE_RUST=0` reste accepté.
+*   **Repli** — si le daemon ne peut pas démarrer (binaire absent, socket
+    occupé, daemon mort au boot), l'app **logue un WARNING**, affiche la raison
+    dans la barre de statut et bascule sur le moteur Python : le repli n'est
+    jamais silencieux.
+*   **Debug sans audio** — `HOLAFD_BACKEND=fake python main.py` (moteur en
+    mémoire) ; `$HOLAFD_BIN` / `$HOLAF_SOCKET` surchargent binaire et socket.
+*   **Packagé** — les bundles PyInstaller embarquent `holafd` (résolu dans le
+    dossier de l'app ou dans `sys._MEIPASS`) : le tarball fonctionne sans Rust
+    installé.
+
+Le MIDI, les VU-mètres et la découverte devices/apps (`pw-dump`/`pactl`) sont
+encore côté Python.  État détaillé des jalons (J0–J5), commandes de test et
+incertitudes API pipewire-rs : [`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md),
+spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
 
 ## Installation
 
@@ -75,10 +87,17 @@ inchangé.
     ```bash
     pip install -r requirements.txt
     ```
+    The Rust daemon also needs a Rust toolchain (and the PipeWire dev headers
+    for `bindgen`) — or use a packaged build, which embeds `holafd`:
+    ```bash
+    ./build.sh --tarball        # builds holafd + the PyInstaller bundle
+    ```
 
 3.  **Run the application**:
     ```bash
-    python main.py
+    python main.py             # Rust backend by default
+    # or, without a Rust daemon:
+    HOLAF_USE_PYTHON=1 python main.py
     ```
 
 ## Usage

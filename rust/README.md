@@ -1,9 +1,11 @@
 # rust/ — Réécriture Rust du cœur de Holaf-Mix
 
 Workspace cargo du **daemon `holafd`** et de son client CLI **`holafctl`**.  L'UI
-Python (PySide6) reste inchangée : en mode expérimental (`HOLAF_USE_RUST=1`)
-elle parle au daemon en NDJSON sur socket Unix au lieu de piloter PipeWire
-directement.
+Python (PySide6) parle au daemon en NDJSON sur socket Unix au lieu de piloter
+PipeWire directement — **c'est le mode par défaut** de Holaf-Mix (repli
+`AudioEngine` Python si le daemon ne démarre pas, opt-out
+`HOLAF_USE_PYTHON=1`) : voir §9 de la spec et §0 de
+[`docs/rust-rewrite-status.md`](../docs/rust-rewrite-status.md).
 
 La spec complète (modèle, contrat IPC, mapping FX, jalons) est dans
 [`docs/rust-rewrite-spec.md`](../docs/rust-rewrite-spec.md).  L'état courant des
@@ -127,8 +129,8 @@ pipewire-rs).
 * **J0** ✅ `holaf-core` : modèle, FX, migrations, SPA-JSON.  69 tests.
 * **J1 / J2** ✅ spike + `holaf-pw` réel (reconcilieur, `PipeWireBackend`) + `holafd --backend pipewire` — fait sur le conteneur headless (`docs/j2-phase2-pipewire-backend.md`).
 * **J3** ✅ `holaf-ipc` + `holafd` + `holafctl`.  57 tests (146 au total workspace).
-* **J4** ✅ `IpcAudioEngine` Python + `rust_launcher` + bascule `HOLAF_USE_RUST=1`.  21 tests Python (28 après J5 partiel).
-* **J5** ◑ partie sans PipeWire faite : robustesse client (retry borné, timeouts, erreurs `code`/`request_id`), launcher anti-double-spawn + relance si mort, `rust/README.md`, `scripts/build_rust.sh`, doc de bascule.
+* **J4** ✅ `IpcAudioEngine` Python + `rust_launcher`, bascule du backend côté `main.py`.  21 tests Python (62 après J5).
+* **J5** ◑ partie sans PipeWire faite : robustesse client (retry borné, timeouts, erreurs `code`/`request_id`), launcher anti-double-spawn + relance si mort, **mode Rust par défaut + repli Python visible**, packaging (`build.sh` → `scripts/build_rust.sh` → spec PyInstaller, PKGBUILD/.desktop), doc.
 * **Machine utilisateur** 🔴 validation multi-plugins sur devices audio réels (strips physiques), PipeWire ~1.2, hotplug, metering natif.
 
 ## Tester

@@ -19,18 +19,30 @@ alone.  ``DaemonHandle.spawned_by_us`` exposes the same ownership decision as
 a return value of ``ensure_daemon_running()`` so the application can branch
 its exit teardown explicitly.
 
-The daemon binary is located via (in order): ``$HOLAFD_BIN``, the repo's
-``rust/target/release/holafd``, ``rust/target/debug/holafd``, then the ``PATH``
-(``shutil.which``).  Its stdout/stderr are appended to ``<socket>.log`` so
-Rust ``env_logger`` output is easy to inspect after a crash.
+The daemon binary is located via (in order): ``$HOLAFD_BIN``, the
+PyInstaller bundle (frozen app: next to ``sys.executable``, then
+``sys._MEIPASS`` / ``_internal``), the repo's ``rust/target/release/holafd``
+then ``rust/target/debug/holafd``, then the ``PATH`` (``shutil.which``).  Its
+stdout/stderr are appended to ``<socket>.log`` so Rust ``env_logger`` output is
+easy to inspect after a crash.
+
+Frozen (PyInstaller) bundles
+----------------------------
+Onefile bundles extract their payload — including an embedded ``holafd`` —
+into ``sys._MEIPASS`` at every start.  The extracted copy may lose its
+executable bit (the archive can be unpacked without mode preservation),
+so a candidate found there is ``chmod +x``-ed on the fly before use; the same
+helper also covers `onedir` bundles, where ``sys._MEIPASS`` is the
+``_internal/`` directory.  The distributed tarball additionally places
+``holafd`` right next to the ``holaf-mix`` executable, which is the first
+frozen candidate (that copy is never extracted nor copied per launch).
 
 Backend choice
 --------------
-Until the real PipeWire backend lands (J1/J2) only ``fake`` answers orders, so
-the launcher defaults ``holafd --backend fake`` (in-memory engine) — enough to
-validate the full IPC stack.  Override with ``$HOLAFD_BACKEND`` (fake or
-unimplemented).  When the real backend ships, the default becomes the live
-PipeWire backend and the fake remains for tests.
+Rust mode is the application default (see ``main.create_audio_engine``), so the
+launcher starts the **live PipeWire backend**: ``holafd --backend pipewire``.
+``$HOLAFD_BACKEND`` remains an override for debugging and tests (``fake`` for a
+no-audio in-memory engine, see ``docs/rust-rewrite-status.md``).
 """
 
 import logging
@@ -38,9 +50,10 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from .ipc_audio_engine import default_socket_path
 
@@ -59,23 +72,32 @@ class DaemonHandle:
             answering on the socket (launched manually by the user or by an
             earlier process) — in that case the caller must NOT stop it on
             exit.
+        reason: Human-readable explanation when ``ok`` is False ("holafd
+            binary not found", "holafd exited early (code 1)", "timed out
+            waiting for holafd", …).  Empty on success.  This is what the app
+            shows to the user when it degrades to the Python engine, so it
+            must stay actionable and free of secrets.
 
     ``bool(handle)`` mirrors ``ok`` so existing ``if not
     ensure_daemon_running():`` checks keep working while new callers can still
     read ``handle.spawned_by_us`` to decide who owns the teardown.
     """
 
-    __slots__ = ("ok", "spawned_by_us")
+    __slots__ = ("ok", "spawned_by_us", "reason")
 
-    def __init__(self, ok: bool, spawned_by_us: bool):
+    def __init__(self, ok: bool, spawned_by_us: bool, reason: str = ""):
         self.ok = ok
         self.spawned_by_us = spawned_by_us
+        self.reason = reason
 
     def __bool__(self) -> bool:
         return self.ok
 
     def __repr__(self) -> str:
-        return f"DaemonHandle(ok={self.ok!r}, spawned_by_us={self.spawned_by_us!r})"
+        return (
+            f"DaemonHandle(ok={self.ok!r}, spawned_by_us={self.spawned_by_us!r}, "
+            f"reason={self.reason!r})"
+        )
 
 # How long a single liveness probe may block.
 PROBE_TIMEOUT_S = 0.5
@@ -84,6 +106,11 @@ STARTUP_POLL_INTERVAL_S = 0.1
 STARTUP_MAX_WAIT_S = 2.0
 # How long stop_daemon lets a graceful terminate() finish before kill().
 STOP_GRACE_S = 3.0
+
+# Backend the daemon runs by default.  Rust mode is the application default, so
+# the live PipeWire backend is what users get; `fake` stays available through
+# $HOLAFD_BACKEND for debugging and tests (no audio needed).
+DEFAULT_BACKEND = "pipewire"
 
 # The subprocess this module launched (None until ensure_daemon_running runs).
 _process: Optional[subprocess.Popen] = None
@@ -120,13 +147,99 @@ def _daemon_responding(path: str, timeout: float = PROBE_TIMEOUT_S) -> bool:
         sock.close()
 
 
+def _is_executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _ensure_executable(path: str) -> bool:
+    """Return True when ``path`` is an executable file, chmod +x-ing it first.
+
+    PyInstaller onefile bundles extract their payload (including an embedded
+    ``holafd``) into ``sys._MEIPASS`` on every launch.  Depending on how the
+    archive was produced/unpacked the extracted copy may not carry the
+    executable bit, so we restore it here instead of failing to spawn the
+    daemon.  Any filesystem error is swallowed (the caller then just skips
+    this candidate).
+    """
+    if not os.path.isfile(path):
+        return False
+    if os.access(path, os.X_OK):
+        return True
+    try:
+        mode = os.stat(path).st_mode
+        os.chmod(path, mode | 0o111)
+        logger.info("restored the executable bit on %s", path)
+    except OSError as exc:
+        logger.warning("cannot make %s executable: %s", path, exc)
+        return False
+    return os.access(path, os.X_OK)
+
+
+def _frozen_candidate_dirs() -> List[str]:
+    """Directories to probe for a bundled ``holafd`` in a frozen build.
+
+    * the application directory (``sys.executable``'s folder) — where the
+      distribution tarball places ``holafd``, and what PyInstaller uses for
+      ``onedir``'s top level;
+    * ``sys._MEIPASS`` — the onefile extraction dir, also `onedir`'s
+      ``_internal/`` in PyInstaller ≥ 6;
+    * ``<app dir>/_internal`` — explicit fallback for onedir layouts where
+      ``sys._MEIPASS`` is unavailable (older/newer bootloaders).
+    """
+    dirs = []
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    dirs.append(exe_dir)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(os.path.abspath(meipass))
+    dirs.append(os.path.join(exe_dir, "_internal"))
+    # De-duplicate while keeping order.
+    seen = set()
+    ordered = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            ordered.append(d)
+    return ordered
+
+
 def _find_holafd_binary() -> Optional[str]:
-    """Locate the `holafd` executable or return None."""
+    """Locate the `holafd` executable or return None.
+
+    Search order: ``$HOLAFD_BIN`` → frozen bundle (app dir, ``sys._MEIPASS``,
+    ``_internal/``) → ``rust/target/{release,debug}`` (dev checkout) →
+    ``$PATH``.  The resolved path is logged together with the rule that matched,
+    so a startup failure is diagnosable from the log alone.
+    """
     env_bin = os.environ.get("HOLAFD_BIN")
     if env_bin:
-        if os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        # Strict: an explicit path must already be executable.  We never
+        # chmod a file the user named — a typo would otherwise turn an
+        # arbitrary file into an executed "daemon".
+        if _is_executable(env_bin):
+            logger.info("holafd resolved from $HOLAFD_BIN: %s", env_bin)
             return env_bin
-        logger.warning("HOLAFD_BIN=%s is not an executable file; ignoring", env_bin)
+        logger.warning(
+            "HOLAFD_BIN=%s is not an executable file; ignoring", env_bin
+        )
+
+    # Frozen (PyInstaller) bundle: holafd ships *inside* the app directory or
+    # is extracted into _MEIPASS.  Checked before the dev tree on purpose — a
+    # packaged app must use its own pinned daemon, never a leftover build.
+    if getattr(sys, "frozen", False):
+        for directory in _frozen_candidate_dirs():
+            candidate = os.path.join(directory, "holafd")
+            if _ensure_executable(candidate):
+                logger.info(
+                    "holafd resolved from the PyInstaller bundle: %s", candidate
+                )
+                return candidate
+        logger.warning(
+            "frozen app: no bundled holafd next to %s nor in %s — "
+            "falling back to the repo/PATH lookup",
+            os.path.abspath(sys.executable),
+            getattr(sys, "_MEIPASS", "<no _MEIPASS>"),
+        )
 
     # <repo-root>/rust/target/<profile>/holafd  (this file lives at
     # <root>/src/backend/rust_launcher.py, so root is 3 dirs up).
@@ -136,10 +249,17 @@ def _find_holafd_binary() -> Optional[str]:
     target = os.path.join(root, "rust", "target")
     for profile in ("release", "debug"):
         candidate = os.path.join(target, profile, "holafd")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        if _is_executable(candidate):
+            logger.info(
+                "holafd resolved from the dev tree (target/%s): %s",
+                profile,
+                candidate,
+            )
             return candidate
 
     found = shutil.which("holafd")
+    if found:
+        logger.info("holafd resolved from $PATH: %s", found)
     return found
 
 
@@ -198,7 +318,9 @@ def ensure_daemon_running(socket_path: Optional[str] = None) -> DaemonHandle:
       daemon — the caller then owns its teardown and should call
       :func:`stop_daemon` when the process exits.  When a daemon was already
       running before this call (started manually by the user or by another
-      process) it is False and the caller must NOT stop it.
+      process) it is False and the caller must NOT stop it;
+    * ``reason`` explains a failure (empty on success) — see
+      :class:`DaemonHandle`.
 
     Concurrency: the whole locate+spawn+wait sequence runs under a module
     lock, so concurrent callers from the UI thread pool never double-spawn.
@@ -226,11 +348,13 @@ def ensure_daemon_running(socket_path: Optional[str] = None) -> DaemonHandle:
         _daemon_launched_alive()
         _spawning = True
         try:
-            launched = _launch_daemon_locked(path)
+            launched, reason = _launch_daemon_locked(path)
         finally:
             _spawning = False
         # A successful launch is by definition one we performed.
-        return DaemonHandle(ok=launched, spawned_by_us=launched)
+        return DaemonHandle(
+            ok=launched, spawned_by_us=launched, reason=reason
+        )
 
 
 def _owns_daemon_on(path: str) -> bool:
@@ -246,28 +370,29 @@ def _owns_daemon_on(path: str) -> bool:
     return _launched_socket == path
 
 
-def _launch_daemon_locked(path: str) -> bool:
+def _launch_daemon_locked(path: str) -> Tuple[bool, str]:
     """Locate, spawn and wait for the daemon (caller must hold ``_launch_lock``).
 
-    Returns True once the daemon answers on ``path``.  When the binary cannot
-    be found it logs a clear message and returns False **without raising** —
-    the caller (main.py's engine factory) turns that into a user-facing
-    startup error, and tests rely on the False return.
+    Returns ``(ok, reason)``: ``ok`` is True once the daemon answers on
+    ``path``; on failure ``reason`` is a short, user-facing explanation
+    (surfaced by ``main.py`` when it falls back to the Python engine).  Never
+    raises on a missing binary / failed spawn — the caller and the tests rely
+    on that.
     """
     global _process, _launched_socket
 
     binary = _find_holafd_binary()
     if not binary:
-        logger.error(
-            "holafd binary not found (set HOLAFD_BIN or build rust/): "
-            "cannot start the Rust daemon at %s",
-            path,
+        reason = (
+            "holafd binary not found (build it with ./scripts/build_rust.sh, "
+            "or set HOLAFD_BIN)"
         )
-        return False
+        logger.error("%s: cannot start the Rust daemon at %s", reason, path)
+        return False, reason
 
     _remove_stale_socket(path)
 
-    backend = os.environ.get("HOLAFD_BACKEND", "fake")
+    backend = os.environ.get("HOLAFD_BACKEND", DEFAULT_BACKEND)
     log_path = f"{path}.log"
     logger.info("launching %s --socket %s --backend %s (log: %s)", binary, path, backend, log_path)
     try:
@@ -280,7 +405,7 @@ def _launch_daemon_locked(path: str) -> bool:
         log_file.close()  # Child keeps its inherited fd.
     except OSError as exc:
         logger.error("failed to launch holafd: %s", exc)
-        return False
+        return False, f"failed to launch holafd: {exc}"
 
     _process = proc
     _launched_socket = path
@@ -290,7 +415,7 @@ def _launch_daemon_locked(path: str) -> bool:
     while time.monotonic() < deadline:
         if _daemon_responding(path):
             logger.info("holafd is up on %s (pid %s)", path, proc.pid)
-            return True
+            return True, ""
         if proc.poll() is not None:
             logger.error(
                 "holafd exited early (code %s) while starting on %s — see %s",
@@ -298,11 +423,18 @@ def _launch_daemon_locked(path: str) -> bool:
                 path,
                 log_path,
             )
-            return False
+            return (
+                False,
+                f"holafd exited during startup (code {proc.returncode}); "
+                f"see {log_path}",
+            )
         time.sleep(STARTUP_POLL_INTERVAL_S)
 
     logger.error("timed out waiting for holafd on %s (see %s)", path, log_path)
-    return False
+    return (
+        False,
+        f"timed out waiting for holafd on {path}; see {log_path}",
+    )
 
 
 def stop_daemon() -> bool:

@@ -94,8 +94,19 @@ xdg-open dist/icons/holaf-mix-256.png
 ```
 
 This runs:
-1. `pyinstaller packaging/holaf-mix.spec` → `dist/holaf-mix` (onefile binary)
-2. Copies icons next to the binary
+1. `scripts/build_rust.sh` → `dist/holafd` + `dist/holafctl` (Rust audio core).
+   **Best effort**: without a Rust toolchain (or if the build fails) the script
+   logs a warning and continues — you then get a Python-only bundle, and the
+   app falls back to the classic `AudioEngine` at startup.
+2. `pyinstaller packaging/holaf-mix.spec` → `dist/holaf-mix` (onefile binary)
+   with `holafd`/`holafctl` embedded (extracted to `sys._MEIPASS` at launch)
+3. Copies icons next to the binary
+
+To build only the Rust side (e.g. after a `git pull` in `rust/`):
+
+```bash
+./scripts/build_rust.sh          # cargo build --release -p holafd -p holafctl
+```
 
 ### 4. Run it
 
@@ -103,7 +114,11 @@ This runs:
 ./dist/holaf-mix
 ```
 
-The first launch creates `config.json` next to the binary.
+The first launch creates `config.json` next to the binary.  `holafd` is started
+on demand with `--backend pipewire`; if it cannot start, the app logs a WARNING
+and runs the classic Python engine instead (`HOLAF_USE_PYTHON=1` forces that
+mode explicitly).  `./dist/holafctl --help` drives the daemon from a shell
+(`HOLAF_SOCKET` must match — default `/tmp/holaf-$USER.sock`).
 
 ---
 
@@ -125,6 +140,7 @@ makepkg -si
 
 This installs:
 - `/usr/bin/holaf-mix` (executable)
+- `/usr/bin/holafd` + `/usr/bin/holafctl` (Rust audio core, default backend)
 - `/usr/share/applications/holaf-mix.desktop` (KDE menu entry)
 - `/usr/share/icons/hicolor/{16,...,512}x{16,...,512}/apps/holaf-mix.png`
 - `/usr/share/icons/hicolor/scalable/apps/holaf-mix.svg`

@@ -1,31 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  scripts/build_rust.sh — Build the Rust `holafd` daemon and publish it
-#  next to the Python build output.
+#  scripts/build_rust.sh — Build the Rust `holafd` daemon + `holafctl` CLI and
+#  publish them next to the Python build output.
 # ============================================================================
 #
 #  Purpose
 #  -------
-#  J5 (partie sans PipeWire) : le daemon Rust (`holafd`) est un binaire
-#  indépendant que la nouvelle UI « Rust mode » (HOLAF_USE_RUST=1) lance au
-#  besoin.  Ce script le compile en release et le copie à un emplacement
-#  prévu — `dist/holafd` à la racine du dépôt, côte à côte avec la sortie de
-#  `build.sh` (dist/holaf-mix, dist/icons/, …).
+#  Le backend Rust est le mode **par défaut** de Holaf-Mix : `main.py` lance
+#  `holafd` (backend PipeWire) au démarrage.  Ce script compile le daemon et la
+#  CLI en release et les copie à un emplacement prévu — `dist/` à la racine du
+#  dépôt, côte à côte avec la sortie de `build.sh` (dist/holaf-mix,
+#  dist/icons/, …).
 #
-#  Ce script NE MODIFIE PAS `build.sh`.  L'intégration future (quand le
-#  backend PipeWire réel sera stable, J1/J2) consistera à :
-#    1. appeler ce script depuis `build.sh` (ou inliner `cargo build`) juste
-#       avant l'étape PyInstaller ;
-#    2. déclarer le binaire dans packaging/holaf-mix.spec (binaries=…) et/ou
-#       packaging/PKGBUILD pour l'embarquer dans le paquet final.
+#  `build.sh` appelle ce script (étape « Build Rust daemon + CLI ») **avant**
+#  PyInstaller, et `packaging/holaf-mix.spec` embarque ensuite les deux binaires
+#  dans le bundle.  L'appel est best-effort côté build.sh : sans cargo, ou si
+#  la compilation échoue, le build continue en Python seul (l'app se rabattra
+#  sur l'`AudioEngine` classique au démarrage).
 #
 #  Usage
 #  -----
-#      ./scripts/build_rust.sh                 # cargo build --release -p holafd → dist/holafd
+#      ./scripts/build_rust.sh                 # cargo build --release → dist/{holafd,holafctl}
 #      ./scripts/build_rust.sh /tmp/my-dist    # destination personnalisée
-#      HOLAFD_BIN_OUT=dist/holafd ./scripts/build_rust.sh
+#      HOLAFD_BIN_OUT=dist ./scripts/build_rust.sh
 #
-#  Sortie : exit 0 si le binaire a été copié, non-zéro sinon.
+#  Sortie : exit 0 si les binaires ont été copiés, non-zéro sinon.
 # ============================================================================
 
 set -euo pipefail
@@ -43,6 +42,7 @@ if [[ -z "$DEST_DIR" ]]; then
 fi
 
 log() { printf '\033[1;34m[build-rust]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[build-rust]\033[0m %s\n' "$*" >&2; }
 err() { printf '\033[1;31m[build-rust]\033[0m %s\n' "$*" >&2; }
 
 # --- Cargo availability ------------------------------------------------------
@@ -58,24 +58,35 @@ if [[ ! -f "$RUST_DIR/Cargo.toml" ]]; then
 fi
 
 # --- Build -------------------------------------------------------------------
-log "Building holafd (release) in $RUST_DIR ..."
+# holafd  : the daemon the app talks to (default backend: PipeWire)
+# holafctl: the CLI (status / apply-snapshot / volume / meter-sources …)
+log "Building holafd + holafctl (release) in $RUST_DIR ..."
 (
     cd "$RUST_DIR"
-    cargo build --release -p holafd
+    cargo build --release -p holafd -p holafctl
 )
-
-SOURCE_BIN="$RUST_DIR/target/release/holafd"
-if [[ ! -x "$SOURCE_BIN" ]]; then
-    err "expected binary not found after build: $SOURCE_BIN"
-    exit 1
-fi
 
 # --- Publish ----------------------------------------------------------------
 mkdir -p "$DEST_DIR"
-DEST_BIN="$DEST_DIR/holafd"
-cp "$SOURCE_BIN" "$DEST_BIN"
-chmod +x "$DEST_BIN"
+for bin in holafd holafctl; do
+    src="$RUST_DIR/target/release/$bin"
+    if [[ ! -x "$src" ]]; then
+        err "expected binary not found after build: $src"
+        exit 1
+    fi
+    dest="$DEST_DIR/$bin"
+    # Atomic replace: copying straight onto `dest` fails with ETXTBSY when a
+    # daemon is *currently running that file* (a leftover holafd from an
+    # earlier session, or one the dev is testing).  Writing a sibling temp file
+    # and renaming over it always works, and the running process keeps its own
+    # (unlinked) inode untouched.
+    tmp="$dest.tmp.$$"
+    cp "$src" "$tmp"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$dest"
+    log "Published $src → $dest"
+done
 
-log "Published $SOURCE_BIN → $DEST_BIN"
-log "Done. The Rust launcher finds this binary when HOLAFD_BIN=$DEST_BIN is"
-log "not set and no rust/target/release/holafd exists next to the sources."
+log "Done. The app's launcher finds holafd automatically: in a packaged build"
+log "it looks next to the executable / in the PyInstaller bundle first, then"
+log "rust/target/{release,debug}, then \$PATH (\$HOLAFD_BIN overrides all)."

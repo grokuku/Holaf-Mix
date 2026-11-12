@@ -5,12 +5,81 @@ cœur).  La spec technique détaillée vit dans
 [`rust-rewrite-spec.md`](./rust-rewrite-spec.md) ; le guide du développeur Rust
 est dans [`rust/README.md`](../rust/README.md).
 
-Statut : **J5 — partie sans PipeWire terminée.**  **J1 + J2 phase 2 (backend
+Statut : **le backend Rust est le mode PAR DÉFAUT de Holaf-Mix** (voir §0).
+**J5 — partie sans PipeWire terminée.**  **J1 + J2 phase 2 (backend
 PipeWire réel) ont été réalisés sur ce conteneur headless** (PipeWire 0.3.65
 + WirePlumber 0.4.13, plugins LADSPA gate/mbeq/sc4/tap_tubewarmth) : voir
 [`j2-phase2-pipewire-backend.md`](./j2-phase2-pipewire-backend.md).  Les
 seuls points restants dépendent d'une **machine utilisateur avec audio réel**
 (validation multi-plugins sur des devices physiques, PipeWire ~1.2, hotplug).
+
+---
+
+## 0. Mode par défaut : Rust (avec repli Python)
+
+Depuis J5, `main.create_audio_engine()` **préfère le daemon Rust** — plus de
+variable d'environnement à mettre pour en profiter :
+
+```
+  python main.py
+        │
+        ▼
+  HOLAF_USE_PYTHON=1 (ou HOLAF_USE_RUST=0) ? ──── oui ──▶ AudioEngine (Python)
+        │ non (= défaut)                                     (aucun daemon)
+        ▼
+  ensure_daemon_running()  →  holafd --backend pipewire
+        │
+        ├── daemon OK ──▶ IpcAudioEngine (NDJSON sur socket Unix)
+        │
+        └── échec ─────▶ WARNING loggé + raison dans la barre de statut (30 s)
+                         → repli AudioEngine (Python)
+```
+
+* **Opt-out** : `HOLAF_USE_PYTHON=1` force l'`AudioEngine` Python classique (le
+daemon n'est ni sondé, ni lancé). `HOLAF_USE_RUST=0` reste accepté (variante
+historique de J4). `HOLAF_USE_RUST=1` est désormais redondant (= défaut).
+* **Repli, jamais silencieux** : binaire absent, socket inaccessible, daemon
+  qui meurt au démarrage, import IPC cassé → `WARNING` dans le log **et**
+  message persistant dans la barre de statut de la fenêtre (30 s,
+  `FALLBACK_NOTICE_TIMEOUT_MS`), puis `AudioEngine` Python. La raison exacte
+  est attachée à l'engine (`_rust_fallback_reason`) et affichée.
+* **Teardown** : le drapeau `_rust_daemon_spawned_by_us` n'est posé que sur le
+  chemin Rust réussi ; après un repli, `shutdown_all()` ne tente donc **jamais**
+  d'arrêter un daemon que l'app n'a pas lancé (§2.1).
+* **Backend du daemon** : `pipewire` par défaut (`DEFAULT_BACKEND` dans
+  `rust_launcher.py`) ; `HOLAFD_BACKEND=fake` reste l'override de debug/tests.
+
+### 0.1 Résolution du binaire `holafd`
+
+Ordre exact (premier trouvé gagne, chemin loggé au niveau INFO) :
+
+1. `$HOLAFD_BIN` (doit déjà être exécutable — on ne `chmod` jamais un fichier
+   nommé par l'utilisateur) ;
+2. **app gelée (PyInstaller)** : dossier de `sys.executable` (le tarball y place
+   `holafd`), puis `sys._MEIPASS` (extraction onefile = `_internal/` en onedir),
+   puis `<app>/_internal` ; un candidat sans bit exécutable est rendu exécutable
+   (`chmod +x`) à la volée (l'extraction onefile peut perdre le mode) ;
+3. arbre de dev : `rust/target/release/holafd` puis `debug/` ;
+4. `$PATH` (`shutil.which`).
+
+Le socket reste `$HOLAF_SOCKET` sinon `/tmp/holaf-$USER.sock` ; le socket
+périmé n'est supprimé que si personne n'y répond, et `stop_daemon()` ne retire
+que celui créé pour un daemon qu'il possède.
+
+### 0.2 Ce qui reste côté Python
+
+Même en mode Rust, restent dans le processus Python (choix assumé, spec §6) :
+
+* **découverte devices / apps** : `main_window.py` appelle encore
+  `src/backend/pipewire_utils.py` (`pw-dump` / `pactl`) directement — indépendant
+  du moteur, donc fonctionne à l'identique dans les deux modes ;
+* **MIDI** (`midi_engine.py`, `mido` + `python-rtmidi`) ;
+* **VU-mètres** : `MeteringEngine` (sounddevice + `PULSE_SOURCE`) alimenté par
+  les noms de sources renvoyés par le daemon (`meter.sources`) ;
+* **UI Qt** évidemment, et la config (`config.json`, migrations côté daemon).
+
+Conséquence : le mode Rust sert l'**état et le graphe audio** ; migrer la
+discovery dans le daemon est le reste du J5 (voir §4).
 
 ---
 
@@ -23,13 +92,14 @@ seuls points restants dépendent d'une **machine utilisateur avec audio réel**
 | **J2** | `holaf-pw` réel derrière trait `Backend` (déplacé dans holaf-core), reconcilieur de graphe, routing, volume/mute, metadata, cleanup, `holafd --backend pipewire` | ✅ **fait (conteneur headless)** | `cargo test --workspace` 146 verts + `cargo test -p holaf-pw --test backend_live` (voir docs/j2-phase2-pipewire-backend.md) |
 | **J3** | `holaf-ipc` + `holafd` (serveur socket NDJSON) + `holafctl` | ✅ **fait** | `cargo test -p holaf-ipc -p holafd -p holafctl` : **57 tests** verts |
 | **J4** | `IpcAudioEngine` Python (même surface publique qu'`AudioEngine`), `rust_launcher`, bascule `HOLAF_USE_RUST=1` | ✅ **fait** | `python -m unittest discover -s tests -v` : **21 tests** verts |
-| **J5** | **Partie sans PipeWire** : robustesse client (retry, timeouts, erreurs structurées), launcher anti-double-spawn/relance, packaging & doc | ◑ **partiel** | 28 tests Python verts + doc (voir §2) |
+| **J5** | **Partie sans PipeWire** : robustesse client (retry, timeouts, erreurs structurées), launcher anti-double-spawn/relance, packaging & doc, **bascule en mode par défaut + repli Python** | ✅ **fait** | 62 tests Python verts (dont 21 de sélection backend/résolution), E2E headless : daemon `--backend pipewire` par défaut, nœuds `Holaf_*` créés puis nettoyés |
 | **J5 (metering)** | VU-mètres avec le backend Rust : `meter.sources` (uid → nom de source), `IpcAudioEngine.get_meter_levels` sur `MeteringEngine` local, durcissement `metering.py` (staleness, backoff, re-probe PortAudio) | ✅ **fait** | `holafctl meter-sources`, E2E sine → niveaux 1.0/0.0 |
-| **J5 (suite)** | hotplug devices, metering natif optionnel, intégration binaire Rust dans `build.sh`/`.desktop` | 🔴 reste à faire (dépend en partie de J1/J2) | — |
+| **J5 (suite)** | hotplug devices, metering natif optionnel, discovery devices/apps migrée dans le daemon | 🔴 reste à faire (dépend en partie de J1/J2) | — |
 
 Total workspace Rust : **151 tests** (`cargo test`), tous verts avec un daemon
 PipeWire headless (sans lui, les 2 tests live `backend_live` sont skippés).
-Tests Python (client IPC + launcher + metering) : **41 tests** verts.
+Tests Python (client IPC + launcher + metering + sélection backend) : **62
+tests** verts.
 
 ---
 
@@ -76,7 +146,7 @@ Décision de review, implémentée dans `main.py` + `rust_launcher.py` :
     `False` quand un daemon tournait **déjà** avant l'app (lancé manuellement
     par l'utilisateur ou une session précédente).  Un daemon préexistant n'est
     donc jamais « possédé » par l'app.
-* `main.py` (mode `HOLAF_USE_RUST=1`) mémorise ce flag sur l'engine
+* `main.py` (mode Rust, désormais par défaut) mémorise ce flag sur l'engine
   (`IpcAudioEngine._rust_daemon_spawned_by_us`) et, dans `shutdown_all()`
   (connecté à `QApplication.aboutToQuit`), appelle
   `rust_launcher.stop_daemon()` **uniquement si** `spawned_by_us` — et
@@ -132,26 +202,32 @@ cd rust
 # charge config.json, migre, imprime le plan de graphe, exit 0
 ```
 
-### 3.4 Bascule UI sur le mode Rust (J4)
+### 3.4 Lancer l'UI (mode Rust par défaut)
 
 ```bash
 cd rust && cargo build --release -p holafd        # binaire dispo pour le launcher
 cd ..                                              # racine du dépôt
-HOLAF_USE_RUST=1 python main.py                    # UI branchée sur IpcAudioEngine
+python main.py                                     # UI branchée sur IpcAudioEngine
+HOLAF_USE_PYTHON=1 python main.py                  # opt-out : AudioEngine Python
+HOLAFD_BACKEND=fake python main.py                 # daemon en mémoire (debug, sans audio)
 ```
 
 Le launcher (`src/backend/rust_launcher.py`) localise `holafd` dans l'ordre :
-`$HOLAFD_BIN` → `rust/target/release/holafd` → `rust/target/debug/holafd` →
-`PATH`.  Backend contrôlé par `$HOLAFD_BACKEND` (`fake` par défaut).  Le socket
-est `$HOLAF_SOCKET` sinon `/tmp/holaf-$USER.sock`.  **Sans `HOLAF_USE_RUST=1`
-le comportement par défaut (AudioEngine Python classique) est intact.**
+`$HOLAFD_BIN` → bundle PyInstaller (dossier de l'exécutable, `sys._MEIPASS`,
+`_internal/`) → `rust/target/release/holafd` → `rust/target/debug/holafd` →
+`PATH`.  Backend du daemon : `pipewire` par défaut, `$HOLAFD_BACKEND` en
+override.  Le socket est `$HOLAF_SOCKET` sinon `/tmp/holaf-$USER.sock`.
+**Sans variable d'environnement, c'est le mode Rust ; en cas d'échec du daemon
+l'app se rabat sur l'`AudioEngine` Python avec un WARNING visible (§0).**
 
-### 3.5 Tests Python (J4 + robustesse J5)
+### 3.5 Tests Python (J4 + robustesse J5 + sélection backend)
 
 ```bash
 python -m unittest discover -s tests -v
-# 28 tests : conversion strip→schéma Rust, enveloppe NDJSON, erreurs,
-# retry borné sur connexion coupée, request_id, launcher anti-double-spawn.
+# 62 tests : conversion strip→schéma Rust, enveloppe NDJSON, erreurs,
+# retry borné sur connexion coupée, request_id, launcher anti-double-spawn,
+# sélection du backend (défaut Rust / opt-out / repli) et résolution du binaire
+# (dev, frozen + _MEIPASS, chmod, $HOLAFD_BIN).
 ```
 
 ---
@@ -166,11 +242,15 @@ python -m unittest discover -s tests -v
    * hotplug devices (événements `device_list_changed`, rescan) ;
    * metering natif optionnel (spec §6) — le metering Python est désormais
      alimenté par le daemon (`meter.sources`), un metering natif reste optionnel ;
-   * intégrer `scripts/build_rust.sh` dans `build.sh` et embarquer `holafd`
-     dans `packaging/holaf-mix.spec` / PKGBUILD / `.desktop` ;
    * migrer la discovery devices/apps de la UI (`pipewire_utils`) vers le
      daemon (actuellement l'UI appelle encore `pipewire_utils` directement).
-3. **J5 — polish** : purge des sockets/zombies résiduels au démarrage, tests
+3. **Packaging (fait)** : `build.sh` appelle `scripts/build_rust.sh` avant
+   PyInstaller, `packaging/holaf-mix.spec` embarque `holafd`+`holafctl`,
+   `PKGBUILD` et `.desktop` les installent à côté du binaire, la CI construit le
+   daemon avant les étapes Python.  Reste à valider la **machine utilisateur** :
+   un tarball/paquet réel doit trouver son `holafd` embarqué (log INFO
+   « holafd resolved from the PyInstaller bundle »).
+4. **J5 — polish** : purge des sockets/zombies résiduels au démarrage, tests
    de charge IPC, logging `RUST_LOG` réglable depuis l'app.
 
 ---

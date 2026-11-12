@@ -21,22 +21,25 @@
 #
 #  Output: two INDEPENDENT artifact sets
 #
-#    Python build (legacy, still the user-facing app):
+#    Python build (the user-facing app — now WITH the Rust daemon inside):
 #      holaf-mix-{sha}-{arch}
-#        holaf-mix-{version}-{arch}.tar.gz  (the distributable bundle)
+#        holaf-mix-{version}-{arch}.tar.gz  (the distributable bundle; it
+#                                            embeds holafd/holafctl, see
+#                                            packaging/holaf-mix.spec)
 #        SHA256SUMS
 #
-#    Rust build (daemon + CLI, J5 — becoming the new core):
+#    Rust build (daemon + CLI, standalone):
 #      holaf-rust-{sha}-{arch}
 #        holafd, holafctl                    (release binaries, stripped)
 #        holaf-rust-{arch}.tar.gz            (both binaries in one tarball)
 #
-#  Why two separate artifacts (and not one merged bundle)?
-#    The Rust workspace is young; the Python app is what users run today.
-#    Keeping them in separate upload steps means a broken Rust build never
-#    prevents the Python bundle from being published (and vice-versa).
-#    When the Rust rewrite is validated, the Python steps can be deleted
-#    without touching the Rust ones.
+#  Why the Rust build runs first (and before PyInstaller)
+#    The Rust daemon is Holaf-Mix's DEFAULT audio backend, so the packaged app
+#    must contain it: build.sh builds/publishes dist/holafd + dist/holafctl and
+#    the PyInstaller spec embeds them.  Independence is preserved differently:
+#    build.sh treats the Rust step as best-effort (log + continue), so a cargo
+#    failure yields a Python-only bundle that falls back to the classic engine
+#    at startup, and the two upload steps stay gated independently.
 # ============================================================================
 
 name: Build Holaf-Mix
@@ -80,6 +83,12 @@ jobs:
       # Skip the safety guard inside the CI container (no display, no host)
       HOLAF_BUILD_INSTALL_DEPS: '1'
       DEBIAN_FRONTEND: noninteractive
+      # bindgen (libspa-sys / pipewire-sys) needs libclang. Arch puts
+      # libclang.so in /usr/lib (no versioned subdir) and clang-sys' search
+      # order is not exhaustive, so we point at it explicitly. Job-wide on
+      # purpose: build.sh now invokes scripts/build_rust.sh itself, i.e. cargo
+      # also runs from *inside* the Python build steps.
+      LIBCLANG_PATH: /usr/lib
 
     steps:
       # ------------------------------------------------------------------
@@ -243,41 +252,14 @@ jobs:
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
-      # 2. Build (using the project's own build.sh, with safety bypass)
-      # ------------------------------------------------------------------
-      - name: Build (onefile)
-        if: ${{ github.event.inputs.mode != 'onedir' && github.event.inputs.mode != 'both' || github.event.inputs.mode == '' }}
-        run: |
-          # Activate the venv so the same python3 that has the packages
-          # is the one build.sh calls.
-          # shellcheck disable=SC1091
-          source /opt/holaf-venv/bin/activate
-          chmod +x build.sh assets/icons/build_icons.sh
-          ./build.sh --tarball
-        env:
-          # Build inside the CI container: bypass the host-install guards.
-          HOLAF_BUILD_INSTALL_DEPS: '1'
-
-      - name: Build (onedir, fast launch)
-        if: ${{ github.event.inputs.mode == 'onedir' || github.event.inputs.mode == 'both' }}
-        run: |
-          # Activate the venv too: each `run:` is a fresh shell, so the
-          # activation done in the onefile step does NOT carry over. Without
-          # this, `pyinstaller` is not found when mode=onedir/both.
-          # shellcheck disable=SC1091
-          source /opt/holaf-venv/bin/activate
-          chmod +x build.sh assets/icons/build_icons.sh
-          ./build.sh --onedir --tarball
-        env:
-          HOLAF_BUILD_INSTALL_DEPS: '1'
-
-      # ------------------------------------------------------------------
-      # 3. Rust build (daemon + CLI)
-      #    Runs AFTER the Python build (so a Rust breakage can never block the
-      #    Python artifact — see the upload steps) and BEFORE the Python smoke
-      #    tests, so each toolchain gets its own shell/env. Output lands in
-      #    dist/ next to the Python bundle; the "Fold" step below then injects
-      #    holafd/holafctl into the already-built Python tarball.
+      # 2. Rust build (daemon + CLI)
+      #    Runs BEFORE the PyInstaller steps on purpose: the Rust daemon is the
+      #    app's DEFAULT audio backend, and packaging/holaf-mix.spec embeds
+      #    holafd/holafctl into the bundle, so the binaries must already exist
+      #    in dist/.  build.sh also invokes scripts/build_rust.sh itself and
+      #    tolerates a failure (Python-only bundle), so a Rust breakage still
+      #    cannot cost us the Python artifact — see the upload steps.
+      #    Each toolchain gets its own shell/env from here on.
       # ------------------------------------------------------------------
       - name: Diagnose Rust build toolchain (PipeWire / libclang / bindgen)
         # Cheap, best-effort one-stop diagnostic for the *whole* FFI chain, run
@@ -341,11 +323,7 @@ jobs:
         # resolves in this fresh shell with no export and no $GITHUB_PATH
         # entry. Never prepend a custom PATH before this step: it could
         # shadow /usr/bin/cargo with a stale/partial toolchain.
-        # LIBCLANG_PATH: Arch puts libclang.so in /usr/lib (no versioned
-        # subdir); bindgen's clang-sys search order is not exhaustive, so we
-        # point at it explicitly — harmless when unnecessary.
-        env:
-          LIBCLANG_PATH: /usr/lib
+        # LIBCLANG_PATH comes from the job env (see top of the job).
         run: |
           set -euo pipefail
           cd rust
@@ -428,44 +406,35 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: Fold Rust binaries into the Python bundle
-        # build.sh's make_tarball() already copies dist/holafd + dist/holafctl
-        # into the bundle *when they exist* — but in this workflow the Python
-        # build runs BEFORE the Rust build (deliberately: a Rust failure must
-        # not block the Python artifact). So we repack the already-built
-        # tarball here, in place. Result: one download contains the Python app
-        # AND the Rust daemon/CLI (HOLAF_USE_RUST=1 works out of the box).
-        # Tolerant: if no tarball exists (build failed / mode skipped), it
-        # does nothing and never fails the job.
+      # ------------------------------------------------------------------
+      # 3. Build (using the project's own build.sh, with safety bypass)
+      # ------------------------------------------------------------------
+      - name: Build (onefile)
+        if: ${{ github.event.inputs.mode != 'onedir' && github.event.inputs.mode != 'both' || github.event.inputs.mode == '' }}
         run: |
-          set -uo pipefail
-          shopt -s nullglob
-          tarballs=(dist/holaf-mix-*.tar.gz)
-          if ((${#tarballs[@]} == 0)); then
-            echo "No Python tarball in dist/ — nothing to fold into."
-            exit 0
-          fi
-          if [[ ! -x dist/holafd || ! -x dist/holafctl ]]; then
-            echo "Rust binaries missing — leaving the Python tarball as-is."
-            exit 0
-          fi
-          for tb in "${tarballs[@]}"; do
-            workdir=$(mktemp -d)
-            tar -xzf "$tb" -C "$workdir"
-            # The staging root is holaf-mix-<version>/ (see build.sh)
-            root="$(find "$workdir" -mindepth 1 -maxdepth 1 -type d | head -1)"
-            if [[ -z "$root" ]]; then
-              echo "::warning::$tb has no top-level directory — skipping"
-              rm -rf "$workdir"
-              continue
-            fi
-            cp dist/holafd dist/holafctl "$root/"
-            chmod +x "$root/holafd" "$root/holafctl"
-            tar -czf "$tb" -C "$workdir" "$(basename "$root")"
-            rm -rf "$workdir"
-            echo "Repacked $tb — Rust entries now inside:"
-            tar -tzf "$tb" | grep -E '(holafd|holafctl)$' || echo "  (none!)"
-          done
+          # Activate the venv so the same python3 that has the packages
+          # is the one build.sh calls.
+          # shellcheck disable=SC1091
+          source /opt/holaf-venv/bin/activate
+          chmod +x build.sh assets/icons/build_icons.sh
+          ./build.sh --tarball
+        env:
+          # Build inside the CI container: bypass the host-install guards.
+          HOLAF_BUILD_INSTALL_DEPS: '1'
+
+      - name: Build (onedir, fast launch)
+        if: ${{ github.event.inputs.mode == 'onedir' || github.event.inputs.mode == 'both' }}
+        run: |
+          # Activate the venv too: each `run:` is a fresh shell, so the
+          # activation done in the onefile step does NOT carry over. Without
+          # this, `pyinstaller` is not found when mode=onedir/both.
+          # shellcheck disable=SC1091
+          source /opt/holaf-venv/bin/activate
+          chmod +x build.sh assets/icons/build_icons.sh
+          ./build.sh --onedir --tarball
+        env:
+          HOLAF_BUILD_INSTALL_DEPS: '1'
+
 
       - name: cargo test (workspace)
         # No PipeWire daemon is required: the live tests in
@@ -473,8 +442,6 @@ jobs:
         # no headless PipeWire configured") unless XDG_RUNTIME_DIR points at a
         # headless runtime or HOLAF_PW_LIVE=1 is set. Nothing here sets those,
         # so the job stays hermetic on a stock Arch container.
-        env:
-          LIBCLANG_PATH: /usr/lib
         run: |
           set -euo pipefail
           cd rust

@@ -3,16 +3,21 @@
 #  holaf-mix.spec — PyInstaller spec for Holaf-Mix
 # ============================================================================
 #  Build with:
-#      pyinstaller holaf-mix.spec
+#      pyinstaller holaf-mix.spec                       # onefile (default)
+#      HOLAF_BUILD_MODE=onedir pyinstaller holaf-mix.spec
+#  (`build.sh` sets HOLAF_BUILD_MODE itself; both modes are handled below.)
 #
 #  Produces:
-#      dist/holaf-mix/             (when --onedir, the default below)
-#      dist/holaf-mix/holaf-mix    (executable)
-#      dist/holaf-mix/_internal/   (Python + Qt + bundled libs)
+#      onefile : dist/holaf-mix                (single executable; extracted to
+#                                               sys._MEIPASS at launch)
+#      onedir  : dist/holaf-mix/holaf-mix      (executable)
+#                dist/holaf-mix/_internal/     (Python + Qt + bundled libs
+#                                               + the Rust daemon)
 #
-#  To produce a single-file binary instead, change EXE to onefile:
-#      EXE(pyz, a.scripts, a.binaries, a.datas, [], name='holaf-mix', ...)
-#  and remove COLLECT. Note: onefile is slower to start (~1-2s extraction).
+#  The Rust audio daemon (holafd) and CLI (holafctl) are embedded when they
+#  exist in dist/ or rust/target/release/ — see the "Bundled Rust binaries"
+#  block.  Without them the bundle is Python-only and falls back to the
+#  classic engine at startup.
 # ============================================================================
 
 from pathlib import Path
@@ -74,6 +79,38 @@ _hiddenimports = [
 # the data files guarantee `import email.message` will succeed.
 _EMAIL_PKG_PATH = os.path.dirname(_stdlib_email.__file__)
 
+# --- Bundled Rust binaries (holafd + holafctl) -------------------------------
+# The Rust daemon is the DEFAULT audio backend (see main.create_audio_engine),
+# so the packaged app must ship it.  Candidates, first hit wins:
+#   dist/                      <- scripts/build_rust.sh / build.sh publish here
+#   rust/target/release/       <- plain `cargo build --release` (dev)
+# When neither exists (no cargo on the build host) the bundle is Python-only:
+# the app still runs and falls back to the classic engine at startup.
+#
+# Declared as `datas` (not `binaries`) on purpose: PyInstaller dependency-
+# analyses `binaries` entries and would then copy libpipewire/libspa/libpulse
+# into the bundle, where LD_LIBRARY_PATH would make the app load them instead
+# of the user's system libraries — a client library older than the running
+# PipeWire daemon breaks the audio graph.  The daemon must link against the
+# system PipeWire, so the ELFs travel as opaque payload.  They land in
+# sys._MEIPASS (onefile extraction dir, or onedir's _internal/) and
+# src/backend/rust_launcher.py restores the executable bit on first use.
+_RUST_BIN_SOURCES = [ROOT / 'dist', ROOT / 'rust' / 'target' / 'release']
+_rust_data = []
+for _name in ('holafd', 'holafctl'):
+    for _dir in _RUST_BIN_SOURCES:
+        _candidate = _dir / _name
+        if _candidate.is_file():
+            _rust_data.append((str(_candidate), '.'))
+            break
+if not _rust_data:
+    print('[holaf-mix.spec] WARNING: no Rust binaries found in ' \
+          + ', '.join(str(d) for d in _RUST_BIN_SOURCES) \
+          + ' -> Python-only bundle (the app will run the classic engine)')
+else:
+    print('[holaf-mix.spec] bundling Rust binaries: '
+          + ', '.join(Path(src).name for src, _ in _rust_data))
+
 # --- Analysis ----------------------------------------------------------------
 a = Analysis(
     [str(MAIN_PY)],
@@ -90,7 +127,10 @@ a = Analysis(
     # + collect_submodules() + runtime hooks all fail to make `import
     # email.message` work for importlib.metadata. The runtime hook tries
     # first (smaller bundle), but the data files guarantee resolution.
-    datas=[(_EMAIL_PKG_PATH, 'email')],
+    #
+    # `_rust_data` carries the Rust daemon/CLI (holafd, holafctl) — see the
+    # comment block above; empty on a machine without cargo.
+    datas=[(_EMAIL_PKG_PATH, 'email'), *_rust_data],
     # sounddevice loads PortAudio via ctypes, which PyInstaller misses.
     # python-rtmidi has a dynamic backend. These hidden imports force
     # PyInstaller to include the .so modules explicitly.
@@ -131,18 +171,24 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# --- Onefile build -----------------------------------------------------------
-# Faster startup, no COLLECT needed. Good for a single-user install.
-exe_onefile = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+# --- Build mode --------------------------------------------------------------
+# Onefile (default, single binary) or onedir (multi-file, faster launch).
+# Selected by $HOLAF_BUILD_MODE, which build.sh sets from its --onedir flag.
+# Done here rather than by sed-patching this file (the previous approach
+# commented out individual EXE arguments and produced an invalid spec as soon
+# as its line layout changed).
+BUILD_MODE = os.environ.get('HOLAF_BUILD_MODE', 'onefile').strip().lower()
+if BUILD_MODE not in ('onefile', 'onedir'):
+    raise SystemExit(
+        f"[holaf-mix.spec] invalid HOLAF_BUILD_MODE={BUILD_MODE!r} "
+        "(expected 'onefile' or 'onedir')"
+    )
+print(f'[holaf-mix.spec] build mode: {BUILD_MODE}')
+
+_EXE_COMMON = dict(
     name='holaf-mix',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,        # strip symbols from the bootloader
     upx=True,          # compress with UPX if available
     upx_exclude=[],
     runtime_tmpdir=None,
@@ -155,14 +201,39 @@ exe_onefile = EXE(
     icon=str(ICON_PNG) if ICON_PNG.exists() else None,
 )
 
-# --- Uncomment for an onedir build (faster launch, multi-file dist) ---------
-# COLLECT(
-#     exe_onefile,
-#     a.binaries,
-#     a.zipfiles,
-#     a.datas,
-#     strip=False,
-#     upx=True,
-#     upx_exclude=[],
-#     name='holaf-mix',
-# )
+if BUILD_MODE == 'onefile':
+    # Everything (Python, Qt, and the Rust daemon as data files) is packed into
+    # the executable and extracted to sys._MEIPASS at launch.
+    # NOTE: the result MUST be bound to a name — PyInstaller finds the targets
+    # to build by scanning the spec namespace for EXE/COLLECT instances.
+    exe_onefile = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        strip=True,    # strip symbols from the bootloader
+        **_EXE_COMMON,
+    )
+else:
+    # onedir: the EXE carries no payload (exclude_binaries=True), COLLECT
+    # writes the executable + _internal/ next to it.  holafd/holafctl land in
+    # _internal/ (sys._MEIPASS) and are found there by rust_launcher.
+    exe_onedir = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        strip=False,
+        **_EXE_COMMON,
+    )
+    collected = COLLECT(
+        exe_onedir,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name='holaf-mix',
+    )

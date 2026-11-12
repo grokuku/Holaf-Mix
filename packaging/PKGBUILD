@@ -39,6 +39,10 @@ makedepends=(
     'python-pyinstaller'
     'librsvg2'             # for icon rendering
     'imagemagick'
+    # Rust daemon (holafd) + CLI (holafctl): the daemon is the app's DEFAULT
+    # audio backend and is embedded in the PyInstaller bundle.
+    'rust'
+    'clang'                # bindgen needs libclang.so (libspa-sys)
 )
 optdepends=(
     'rnnoise: AI noise cancellation (librnnoise_ladspa)'
@@ -56,7 +60,14 @@ build() {
     # 1. Generate icons from the source SVG
     ./assets/icons/build_icons.sh
 
-    # 2. Build the standalone executable via PyInstaller
+    # 2. Build the Rust daemon + CLI and publish them to dist/ so that step 3
+    #    embeds them (packaging/holaf-mix.spec reads dist/holafd).
+    #    The daemon is the DEFAULT backend, so failing here would ship an app
+    #    that can only run the classic Python engine — make it a hard error
+    #    (cargo is in makedepends).
+    ./scripts/build_rust.sh
+
+    # 3. Build the standalone executable via PyInstaller
     pyinstaller \
         --noconfirm \
         --clean \
@@ -64,7 +75,7 @@ build() {
         --distpath build/dist \
         packaging/holaf-mix.spec
 
-    # 3. Re-render the .desktop with absolute install paths
+    # 4. Re-render the .desktop with absolute install paths
     sed \
         -e "s|__EXEC_PATH__|/usr/bin|g" \
         -e "s|__ICON_PATH__|/usr/share/holaf-mix/icons|g" \
@@ -84,6 +95,14 @@ package() {
         # Symlink to /usr/bin
         ln -sf /usr/lib/holaf-mix/holaf-mix "$pkgdir/usr/bin/holaf-mix"
     fi
+
+    # --- Rust daemon + CLI (default audio backend) ---
+    # Installed in /usr/bin, i.e. NEXT TO the holaf-mix executable: that is the
+    # first place src/backend/rust_launcher.py probes in a frozen app, so the
+    # packaged daemon is found without any env var.  (It is also embedded in
+    # the PyInstaller bundle; this copy is what holafctl users invoke.)
+    install -Dm755 "dist/holafd"   "$pkgdir/usr/bin/holafd"
+    install -Dm755 "dist/holafctl" "$pkgdir/usr/bin/holafctl"
 
     # --- Icons (all sizes for HiDPI support) ---
     install -dm755 "$pkgdir/usr/share/holaf-mix/icons"
@@ -132,6 +151,8 @@ post_install() {
         update-desktop-database -q /usr/share/applications 2>/dev/null || true
     fi
     echo "==> Holaf-Mix installed. Launch with: holaf-mix"
+    echo "    Audio core: Rust daemon 'holafd' (installed at /usr/bin/holafd,"
+    echo "    started on demand by the app). CLI: holafctl status"
     echo "    Config will be created at: ~/.config/holaf-mix/ on first run"
     # NOTE: the app currently saves config next to the binary.
     # If you want it in ~/.config/, patch src/config/settings.py to use

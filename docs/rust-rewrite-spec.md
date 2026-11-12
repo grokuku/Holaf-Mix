@@ -83,10 +83,17 @@ J1 (10-16h): spike pipewire-rs holaf-spike: connexion, discovery, UNE chaine fil
 J2 (14-20h): holaf-pw complet derrière trait GraphBackend (+FakeBackend), reconcilieur de graphe, routing exclusif, mono, restart local/full, hot-reload, cleanup zombies. Tests Fake.
 J3 (10-16h): holaf-ipc, serveur socket NDJSON, contrat complet, holafctl CLI. Tests IPC.
 J4 (12-18h): IpcAudioEngine Python (même surface publique qu'AudioEngine → main_window.py quasi inchangé), launcher daemon, bascule config.
-J5 (8-12h): hotplug devices, retries/timeouts, packaging daemon+.desktop, metering natif optionnel, doc.
+J5 (8-12h): hotplug devices, retries/timeouts, packaging daemon+.desktop, metering natif optionnel, doc, **bascule en mode par défaut + repli Python (§9)**.
 Total ≈ 60-92 h.
 
 ## 8. Stratégie de test sans PipeWire
 Dès J0 en pur Rust: formateurs SPA golden-testés (fixtures capturées des fonctions Python pures), tables byte-à-byte, migrations from_dict (vieux formats bool/Model/noms courts), config IO rond-tri, serde round-trip, logique routing en mémoire (heuristiques _auto_link_ports sur noms simulés), décisions hot/reload/restart via FakeBackend, IPC NDJSON parse/encode dispatch.
 Mode daemon --check-config: charge config.json, applique migrations, affiche le plan de graphe sans se connecter à PipeWire.
 Seul holaf-pw réel non testable sans serveur → J1/J2 sur machine utilisateur.
+
+## 9. Sélection du backend (mode par défaut = Rust)
+`main.create_audio_engine()` est le **seul** point de choix des deux implémentations du contrat de §4 (toutes deux exposant la même surface publique qu'`AudioEngine`) :
+1. `HOLAF_USE_PYTHON=1` (ou l'ancien `HOLAF_USE_RUST=0`) → `AudioEngine` Python, aucun daemon sondé ni lancé ;
+2. sinon → `rust_launcher.ensure_daemon_running()` puis `IpcAudioEngine`. Le launcher lance `holafd --backend pipewire` (`$HOLAFD_BACKEND` en override) si personne ne répond sur `$HOLAF_SOCKET` / `/tmp/holaf-$USER.sock`, et résout le binaire dans l'ordre : `$HOLAFD_BIN` → bundle PyInstaller (dossier de `sys.executable`, `sys._MEIPASS`, `_internal/`, avec `chmod +x` de secours) → `rust/target/{release,debug}` → `PATH` ;
+3. échec de (2) → WARNING loggé + notice dans la barre de statut + repli sur `AudioEngine` (`engine._rust_fallback_reason` porte la raison). Le repli n'est jamais silencieux et n'arrête jamais un daemon que l'app n'a pas lancé (`spawned_by_us`).
+Le daemon est la source de vérité de l'état audio ; restent côté Python la découverte devices/apps (`pipewire_utils`), le MIDI et le metering (§6).

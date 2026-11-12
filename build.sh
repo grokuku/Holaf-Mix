@@ -2,11 +2,12 @@
 # ============================================================================
 #  build.sh — End-to-end build script for Holaf-Mix
 # ============================================================================
-#  Renders the icon set, builds the standalone executable, and (optionally)
-#  packages everything into a tarball for distribution.
+#  Renders the icon set, builds the Rust daemon (holafd/holafctl), builds the
+#  standalone executable (embedding the daemon), and (optionally) packages
+#  everything into a tarball for distribution.
 #
 #  Usage:
-#    ./build.sh                          # icons + executable
+#    ./build.sh                          # icons + Rust daemon + executable
 #    ./build.sh --install-deps           # install system + Python deps
 #    ./build.sh --icons-only             # just rebuild icons
 #    ./build.sh --run                    # build, then launch the binary
@@ -131,9 +132,9 @@ PYTHON_DEPS=(
 has() { command -v "$1" >/dev/null 2>&1; }
 
 print_help() {
-    # Print the header docblock (lines 2..21 in this file), stripping the
+    # Print the header docblock (lines 2..22 in this file), stripping the
     # leading "# " comment marker that bash sees in the script body.
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- Step implementations ----------------------------------------------------
@@ -276,7 +277,7 @@ check_deps() {
 }
 
 build_icons() {
-    hdr "Step 1/3 — Building icon set"
+    hdr "Step 1/4 — Building icon set"
     if [[ -x "$ROOT_DIR/assets/icons/build_icons.sh" ]]; then
         "$ROOT_DIR/assets/icons/build_icons.sh"
     else
@@ -286,9 +287,51 @@ build_icons() {
     ok "Icons ready in $DIST_DIR/icons/"
 }
 
+build_rust_binaries() {
+    # ========================================================================
+    #  Rust daemon/CLI (holafd + holafctl) — MUST run BEFORE PyInstaller
+    # ========================================================================
+    #  The Rust backend is the app's DEFAULT audio engine, so packaging/
+    #  holaf-mix.spec embeds dist/holafd (+ holafctl) as data files.  If the
+    #  binaries don't exist yet, PyInstaller simply produces a Python-only
+    #  bundle — the app then falls back to the classic engine at startup.
+    #
+    #  Therefore this step is strictly best-effort: a machine without a Rust
+    #  toolchain (or without the PipeWire dev headers bindgen needs) keeps
+    #  producing a working, Python-only build exactly like before.
+    # ========================================================================
+    hdr "Step 2/4 — Building Rust daemon + CLI"
+
+    local script="$ROOT_DIR/scripts/build_rust.sh"
+    if [[ ! -x "$script" ]]; then
+        warn "scripts/build_rust.sh not found/executable — Python-only build"
+        return 0
+    fi
+    if ! has cargo; then
+        warn "cargo not found on PATH — Python-only build."
+        warn "  Install Rust (rustup or your distro's package) to embed holafd."
+        return 0
+    fi
+
+    # bindgen (libspa-sys) needs libclang; on Arch it lives in /usr/lib with
+    # no versioned dir, which is not always in clang-sys' search path.
+    # Harmless on distros where it is found anyway.
+    if [[ -z "${LIBCLANG_PATH:-}" ]] && [[ -e /usr/lib/libclang.so ]]; then
+        export LIBCLANG_PATH=/usr/lib
+    fi
+
+    if "$script" "$DIST_DIR"; then
+        ok "Rust binaries published to $DIST_DIR (holafd, holafctl)"
+    else
+        warn "Rust build failed — continuing with a Python-only bundle"
+        warn "  (the app will fall back to the classic Python engine)"
+    fi
+    return 0
+}
+
 build_executable() {
     local mode="${1:-onefile}"
-    hdr "Step 2/3 — Building $mode executable with PyInstaller"
+    hdr "Step 3/4 — Building $mode executable with PyInstaller"
 
     if [[ ! -f "$SPEC_FILE" ]]; then
         err "Spec file not found: $SPEC_FILE"
@@ -296,32 +339,25 @@ build_executable() {
         exit 1
     fi
 
-    # Edit spec on the fly if --onedir requested (toggle the COLLECT block)
-    local spec_to_use="$SPEC_FILE"
-    if [[ "$mode" == "onedir" ]]; then
-        log "Patching spec to produce onedir build..."
-        spec_to_use="$BUILD_DIR/holaf-mix-onedir.spec"
-        mkdir -p "$BUILD_DIR"
-        # Uncomment the COLLECT block; comment the EXE's bundled binaries
-        sed -e 's|# COLLECT(|COLLECT(|' \
-            -e 's|^\(# \)\(a.binaries, a.zipfiles, a.datas,\)|\2|' \
-            -e '/^exe_onefile = EXE/,/^)$/ {
-                s|a.binaries,|# a.binaries,|
-                s|a.datas,|# a.datas,|
-            }' \
-            "$SPEC_FILE" > "$spec_to_use"
-    fi
+    # Build mode is selected through the environment so the spec has a single,
+    # always-valid source: no sed-patching (which silently produced an invalid
+    # spec whenever the EXE/COLLECT layout changed).
+    case "$mode" in
+        onefile|onedir) ;;
+        *) err "Unknown build mode: $mode"; exit 1 ;;
+    esac
+    export HOLAF_BUILD_MODE="$mode"
 
     # Clean only the pyinstaller work dir, not the whole build/
     rm -rf "$PYI_WORK" "$PYI_DIST"
     mkdir -p "$PYI_WORK" "$PYI_DIST"
 
-    log "Running PyInstaller (this takes 2-5 minutes the first time)..."
+    log "Running PyInstaller ($mode, this takes 2-5 minutes the first time)..."
     pyinstaller \
         --noconfirm \
         --workpath "$PYI_WORK" \
         --distpath "$PYI_DIST" \
-        "$spec_to_use"
+        "$SPEC_FILE"
 
     # Publish into ./dist/ for clarity
     rm -rf "$DIST_DIR/holaf-mix" "$DIST_DIR/holaf-mix.bin"
@@ -346,7 +382,7 @@ build_executable() {
 }
 
 make_tarball() {
-    hdr "Step 3/3 — Building distribution tarball"
+    hdr "Step 4/4 — Building distribution tarball"
 
     local arch; arch="$(uname -m)"
     local tar_name="${APP_NAME}-${APP_VERSION}-${arch}.tar.gz"
@@ -370,10 +406,13 @@ make_tarball() {
     [[ -f "$ROOT_DIR/packaging/holaf-mix.desktop" ]] && \
         cp "$ROOT_DIR/packaging/holaf-mix.desktop" "$staging/"
 
-    # --- Optional Rust core (holafd + holafctl) --------------------------
-    # The Rust daemon/CLI are built by `scripts/build_rust.sh` (or by CI's
-    # cargo step) into $DIST_DIR. When present, ship them inside the same
-    # tarball so a single download is enough to try `HOLAF_USE_RUST=1`.
+    # --- Rust core (holafd + holafctl) -----------------------------------
+    # The Rust daemon is the DEFAULT backend, so build.sh builds it *before*
+    # PyInstaller and the spec embeds it inside the bundle (onefile →
+    # sys._MEIPASS, onedir → <bundle>/_internal/).  We ALSO ship the two
+    # binaries at the top level of the tarball: holafd next to holaf-mix is the
+    # first path the launcher probes in a frozen app (no extraction, no chmod
+    # needed), and holafctl is the CLI users invoke directly.
     # When absent (plain local build without cargo), we say so and continue:
     # the Python-only bundle must keep working exactly as before.
     local rust_bins=()
@@ -445,9 +484,9 @@ check_deps
 
 case "$ACTION" in
     icons)   build_icons ;;
-    exe)     build_icons; build_executable "$MODE" ;;
-    build)   build_icons; build_executable "$MODE" ;;
-    all-tar) build_icons; build_executable "$MODE"; make_tarball ;;
+    exe)     build_icons; build_rust_binaries; build_executable "$MODE" ;;
+    build)   build_icons; build_rust_binaries; build_executable "$MODE" ;;
+    all-tar) build_icons; build_rust_binaries; build_executable "$MODE"; make_tarball ;;
 esac
 
 if $RUN_AFTER; then

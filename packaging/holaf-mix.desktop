@@ -28,6 +28,17 @@ Exec=python3 -m PySide6.QtCore %k/../../holaf-mix
 #   Exec=__EXEC_PATH__/holaf-mix %U
 # (replaced at install time by the PKGBUILD / install script)
 
+# Same substitution as Exec: lets the desktop environment grey the entry out
+# when the app is not installed at the expected place.
+TryExec=__EXEC_PATH__/holaf-mix
+
+# NOTE (Rust core): the app starts the Rust daemon `holafd` (default audio
+# backend) itself.  Packages install holafd/holafctl NEXT TO this executable
+# (e.g. /usr/bin/holafd); src/backend/rust_launcher.py probes the app directory
+# first, so no extra Exec/Path entry or env var is needed.  If the daemon is
+# missing the app logs a warning and keeps running with the classic Python
+# engine.
+
 # Icon — KDE will pick the largest size it finds; we ship 16-512
 Icon=__ICON_PATH__/holaf-mix
 
