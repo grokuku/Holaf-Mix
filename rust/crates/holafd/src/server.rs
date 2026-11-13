@@ -739,7 +739,9 @@ mod tests {
         // Physical input → its device source; virtual input → null-sink
         // monitor; physical output → that sink's monitor.
         assert_eq!(sources["in-1"], "alsa_input.usb-mic.analog-stereo");
-        assert_eq!(sources["in-2"], "Holaf_Strip_in-2.monitor");
+        // Virtual strips are metered on their **bus** monitor, and the bus name
+        // follows the label (`Desktop`), never the uid.
+        assert_eq!(sources["in-2"], "Holaf_Bus_Desktop.monitor");
         assert_eq!(sources["out-1"], "alsa_output.usb-dac.analog-stereo.monitor");
 
         // Toggling an effect does not move the metered source: a virtual
@@ -748,7 +750,7 @@ mod tests {
         b.fx_set_active("in-2", EffectKey::Eq, true).unwrap();
         let resp = dispatch_one(&mut b, METHOD_METER_SOURCES, json!({}));
         let sources = resp.result.unwrap()["sources"].clone();
-        assert_eq!(sources["in-2"], "Holaf_Strip_in-2.monitor");
+        assert_eq!(sources["in-2"], "Holaf_Bus_Desktop.monitor");
     }
 
     /// A backend panic must be turned into an `internal_error` response, not

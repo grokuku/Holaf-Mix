@@ -40,6 +40,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+# Keep the last few hundred log lines in memory as well: the hidden
+# diagnostics window (Ctrl+Shift+D) shows them in its "Journal" tab, and the
+# report the user copies embeds them.  Without this the only copy of the log is
+# stderr, which a desktop-launched app does not have.  Never fatal: a failing
+# diagnostics handler must not prevent startup.
+try:
+    from src.diagnostics.logbuffer import install_log_handler
+
+    install_log_handler()
+except Exception:  # noqa: BLE001 - diagnostics is optional
+    logging.getLogger("main").debug("in-memory log buffer not installed", exc_info=True)
+
 logger = logging.getLogger("main")
 
 # Env vars controlling backend selection.

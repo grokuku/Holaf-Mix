@@ -48,6 +48,24 @@ pub struct LiveNode {
     pub id: u32,
     pub name: String,
     pub media_class: String,
+    /// The `holaf.uid` property a bus node carries (see
+    /// [`holaf_core::graph::UID_PROP`]) — **diagnostic only**.
+    ///
+    /// PipeWire exports just a fixed key subset in registry globals, and an
+    /// arbitrary key such as `holaf.uid` is not part of it: this field is
+    /// therefore `None` for the buses the daemon itself created (measured on
+    /// 0.3.65; the key *is* visible in `pw-dump`, which reads the node info).
+    /// It is parsed anyway so that a daemon running on a build/future PipeWire
+    /// that does export it gets the identity for free — the reconciler never
+    /// depends on it (see `holaf_core::graph` module docs).
+    pub uid: Option<String>,
+}
+
+impl LiveNode {
+    /// Is this one of our bus nodes (it carries a `holaf.uid`)?
+    pub fn is_ours(&self) -> bool {
+        self.uid.is_some()
+    }
 }
 
 /// One audio port of a node.
@@ -108,6 +126,7 @@ pub fn collect_view(globals: &[GlobalObject<PropertiesBox>]) -> LiveView {
                     id: g.id,
                     name,
                     media_class: prop(g, "media.class").unwrap_or_default(),
+                    uid: prop(g, holaf_core::graph::UID_PROP),
                 });
             }
             ObjectType::Port => {
@@ -164,6 +183,13 @@ impl LiveView {
     /// Node by exact `node.name`.
     pub fn node_named(&self, name: &str) -> Option<&LiveNode> {
         self.nodes.iter().find(|n| n.name == name)
+    }
+
+    /// The bus node that belongs to strip `uid` (whatever its current name).
+    pub fn node_for_strip_uid(&self, uid: &str) -> Option<&LiveNode> {
+        self.nodes
+            .iter()
+            .find(|n| n.uid.as_deref() == Some(uid))
     }
 
     /// All nodes whose name contains `sub` (cleanup sweeps).
@@ -231,6 +257,22 @@ mod tests {
             props: Some(properties! {
                 "node.name" => name,
                 "media.class" => media_class,
+            }),
+        }
+    }
+
+    /// A node of ours: a bus name plus the `holaf.uid` marker it carries.
+    fn bus(id: u32, name: &str, uid: &str) -> GlobalObject<PropertiesBox> {
+        GlobalObject {
+            id,
+            permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
+            type_: ObjectType::Node,
+            version: 3,
+            props: Some(properties! {
+                "node.name" => name,
+                "media.class" => "Audio/Sink",
+                holaf_core::graph::UID_PROP => uid,
+                holaf_core::graph::KIND_PROP => holaf_core::graph::KIND_BUS,
             }),
         }
     }
@@ -305,6 +347,30 @@ mod tests {
         assert!(view.link_exists(111, 101));
         assert!(!view.link_exists(102, 100), "monitor link must not exist");
         assert_eq!(view.links_of_node(11).count(), 2);
+    }
+
+    /// The `holaf.uid` marker is parsed when the registry exposes it (it is
+    /// informational — see [`LiveNode::uid`]; the reconciler recognises its
+    /// nodes through the naming plan of `holaf_core::graph`).
+    #[test]
+    fn the_holaf_uid_marker_is_parsed_when_present() {
+        let globals = vec![
+            bus(10, "Holaf_Bus_Mix_Out", "u-1"),
+            // An older build's null-sink: right uid, no marker at all.
+            node(11, "Holaf_Strip_u-2", "Audio/Sink"),
+            // …and a node that merely *looks* like ours but is not.
+            node(12, "Holaf_Bus_Somebody_Else", "Audio/Sink"),
+        ];
+        let view = collect_view(&globals);
+
+        let mine = view.node_for_strip_uid("u-1").expect("bus of u-1");
+        assert_eq!(mine.name, "Holaf_Bus_Mix_Out");
+        assert!(mine.is_ours());
+        assert!(
+            view.node_for_strip_uid("u-2").is_none(),
+            "a legacy node carries no uid marker — it is swept by name instead"
+        );
+        assert!(!view.node_named("Holaf_Bus_Somebody_Else").unwrap().is_ours());
     }
 
     #[test]

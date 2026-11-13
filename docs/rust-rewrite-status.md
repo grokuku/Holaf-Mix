@@ -229,15 +229,149 @@ Détails, protocole, mesures CPU et protocole de vérification sur machine réel
 
 ---
 
+## 2.4 Noms de nœuds : bus stables dérivés du label
+
+**Symptôme rapporté.** `pactl list short sinks` montrait
+`Holaf_Strip_a187b6c2-…`, `Holaf_Strip_16c798e3-…` : le nom du bus d'un strip
+contenait son **uid**.  Supprimer puis recréer le strip « Mix Out » dans l'app
+tire un nouvel uid, donc un nouveau nom — et tout programme externe qui ciblait
+ce bus (navigateur, DAW, script `pactl`, client JACK) casse silencieusement.  Un
+bus virtuel destiné à être consommé par d'autres applications doit avoir un nom
+**prévisible et stable**.
+
+### Convention (contrat public)
+
+| objet | nom du nœud | stabilité |
+|---|---|---|
+| bus d'un strip virtuel (null-sink) | `Holaf_Bus_<Label>` | **public** : dérivé du libellé |
+| module filter-chain | `Holaf_FX_<uid>` | interne |
+| stream capture de la chaîne | `input.Holaf_FX_<uid>` | interne |
+| stream playback de la chaîne | `output.Holaf_FX_<uid>` | interne |
+
+Règles (`holaf_core::graph` : `slug`, `bus_node_name`, `NodeNames`) :
+
+* **slug** du libellé : ASCII alphanumérique, `-`, `_` ; tout le reste (espaces,
+  ponctuation, `/`, `:`…) devient `_` ; accents repliés (`Éphémère` →
+  `Ephemere`) ; 48 caractères max ; libellé inexploitable → `Bus`.  La **casse
+  est conservée** (`"Mix Out"` → `Mix_Out`) : c'est ce que l'utilisateur lit
+  dans `pactl`/`pavucontrol`.
+* **collisions** : deux strips de même libellé reçoivent `_2`, `_3`, … dans
+  l'ordre du snapshot (donc déterministe au démarrage).
+  Le nom est **collant** : un strip garde le nom qu'il porte tant que son
+  libellé « slugifie » vers la même base — supprimer un des deux homonymes ne
+  renomme donc **pas** le survivant (un renommage détruit/recrée le nœud, ce qui
+  couperait l'audio de tout programme attaché au bus).
+* **renommage** : changer le libellé change le nom public (c'est le but).  Le
+  moteur détruit alors l'ancien bus (et sa chaîne FX, ancrée dessus via
+  `target.object`) et recrée le nouveau ; le routage est ré-dérivé.
+* **propriété des nœuds** : décidée par le **plan de nommage** du snapshot, pas
+  par le nom.  Invariant vérifié à chaque `apply_snapshot` : l'ensemble des nœuds
+  `Holaf_Bus_*` / `Holaf_Strip_*` vivants doit être exactement celui du plan ;
+  tout le reste est détruit (bus d'un strip renommé, strip supprimé, nœud d'une
+  version antérieure ou du moteur Python, run crashé).  C'est ce qui garantit
+  qu'aucun orphelin ne subsiste.
+
+> Pourquoi pas une propriété custom comme identité ?  Chaque bus porte bien
+> `holaf.uid`, `holaf.kind` et `holaf.label` — visibles dans `pw-dump` /
+> `pw-cli info <node>`, donc utiles au diagnostic — mais PipeWire n'exporte
+> **qu'un jeu de clés fixe** dans les *registry globals* qu'un client reçoit
+> (`node.name`, `node.description`, `media.class`, `factory.id`,
+> `object.serial`, …) : mesuré sur 0.3.65, un bus créé par le daemon expose
+> exactement ces cinq clés, les clés custom étant visibles dans `pw-dump` et
+> absentes de l'événement `registry`.  Un réconciliateur qui s'y fierait
+> recréerait tous les bus à chaque apply.  Ajouter des clés globales exige
+> `pw_global_update_keys`, réservé à un module côté serveur.
+
+### Migration (douce)
+
+* un nœud `Holaf_Strip_<uid>` d'une version antérieure (ou du moteur Python) est
+  détruit dès qu'il est vu : un strip ne doit jamais avoir deux bus ;
+* `holafd` expose le nom retenu par strip dans `status.strips[].node_name` —
+  `IpcAudioEngine.strip_node_name(uid)` le consomme, la Qt UI s'en sert pour
+  router une application (repli sur `Holaf_Strip_<uid>` quand c'est l'ancien
+  moteur Python qui tourne, `HOLAF_USE_PYTHON=1`) ;
+* le metering suit automatiquement : `meter.sources` renvoie
+  `Holaf_Bus_Mix_Out.monitor`.
+
+### Cibler un bus depuis l'extérieur
+
+```bash
+# lister les bus Holaf (noms stables, dérivés des libellés)
+pactl list short sinks | grep Holaf_Bus_
+
+# jouer un fichier dans un bus (le graphe Holaf le route vers la sortie)
+PULSE_SINK=Holaf_Bus_Mix_Out mpv album.flac
+
+# y déplacer une application déjà lancée
+pactl move-sink-input <sink-input-id> Holaf_Bus_Mix_Out
+
+# en faire la sortie par défaut du système
+pactl set-default-sink Holaf_Bus_Mix_Out
+
+# écouter ce que le bus transporte (le monitor, ce que lisent les VU-mètres)
+parec --device=Holaf_Bus_Mix_Out.monitor | …
+```
+
+### Limites connues
+
+* les suffixes de collision sont recalculés au **redémarrage du daemon** : si
+  deux strips partagent un libellé, c'est l'ordre du snapshot qui décide (`_2`
+  reste sur le second).  Des libellés uniques — le cas normal — rendent les noms
+  parfaitement stables, y compris après suppression/recréation du strip ;
+* la casse du libellé fait partie du nom : passer de « Casque » à « CASQUE »
+  renomme le bus ;
+* WirePlumber mémorise un volume par **`node.name`**
+  (`~/.local/state/wireplumber/restore-stream`) : après un renommage, c'est le
+  volume mémorisé pour l'*ancien* nom qui ne s'applique plus.  Le moteur
+  ré-affirme toujours le volume du strip après création (double `set_param`),
+  donc le volume configuré gagne — mais la valeur « apprise » par WirePlumber
+  repart de zéro pour un nom neuf ;
+* l'espace de noms `Holaf_*` est **réservé** : au premier apply, le daemon
+  détruit tout nœud dont le nom contient `Holaf_` (débris d'un run crashé, nœud
+  d'une version antérieure).  Un device ou un null-sink que l'utilisateur
+  nommerait lui-même `Holaf_quelque_chose` serait balayé — c'est le prix du
+  nettoyage automatique.
+
+Tests : `rust/crates/holaf-pw/tests/bus_naming.rs` (live) — noms dérivés du
+libellé + collisions, idempotence d'un apply répété, renommage (bus et chaîne FX),
+suppression d'un strip renommé, remplacement d'un nœud `Holaf_Strip_*`.
+
+## 2.5 Fenêtre de diagnostic (`Ctrl+Shift+D`)
+
+Un outil de debug caché, ouvrable uniquement au clavier (`Ctrl+Shift+D`, aucun
+menu ni bouton) : il remplace la collection manuelle de `pactl` / `pw-cli` /
+`pw-link` / `pw-top` / `holafctl status` par une fenêtre unique + un rapport
+texte copiable en un clic (voir la section « Dépannage » du README).
+
+* `src/diagnostics/collector.py` — **collecte pure, sans Qt** :
+  `collect_report(engine, options)` → dict (environnement, `engine.status()`,
+  métrage, graphe `pw-dump`, `/proc`, log) + `detect_findings()` (règles
+  automatiques : `graph_degraded`, `daemon_unreachable`, `fx_host_inprocess`,
+  `fx_host_respawns`, `legacy_bus_names`, `strip_bus_unnamed`,
+  `multiple_daemons`, `orphan_daemon`, `strip_bus_missing`, `device_missing`,
+  `small_quantum`, `pwt_errors`, `volume_mismatch`, `fx_chain_missing`, …) et
+  `format_report_text()`.  Tout outil absent / daemon muet dégrade en
+  `unavailable` + raison, jamais en exception (timeouts de 2 s).
+* `src/ui/diagnostics_dialog.py` — l'affichage seul (5 onglets, collecte dans
+  le `QThreadPool` du `MainWindow`, auto-refresh 2 s sur la partie live).
+* `src/diagnostics/logbuffer.py` — buffer mémoire des 200 dernières lignes de
+  log (installé par `main.py`), alimente l'onglet « Journal ».
+
+Il fonctionne avec **les deux backends** : mode Rust via `engine.status()`,
+mode Python en reconstruisant l'état depuis `node_registry` / `name_cache` /
+`fx_node_ids` et la liste de strips de l'UI.
+
+---
+
 ## 3. Comment tester chaque brique
 
 ### 3.1 Rust pur (J0 + J3) — sans PipeWire
 
 ```bash
 cd rust
-cargo test                # workspace : 146 tests (J0 75 + J3 57 + J1/J2 14)
-cargo test -p holaf-core  # J0 (75)
-cargo test -p holafd      # J3 serveur + FakeBackend + IPC + arrêt propre (45)
+cargo test                # workspace : 203 tests (dont 16 live, skippés sans daemon)
+cargo test -p holaf-core  # J0 + nommage des bus (82)
+cargo test -p holafd      # J3 serveur + FakeBackend + IPC + arrêt propre (51)
 cargo test -p holafctl    # J3 CLI (4)
 ```
 
@@ -294,10 +428,12 @@ l'app se rabat sur l'`AudioEngine` Python avec un WARNING visible (§0).**
 
 ```bash
 python -m unittest discover -s tests -v
-# 62 tests : conversion strip→schéma Rust, enveloppe NDJSON, erreurs,
+# 140 tests : conversion strip→schéma Rust, enveloppe NDJSON, erreurs,
 # retry borné sur connexion coupée, request_id, launcher anti-double-spawn,
-# sélection du backend (défaut Rust / opt-out / repli) et résolution du binaire
-# (dev, frozen + _MEIPASS, chmod, $HOLAFD_BIN).
+# sélection du backend (défaut Rust / opt-out / repli), résolution du binaire
+# (dev, frozen + _MEIPASS, chmod, $HOLAFD_BIN) et la collecte de diagnostic
+# (faux moteurs sain / dégradé / qui lève, parseurs pw-dump & pw-top, golden du
+# rapport texte, fenêtre Qt si PySide6 est présent — sinon tests sautés).
 ```
 
 ---

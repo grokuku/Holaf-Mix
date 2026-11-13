@@ -204,6 +204,12 @@ python3 tools/audio_bench.py matrix \
   l'UI) — c'est la différence structurelle entre B et C ;
 * `--load N` : N boucles `yes`.  **Attention** : saturer tous les cœurs casse
   la mesure elle-même (voir §8).
+* `--device-channels N` : la chaîne alimente un device null-sink à **N canaux**
+  (`4` = une interface USB 4 sorties, voir §8 bis) au lieu du bus stéréo du
+  strip ; la capture se fait sur le monitor de ce device.
+* Le nom du bus du strip de banc est **demandé au démon**
+  (`holafctl status` → `strips[].node_name`), donc le banc suit la convention
+  de nommage (`Holaf_Bus_Bench`) sans la coder en dur.
 
 ## 8. Ce que le banc de ce conteneur peut — et ne peut pas — prouver
 
@@ -245,6 +251,75 @@ Ce que le banc prouve en revanche, et qui est indépendant de l'ordonnanceur :
   même) ;
 * `degraded=false`, `pending=[]`, `ERR=0` dans tous les cas : le graphe et le
   service sont sains.
+
+## 8 bis. Piste écartée par la mesure : device 4 canaux vs strips stéréo
+
+Hypothèse à tester : `alsa_output.usb-PreSonus_Studio_26c_…-00.pro-output-0` est
+un nœud **4 canaux** (`s32le 4ch 48000Hz`) alors que tous nos strips et chaînes
+sont stéréo (`float32le 2ch`) ; la négociation 2 → 4 canaux pourrait provoquer un
+remix, voire un hachage (le casque hache, les HP C-Media 2 canaux non).
+
+### Ce que font les deux moteurs (identique)
+
+* Ils ciblent les **deux premiers ports du device** : `playback_FL` et
+  `playback_FR`.  Côté Rust, `link_nodes` prend les ports du nœud par
+  `audio.channel` (`FL`/`FR`, repli sur l'index 0/1) ; côté Python,
+  `_auto_link_ports` matche `FL`/`left` en priorité puis `:output_0`.  Sur un
+  device `FL FR RL RR`, `RL`/`RR` restent **non liés** dans les deux cas.
+* Aucun remix : la chaîne déclare `audio.channels = 2`,
+  `audio.position = [ FL, FR ]` et `stream.dont-remix = true` (config SPA-JSON
+  identique au caractère près, cf. `spa_config::build_filter_chain_config`).
+* Le volume : Rust écrit `channelVolumes`/`monitorVolumes` avec **2 valeurs**,
+  Python utilise `pactl set-sink-volume <nœud> N%`.  Mesuré sur un device 4
+  canaux : PipeWire (adapter audioconvert) étend le tableau — on relit
+  `channelVolumes = 0.512 ×4` pour un volume de 80 %, exactement ce que laisse
+  `pactl … 80%`.  Pas d'écart.
+
+### Mesure en headless (2 canaux vs 4 canaux)
+
+Même graphe dans les deux cas (bus d'entrée → chaîne EQ (hôte `--fx-host`) →
+device), le seul paramètre qui change est le nombre de canaux du device
+(`audio.channels=4`, `audio.position=[ FL FR RL RR ]`), tonalité 1 kHz, capture
+du monitor du device :
+
+| device | ports liés | trous | steps | THD+N | rms |
+|---|---|---|---|---|---|
+| 2 canaux (défaut) | `FL`, `FR` | 0 | 0 | −81,7 dB | 0,250 |
+| 4 canaux | `FL`, `FR` (+ `RL`/`RR` libres) | 0 | 0 | −81,7 dB | 0,250 |
+
+Identique au chiffre près.  À quantum forcé à 64, les deux se dégradent **de la
+même façon** (conteneur sans temps réel, cf. §8) : 4 canaux n'est pas pire.
+
+**Conclusion : la largeur du device n'est pas la cause du hachage.**  Elle ne
+change ni le câblage, ni le format négocié, ni le DSP ; `pw-top` ne montre aucun
+`ERR` et le monitor du device 4 canaux restitue la tonalité sans trou.
+
+### Reproduire / mesurer sur la machine de l'utilisateur
+
+```bash
+# 1) quels ports du casque sont réellement liés (attendu : FL et FR seulement)
+pw-link -l | grep -A1 'pro-output-0' 
+
+# 2) le format négocié de chaque côté de la chaîne (attendu : f32 2ch partout
+#    côté chaîne, le device garde son 4ch)
+pw-top -b -n 1 2>/dev/null | grep -E 'Holaf|pro-output'
+
+# 3) compter les xruns par nœud, EQ actif puis inactif (colonne ERR)
+pw-top            # laisser tourner 10 s dans chaque configuration
+
+# 4) banc A/B avec un device 4 canaux (le seul paramètre qui change)
+eval "$(./scripts/start-pipewire-headless.sh --export)"   # ou session réelle
+python3 tools/audio_bench.py run --scenario fxhost --device-channels 4 --seconds 8
+python3 tools/audio_bench.py run --scenario fxhost --device-channels 2 --seconds 8
+
+# 5) la même chose sans chaîne du tout (plancher de bruit local)
+python3 tools/audio_bench.py run --scenario ref --seconds 8
+```
+
+Si `ERR` reste à 0 sur le nœud `pro-output-0` et que le monitor 4 canaux ne
+contient pas de trous alors que l'oreille entend le hachage, la cause est en
+aval du graphe (périodes ALSA/USB, `api.alsa.period-size`, ou l'interface
+elle-même) — et non dans la négociation stéréo → 4 canaux.
 
 ## 9. À vérifier sur la machine de l'utilisateur (la seule qui reproduit)
 

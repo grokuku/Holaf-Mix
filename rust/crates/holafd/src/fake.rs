@@ -8,7 +8,7 @@
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 
-use holaf_core::graph::meter_source_name;
+use holaf_core::graph::{bus_node_name, meter_source_name, NodeNames};
 use holaf_core::model::{EffectKey, Strip};
 
 use crate::backend::{Backend, BackendError};
@@ -18,6 +18,9 @@ use crate::backend::{Backend, BackendError};
 pub struct FakeBackend {
     /// Live strips keyed by uid, preserving apply/creation order.
     strips: IndexMap<String, Strip>,
+    /// Naming plan of the last snapshot (`uid → Holaf_Bus_<Label>`), so the
+    /// fake reports the very same public names as the real engine.
+    names: NodeNames,
     /// Routing matrix rows `(source_uid, target_uid, active)`.
     routes: Vec<(String, String, bool)>,
     /// Which sink uid is the system default (if any).
@@ -89,6 +92,7 @@ impl Backend for FakeBackend {
                 applied += 1;
             }
         }
+        self.names = NodeNames::plan(self.strips.values(), &self.names);
         self.routes.clear();
         self.apps.clear();
         self.default_sink = None;
@@ -108,9 +112,23 @@ impl Backend for FakeBackend {
         let strips: Vec<Value> = self
             .strips
             .values()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(|e| BackendError::internal("status", e))?;
+            .map(|strip| {
+                let mut value = serde_json::to_value(strip)
+                    .map_err(|e| BackendError::internal("status", e))?;
+                if let Some(obj) = value.as_object_mut() {
+                    // Same public handle as the real engine (`status.strips[].node_name`).
+                    obj.insert(
+                        "node_name".into(),
+                        json!(self
+                            .names
+                            .get(&strip.uid)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| bus_node_name(&strip.label, 1))),
+                    );
+                }
+                Ok(value)
+            })
+            .collect::<Result<_, _>>()?;
         let routes: Vec<Value> = self
             .routes
             .iter()
@@ -293,7 +311,10 @@ impl Backend for FakeBackend {
         self.log("meter_sources".to_string());
         let mut sources = serde_json::Map::new();
         for strip in self.strips.values() {
-            sources.insert(strip.uid.clone(), Value::String(meter_source_name(strip)));
+            sources.insert(
+                strip.uid.clone(),
+                Value::String(meter_source_name(strip, &self.names.bus_name(strip))),
+            );
         }
         Ok(json!({ "running": self.running, "sources": sources }))
     }

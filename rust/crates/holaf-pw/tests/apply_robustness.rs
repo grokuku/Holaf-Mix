@@ -221,6 +221,23 @@ fn fresh_backend() -> Option<PipeWireBackend> {
     Some(backend)
 }
 
+/// Bus node name of a fixture strip: `Holaf_Bus_<slug(label)>`, i.e. derived
+/// from the **label** the helpers below give their strip (`"Out <uid>"` →
+/// `Holaf_Bus_Out_<uid>`), never from the uid alone.
+fn bus_of(label: &str) -> String {
+    holaf_core::graph::bus_node_name(label, 1)
+}
+
+/// The bus of `output_eq`/`output_plain`'s fixture.
+fn out_bus(uid: &str) -> String {
+    bus_of(&format!("Out {uid}"))
+}
+
+/// The bus of `input_routed`'s fixture.
+fn in_bus(uid: &str) -> String {
+    bus_of(&format!("In {uid}"))
+}
+
 /// A virtual output strip with the EQ on (i.e. it wants an FX chain).
 fn output_eq(uid: &str, volume: f32) -> Strip {
     let mut strip = Strip::with_uid(uid, format!("Out {uid}"), StripType::Output);
@@ -285,7 +302,7 @@ fn volume_reaches_the_node_on_the_first_apply_with_the_pulseaudio_curve() {
         .apply_snapshot(&[output_plain(uid, 0.44)])
         .expect("apply_snapshot");
 
-    let node = format!("Holaf_Strip_{uid}");
+    let node = out_bus(uid);
     let read = volumes_of(&node).expect("node must exist right after the first apply");
     let (channel, _monitor) = read;
     assert!(
@@ -343,7 +360,7 @@ fn volume_also_scales_the_monitor_the_vu_meters_read() {
     backend
         .apply_snapshot(&[output_plain(uid, 0.5)])
         .expect("apply_snapshot");
-    let node = format!("Holaf_Strip_{uid}");
+    let node = out_bus(uid);
     let (channel, monitor) = volumes_of(&node).expect("node exists");
     let expected = 0.5_f32 * 0.5 * 0.5; // −18.06 dB, the PulseAudio 50 %
     assert!(
@@ -413,11 +430,12 @@ fn a_missing_device_does_not_abort_the_snapshot_and_heals_when_it_appears() {
     );
 
     // The healthy strip is fully built (chain + intra-strip link) …
-    assert!(node_id_by_name("Holaf_Strip_healthy").is_some());
+    assert!(node_id_by_name(&out_bus("healthy")).is_some());
     assert!(node_id_by_name("input.Holaf_FX_healthy").is_some());
+    let healthy = out_bus("healthy");
     assert!(
         wait_until(Duration::from_secs(2), || {
-            port_links_between("output.Holaf_FX_healthy", "Holaf_Strip_healthy").len() == 2
+            port_links_between("output.Holaf_FX_healthy", &healthy).len() == 2
         }),
         "the healthy strip's chain must be wired to its sink"
     );
@@ -429,7 +447,7 @@ fn a_missing_device_does_not_abort_the_snapshot_and_heals_when_it_appears() {
         "no FX chain may be created while its target node is missing"
     );
     assert!(
-        port_links_between("output.Holaf_FX_absent", "Holaf_Strip_healthy").is_empty(),
+        port_links_between("output.Holaf_FX_absent", &healthy).is_empty(),
         "the absent strip's chain must never be autoconnected into another strip"
     );
 
@@ -441,13 +459,14 @@ fn a_missing_device_does_not_abort_the_snapshot_and_heals_when_it_appears() {
     // The device appears (hot-plug).  NO order is sent: the daemon's own repair
     // pass must build the chain and wire it.
     assert!(create_null_sink(device), "test sink creation");
+    let feed = in_bus("feed");
     let healed = wait_until(Duration::from_secs(6), || {
         port_links_between("output.Holaf_FX_absent", device).len() == 2
-            && port_links_between("Holaf_Strip_feed", "input.Holaf_FX_absent").len() == 2
+            && port_links_between(&feed, "input.Holaf_FX_absent").len() == 2
     });
     let healed_links = (
         port_links_between("output.Holaf_FX_absent", device),
-        port_links_between("Holaf_Strip_feed", "input.Holaf_FX_absent"),
+        port_links_between(&feed, "input.Holaf_FX_absent"),
     );
     assert!(
         healed,
@@ -498,7 +517,7 @@ fn a_broken_strip_never_aborts_the_rest_of_the_snapshot() {
             wait_until(Duration::from_secs(2), || {
                 port_links_between(
                     &format!("output.Holaf_FX_{uid}"),
-                    &format!("Holaf_Strip_{uid}"),
+                    &out_bus(uid),
                 )
                 .len()
                     == 2
@@ -508,7 +527,7 @@ fn a_broken_strip_never_aborts_the_rest_of_the_snapshot() {
     }
     assert!(
         wait_until(Duration::from_secs(2), || {
-            port_links_between("Holaf_Strip_ok3", "input.Holaf_FX_ok2").len() == 2
+            port_links_between(&in_bus("ok3"), "input.Holaf_FX_ok2").len() == 2
         }),
         "the route of the healthy strips must be created (it used to be skipped \
          because the snapshot aborted before the routing phase)"
@@ -549,9 +568,9 @@ fn a_toggle_re_derives_the_routes_and_repairs_the_chain_links() {
         .expect("apply_snapshot");
 
     let chain_out = format!("output.Holaf_FX_{uid}");
-    let sink = format!("Holaf_Strip_{uid}");
+    let sink = out_bus(uid);
     let chain_in = format!("input.Holaf_FX_{uid}");
-    let src_node = format!("Holaf_Strip_{src}");
+    let src_node = in_bus(src);
     assert!(wait_until(Duration::from_secs(2), || {
         port_links_between(&chain_out, &sink).len() == 2
             && port_links_between(&src_node, &chain_in).len() == 2
@@ -618,10 +637,12 @@ fn stereo_routes_pair_fl_with_fl_and_fr_with_fr() {
             input_routed("st-in", &["st-out"]),
         ])
         .expect("apply_snapshot (stereo)");
+    let st_in = in_bus("st-in");
+    let st_out = out_bus("st-out");
     assert!(wait_until(Duration::from_secs(2), || {
-        port_links_between("Holaf_Strip_st-in", "Holaf_Strip_st-out").len() == 2
+        port_links_between(&st_in, &st_out).len() == 2
     }));
-    let mut pairs = port_links_between("Holaf_Strip_st-in", "Holaf_Strip_st-out");
+    let mut pairs = port_links_between(&st_in, &st_out);
     pairs.sort();
     assert_eq!(
         pairs,
@@ -639,10 +660,12 @@ fn stereo_routes_pair_fl_with_fl_and_fr_with_fr() {
     backend
         .apply_snapshot(&[output_plain("st-out", 1.0), mono])
         .expect("apply_snapshot (mono)");
+    // `mono` is labelled "Mic mono" → its bus is `Holaf_Bus_Mic_mono`.
+    let mono_in = bus_of("Mic mono");
     assert!(wait_until(Duration::from_secs(2), || {
-        port_links_between("Holaf_Strip_mono-in", "Holaf_Strip_st-out").len() == 2
+        port_links_between(&mono_in, &st_out).len() == 2
     }));
-    let mut pairs = port_links_between("Holaf_Strip_mono-in", "Holaf_Strip_st-out");
+    let mut pairs = port_links_between(&mono_in, &st_out);
     pairs.sort();
     assert_eq!(
         pairs,

@@ -113,6 +113,49 @@ spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
     *   Move a fader or press a button on your controller.
     *   The mapping is saved automatically.
 
+## Dépannage (touche secrète `Ctrl+Shift+D`)
+
+Quand le son craque, qu'un strip ne route pas ou qu'une appli est muette,
+il n'y a pas de menu « aide » : lancez Holaf-Mix puis appuyez sur
+**`Ctrl+Shift+D`**.  Une fenêtre de diagnostic s'ouvre (aucun bouton dans
+l'interface, uniquement ce raccourci).
+
+Elle rassemble, en un seul endroit, ce qu'il fallait sinon demander en
+commandes shell (`pactl`, `pw-cli`, `pw-link`, `pw-top`, `holafctl status`) :
+
+| Onglet | Contenu |
+| --- | --- |
+| **Summary** | Les constats automatiques, colorés par sévérité (erreur / avertissement / info), avec l'action suggérée sous chacun |
+| **Engine** | État du moteur (`running`, `degraded`, `pending`, `fx_host`, strips avec leur bus et leurs effets actifs, routes) + métrage (niveaux, sources écoutées) |
+| **Graph** | Nœuds `Holaf_*` et devices physiques (id, classe, état, quantum, rate, ports) et liens qui touchent le mix |
+| **System** | Versions (app, `holafd`, PipeWire, kernel, Python), socket, `config.json`, PID, CPU/mémoire, et **tous** les processus `holafd` vivants |
+| **Journal** | Les 200 dernières lignes de log de l'app (buffer mémoire) |
+
+Boutons :
+
+*   **Refresh** (`F5` / `Ctrl+R`) — relance la collecte **en arrière-plan** (l'UI
+    ne gèle jamais, même si le daemon ou PipeWire ne répond pas).
+*   **Copy report** — copie un rapport texte complet dans le presse-papiers :
+    c'est **ce bloc** qu'il faut coller pour demander de l'aide (il commence
+    par les constats).
+*   **Save…** — enregistre le même rapport dans un fichier `.txt`.
+*   **Auto-refresh every 2 s** — rafraîchit uniquement la partie « live »
+    (moteur + métrage), sans relancer `pw-dump`.
+
+Ce que la fenêtre sait détecter toute seule : graphe dégradé ou `pending` non
+vide, daemon injoignable, chaînes FX hébergées en mode `inprocess` (risque de
+hachage) ou FX host qui redémarre en boucle, noms de bus legacy
+`Holaf_Strip_*` (binaire `holafd` périmé → `scripts/build_rust.sh`), plusieurs
+daemons `holafd` vivants (orphelins d'une session précédente), strip dont le bus
+ou le device a disparu du graphe, quantum trop petit (< 256 → craquements),
+`ERR` dans `pw-top`, volumes non appliqués (écart entre la config et le graphe),
+effets actifs sans chaîne FX, erreurs dans le log.
+
+Fonctionne avec **les deux moteurs** (daemon Rust par défaut, moteur Python via
+`HOLAF_USE_PYTHON=1`) : avec le moteur Python, l'état est reconstruit depuis ses
+registres et la liste des strips de l'UI, et les champs indisponibles sont
+signalés `?` au lieu d'être inventés.
+
 ## License
 
 This project is provided "as-is" without any warranty. feel free to fork and modify it for your own needs.

@@ -251,7 +251,9 @@ fn seven_strips_run_in_one_dedicated_fx_host_and_leave_nothing_behind() {
         .collect();
     for uid in ["s0", "s1", "s2", "s3", "s4"] {
         for want in [
-            format!("Holaf_Strip_{uid}"),
+            // The bus name follows the label ("Strip s0" → `Holaf_Bus_Strip_s0`);
+            // the chain nodes keep the uid (they are internal).
+            holaf_core::graph::bus_node_name(&format!("Strip {uid}"), 1),
             format!("input.Holaf_FX_{uid}"),
             format!("output.Holaf_FX_{uid}"),
         ] {

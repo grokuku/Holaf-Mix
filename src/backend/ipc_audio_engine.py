@@ -612,6 +612,34 @@ class IpcAudioEngine:
         """
         return self._request(METHOD_DEVICE_LIST)
 
+    # ------------------------------------------------------- node naming
+    def strip_node_name(self, strip_uid: str) -> Optional[str]:
+        """Public bus name the daemon published for a strip.
+
+        The daemon names a virtual strip's bus after its **label**
+        (`Holaf_Bus_Mix_Out`, `_2` on a label collision) and *not* after its
+        uid: an external program (browser, DAW, script, `pactl`) can target the
+        bus by a predictable name and keep working when the strip is deleted and
+        recreated in the UI.  The naming rule belongs to the daemon (see
+        `holaf_core::graph`), so clients must **ask** for the name instead of
+        rebuilding it: this returns ``status.strips[].node_name``.
+
+        Returns ``None`` when the daemon does not answer or the strip is
+        unknown — callers fall back to their own convention (the classic Python
+        engine still uses `Holaf_Strip_<uid>`).
+        """
+        try:
+            status = self.status()
+        except IpcEngineError as exc:
+            logger.debug("strip_node_name(%s): %s", strip_uid, exc)
+            return None
+        strips = status.get("strips") if isinstance(status, dict) else None
+        for strip in strips or []:
+            if isinstance(strip, dict) and strip.get("uid") == strip_uid:
+                name = strip.get("node_name")
+                return name if isinstance(name, str) and name else None
+        return None
+
     def get_sink_inputs(self) -> Dict[str, Any]:
         """List applications playing audio (``app.list``) as-is."""
         return self._request(METHOD_APP_LIST)

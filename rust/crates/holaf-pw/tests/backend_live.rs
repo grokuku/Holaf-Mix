@@ -188,6 +188,12 @@ fn eq_band_value(node_id: u32, band: &str) -> Option<f32> {
     None
 }
 
+/// Public bus node names of the two test strips: `output_strip` labels its
+/// strip "J2 Out", `input_strip` "J2 In" — the bus name follows the **label**,
+/// never the uid (see `holaf_core::graph::bus_node_name`).
+const OUT_BUS: &str = "Holaf_Bus_J2_Out";
+const IN_BUS: &str = "Holaf_Bus_J2_In";
+
 fn output_strip(uid: &str, eq_active: bool) -> Strip {
     let mut strip = Strip::with_uid(uid, "J2 Out", StripType::Output);
     strip.effects.get_mut(&EffectKey::Eq).unwrap().active = eq_active;
@@ -238,7 +244,7 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
         .filter_map(|n| n.as_str())
         .collect();
     assert!(
-        names.iter().any(|n| *n == "Holaf_Strip_o1-live"),
+        names.iter().any(|n| *n == OUT_BUS),
         "null-sink not in status holaf_nodes: {names:?}"
     );
     assert!(
@@ -252,12 +258,12 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
 
     // Give the daemon a moment then cross-check externally via pw-dump.
     std::thread::sleep(Duration::from_millis(300));
-    assert!(external_has_node("Holaf_Strip_o1-live"), "pw-dump sees the null-sink");
+    assert!(external_has_node(OUT_BUS), "pw-dump sees the null-sink");
     assert!(external_has_node("input.Holaf_FX_o1-live"), "pw-dump sees the chain input");
     assert!(external_has_node("output.Holaf_FX_o1-live"), "pw-dump sees the chain output");
 
     // The input null-sink is linked into the chain's capture sink (routing).
-    let in_sink = node_id_by_name("Holaf_Strip_i1-live").expect("input sink node id");
+    let in_sink = node_id_by_name(IN_BUS).expect("input sink node id");
     let chain_sink = node_id_by_name("input.Holaf_FX_o1-live").expect("chain capture node id");
     let route_links = link_count(in_sink, chain_sink);
     assert!(
@@ -300,7 +306,7 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
         .filter_map(|n| n.as_str())
         .collect();
     assert!(
-        names.iter().any(|n| *n == "Holaf_Strip_o1-live"),
+        names.iter().any(|n| *n == OUT_BUS),
         "strip sink must remain"
     );
     assert!(
@@ -310,7 +316,7 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
     assert!(!external_has_node("input.Holaf_FX_o1-live"), "pw-dump: chain gone");
 
     // Routing now targets the raw null-sink of the output strip.
-    let out_sink = node_id_by_name("Holaf_Strip_o1-live").expect("output sink node id");
+    let out_sink = node_id_by_name(OUT_BUS).expect("output sink node id");
     let direct_links = link_count(in_sink, out_sink);
     assert!(
         direct_links >= 2,
@@ -326,9 +332,9 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
         .expect("apply_snapshot (eq active again)");
     assert_eq!(res["applied"], 2);
     std::thread::sleep(Duration::from_millis(400));
-    let sources = [format!("Holaf_Strip_{i1}"), format!("output.Holaf_FX_{i1}")];
+    let sources = [IN_BUS.to_string(), format!("output.Holaf_FX_{i1}")];
     let targets = [
-        format!("Holaf_Strip_{o1}"),
+        OUT_BUS.to_string(),
         format!("input.Holaf_FX_{o1}"),
     ];
     let sources_ref: Vec<&str> = sources.iter().map(String::as_str).collect();
@@ -348,8 +354,8 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
     backend.stop().expect("stop");
     std::thread::sleep(Duration::from_millis(300));
     for name in [
-        "Holaf_Strip_o1-live",
-        "Holaf_Strip_i1-live",
+        OUT_BUS,
+        IN_BUS,
         "input.Holaf_FX_o1-live",
         "output.Holaf_FX_o1-live",
     ] {
@@ -413,12 +419,12 @@ fn meter_sources_expose_recordable_pulse_sources() {
     let sources = res["sources"].as_object().expect("sources object");
     assert_eq!(
         sources[vin],
-        format!("Holaf_Strip_{vin}.monitor"),
+        format!("{IN_BUS}.monitor"),
         "a virtual strip is metered on its null-sink monitor"
     );
     assert_eq!(
         sources[vout],
-        format!("Holaf_Strip_{vout}.monitor"),
+        format!("{OUT_BUS}.monitor"),
         "an output strip is metered on its master node's monitor"
     );
 
@@ -451,7 +457,7 @@ fn meter_sources_expose_recordable_pulse_sources() {
     let res = backend.meter_sources().expect("meter.sources (no fx)");
     assert_eq!(
         res["sources"][vin],
-        format!("Holaf_Strip_{vin}.monitor"),
+        format!("{IN_BUS}.monitor"),
         "the metered source survives a chain teardown"
     );
 

@@ -30,7 +30,7 @@ Nouveaux fichiers :
 | Fichier | Rôle |
 |---|---|
 | `holaf-core/src/backend.rs` | trait `Backend`, `BackendError`, `UnimplementedBackend` (déplacé) |
-| `holaf-core/src/graph.rs` | helpers purs de planification : noms de nœuds `Holaf_Strip_*`/`Holaf_FX_*`, `wants_fx_chain` (= `_has_active_fx` + graphe non vide), `is_physical`, `ChainFlavour` |
+| `holaf-core/src/graph.rs` | helpers purs de planification : noms de nœuds `Holaf_FX_*` + bus `Holaf_Bus_<Label>` (voir `rust-rewrite-status.md` §2.4 ; à l'époque de J2 : `Holaf_Strip_<uid>`), `wants_fx_chain` (= `_has_active_fx` + graphe non vide), `is_physical`, `ChainFlavour` |
 | `holaf-pw/src/live.rs` | vue pure du registre (`LiveView`) : mapping GlobalObject → nodes/ports/links + helpers FL/FR, testée sans daemon |
 | `holaf-pw/src/engine.rs` | moteur réel (PwSession + Engine) : reconcilieur, chaines, liens, volume/mute, metadata, device_list |
 | `holaf-pw/src/backend.rs` | `PipeWireBackend` : poignée `Send` qui marshalle vers le thread worker |

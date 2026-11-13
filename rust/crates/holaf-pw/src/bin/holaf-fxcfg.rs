@@ -115,7 +115,10 @@ fn main() {
         }
     }
 
-    match ChainSpec::for_strip(&strip) {
+    // A single strip out of context: its bus gets the suffix-free name of its
+    // label (no collision to resolve here).
+    let bus = holaf_core::graph::bus_node_name(&strip.label, 1);
+    match ChainSpec::for_strip(&strip, &bus) {
         Ok(spec) => {
             println!("{}", spec.config);
         }

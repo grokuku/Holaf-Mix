@@ -110,6 +110,9 @@ class ScriptedFakeDaemon:
         # uid → source name the daemon hands to the VU meters (test-settable so
         # a chain-creation/unload can be simulated mid-test).
         self.meter_sources: Dict[str, str] = {}
+        # `status.strips` entries (each carries the daemon-published
+        # `node_name` — see `IpcAudioEngine.strip_node_name`).
+        self.status_strips: List[Dict[str, Any]] = []
         self._tmpdir = tempfile.mkdtemp(prefix="holaf-ipc-test-")
         self.path = os.path.join(self._tmpdir, "daemon.sock")
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -188,7 +191,7 @@ class ScriptedFakeDaemon:
         if method == METHOD_APPLY_SNAPSHOT:
             result = {"applied": len(params.get("strips", [])), "running": True}
         elif method == METHOD_STATUS:
-            result = {"running": True}
+            result = {"running": True, "strips": list(self.status_strips)}
         elif method == "device.list":
             result = {"devices": []}
         elif method == "app.list":
@@ -390,6 +393,35 @@ class IpcRequestTest(unittest.TestCase):
             result = engine._request(METHOD_STATUS)
             self.assertIsInstance(result, dict)
             self.assertTrue(result.get("running"))
+        finally:
+            daemon.close()
+
+    def test_strip_node_name_uses_the_name_published_by_the_daemon(self):
+        # The bus name follows the strip *label* on the Rust side
+        # (`Holaf_Bus_Mix_Out`), not its uid: clients must ask the daemon
+        # instead of rebuilding `Holaf_Strip_<uid>` themselves.
+        daemon = ScriptedFakeDaemon()
+        daemon.status_strips = [
+            {"uid": "out-1", "label": "Mix Out", "node_name": "Holaf_Bus_Mix_Out"},
+            {"uid": "in-1", "label": "Micro", "node_name": "Holaf_Bus_Micro"},
+            {"uid": "in-2", "label": "No name"},  # legacy daemon: no node_name
+        ]
+        engine = IpcAudioEngine(socket_path=daemon.path)
+        try:
+            self.assertEqual(engine.strip_node_name("out-1"), "Holaf_Bus_Mix_Out")
+            self.assertEqual(engine.strip_node_name("in-1"), "Holaf_Bus_Micro")
+            # Unknown strip → None (the caller falls back to its own convention).
+            self.assertIsNone(engine.strip_node_name("gone"))
+            # A daemon that does not publish the field → None, never "".
+            self.assertIsNone(engine.strip_node_name("in-2"))
+        finally:
+            daemon.close()
+
+    def test_strip_node_name_is_none_when_the_daemon_does_not_answer(self):
+        daemon = ScriptedFakeDaemon(error_methods=(METHOD_STATUS,))
+        engine = IpcAudioEngine(socket_path=daemon.path)
+        try:
+            self.assertIsNone(engine.strip_node_name("out-1"))
         finally:
             daemon.close()
 

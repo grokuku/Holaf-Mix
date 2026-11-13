@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                 QLabel, QScrollArea, QFrame, QPushButton, QInputDialog, QMessageBox,
                                 QDialog, QCheckBox, QDialogButtonBox, QSizePolicy, QSystemTrayIcon, QMenu, QApplication, QStyle)
 from PySide6.QtCore import Qt, QThreadPool, QRunnable, Slot, QTimer, QByteArray
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
 from src.config import settings
 from src.models.strip_model import Strip, StripType, StripMode
 from src.ui.widgets.strip_widget import StripWidget
@@ -27,6 +27,11 @@ THREAD_POOL_MAX_WORKERS = 4
 # Initial MIDI feedback settle time after port open (controllers need this
 # before they'll accept LED update messages).
 MIDI_FEEDBACK_SETTLE_MS = 200
+
+# Hidden diagnostics window (no menu entry, no button — the shortcut only).
+# Ctrl+Shift+D is free: the app defines no other QShortcut and the strip
+# widgets only use local buttons/dialogs (verified against the whole tree).
+DIAGNOSTICS_SHORTCUT = "Ctrl+Shift+D"
 
 # --- Custom Dialog for App Selection ---
 class AppSelectionDialog(QDialog):
@@ -143,6 +148,39 @@ class MainWindow(QMainWindow):
         self.meter_timer.setInterval(METER_POLL_INTERVAL_MS)
         self.meter_timer.timeout.connect(self._update_meters)
         self.meter_timer.start()
+
+        # Hidden diagnostics window (Ctrl+Shift+D).  Not referenced by any
+        # menu/button on purpose: it is a debugging tool, not a feature.
+        self._diagnostics_dialog = None
+        self.diagnostics_shortcut = QShortcut(QKeySequence(DIAGNOSTICS_SHORTCUT), self)
+        self.diagnostics_shortcut.setContext(Qt.ApplicationShortcut)
+        self.diagnostics_shortcut.activated.connect(self.open_diagnostics)
+
+    def open_diagnostics(self):
+        """Show (or raise) the hidden diagnostics window — Ctrl+Shift+D.
+
+        The dialog collects the whole state on a worker thread of this
+        window's pool, so opening it never blocks the UI even when the daemon
+        or PipeWire is unresponsive.  The dialog module is imported here (not
+        at module level) so a run that never opens it does not pay for the
+        import.
+        """
+        from src.ui.diagnostics_dialog import DiagnosticsDialog
+
+        if self._diagnostics_dialog is None:
+            self._diagnostics_dialog = DiagnosticsDialog(
+                audio_engine=self.audio_engine,
+                # Callable, not a snapshot: the strip list is live data.
+                strips=lambda: self.strips,
+                thread_pool=self.thread_pool,
+                parent=self,
+            )
+        dialog = self._diagnostics_dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        # The dialog re-collects itself in showEvent(), so a reopened window
+        # always shows fresh state (a stale report is worse than none).
 
     def _init_tray_icon(self):
         """Sets up the System Tray Icon for minimize/restore behavior."""
@@ -492,10 +530,32 @@ class MainWindow(QMainWindow):
             self._save_state()
             self._move_apps_to_strip(strip, running_apps)
 
+    def _strip_sink_name(self, strip):
+        """Name of the sink an application must be moved to for `strip`.
+
+        The naming rule lives in the daemon: a virtual strip's bus is named
+        after its **label** (`Holaf_Bus_Mix_Out`, `_2` on a label collision —
+        see `holaf_core/graph.rs` and docs/rust-rewrite-status.md), so the name
+        survives the strip being deleted and recreated, and an external program
+        can target it.  Ask the engine first (the Rust daemon publishes it as
+        ``status.strips[].node_name``) and fall back to the classic Python
+        engine's uid-based name when there is no daemon to ask.
+        """
+        getter = getattr(self.audio_engine, "strip_node_name", None)
+        if callable(getter):
+            try:
+                name = getter(strip.uid)
+            except Exception as exc:  # never break app routing on a name lookup
+                logger.debug("strip_node_name(%s) failed: %s", strip.uid, exc)
+                name = None
+            if name:
+                return name
+        return f"Holaf_Strip_{strip.uid}"
+
     def _move_apps_to_strip(self, strip, running_apps=None):
         if not running_apps:
             running_apps = pipewire_utils.get_sink_inputs()
-        target_sink_name = f"Holaf_Strip_{strip.uid}"
+        target_sink_name = self._strip_sink_name(strip)
         for app in running_apps:
             if app['name'] in strip.assigned_apps:
                 pipewire_utils.move_sink_input(app['id'], target_sink_name)

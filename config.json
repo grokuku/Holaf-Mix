@@ -33,14 +33,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": false,
                     "params": {
-                        "Model": 0.0
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -63,21 +70,23 @@
                         "20000Hz gain": 0.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }
@@ -115,14 +124,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": false,
                     "params": {
-                        "Model": 0.0
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -145,21 +161,23 @@
                         "20000Hz gain": 0.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }
@@ -199,14 +217,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": true,
                     "params": {
-                        "Model": 5.1
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -229,21 +254,23 @@
                         "20000Hz gain": -30.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }
@@ -284,14 +311,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": false,
                     "params": {
-                        "Model": 0.0
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -314,21 +348,23 @@
                         "20000Hz gain": 0.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }
@@ -372,14 +408,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": false,
                     "params": {
-                        "Model": 5.0
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -402,21 +445,23 @@
                         "20000Hz gain": 0.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }
@@ -460,14 +505,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": false,
                     "params": {
-                        "Model": 0.0
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -490,21 +542,23 @@
                         "20000Hz gain": 0.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }
@@ -530,14 +584,21 @@
                     "params": {
                         "Threshold (dB)": -30.0,
                         "Attack (ms)": 5.0,
-                        "Release (ms)": 200.0,
-                        "Hold (ms)": 50.0
+                        "Hold (ms)": 50.0,
+                        "Decay (ms)": 200.0,
+                        "LF key filter (Hz)": 33.6,
+                        "HF key filter (Hz)": 23520.0,
+                        "Range (dB)": -90.0,
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
                     }
                 },
                 "noise_cancel": {
                     "active": false,
                     "params": {
-                        "Model": 0.0
+                        "VAD Threshold (%)": 74.25,
+                        "VAD Grace Period (ms)": 500,
+                        "Retroactive VAD Grace (ms)": 100,
+                        "Dry Mix": 0.0
                     }
                 },
                 "eq": {
@@ -560,21 +621,23 @@
                         "20000Hz gain": 0.0
                     }
                 },
-                "compressor": {
-                    "active": false,
-                    "params": {
-                        "Threshold (dB)": -15.0,
-                        "Ratio (1:n)": 4.0,
-                        "Attack (ms)": 20.0,
-                        "Release (ms)": 300.0,
-                        "Makeup Gain (dB)": 0.0
-                    }
-                },
                 "tube": {
                     "active": false,
                     "params": {
-                        "Distortion level": 0.0,
-                        "Distortion character": 0.5
+                        "Drive": 0.0,
+                        "Tape--Tube Blend": 0.5
+                    }
+                },
+                "compressor": {
+                    "active": false,
+                    "params": {
+                        "Ratio (1:n)": 4.0,
+                        "Threshold level (dB)": -15.0,
+                        "Attack time (ms)": 20.0,
+                        "Release time (ms)": 300.0,
+                        "Makeup gain (dB)": 0.0,
+                        "RMS/peak": 0.0,
+                        "Knee radius (dB)": 3.25
                     }
                 }
             }

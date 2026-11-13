@@ -60,9 +60,14 @@ IPC `meter.sources` (et la clé `meter_sources` de `engine.status`).  Règle de 
 | cas | source à écouter |
 |---|---|
 | entrée, physique | `<device_name>` (le nœud source lui-même) |
-| entrée, virtuelle | `Holaf_Strip_<uid>.monitor` |
+| entrée, virtuelle | `<bus>.monitor` |
 | sortie, physique | `<device_name>.monitor` |
-| sortie, virtuelle | `Holaf_Strip_<uid>.monitor` |
+| sortie, virtuelle | `<bus>.monitor` |
+
+où `<bus>` est le nom **public** du bus du strip, dérivé du libellé
+(`"Mix Out"` → `Holaf_Bus_Mix_Out`) et non plus de l'uid — voir
+[`rust-rewrite-status.md` §2.4](./rust-rewrite-status.md#24-noms-de-nœuds--bus-stables-dérivés-du-label)
+pour la convention complète et la migration depuis `Holaf_Strip_<uid>`.
 
 Le nom ne dépend pas de l'état du filtre : pour une sortie, la chaîne joue dans le
 même nœud (le monitor est donc post-FX) ; pour une entrée, le VU affiche le signal

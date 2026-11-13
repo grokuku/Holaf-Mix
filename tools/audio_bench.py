@@ -15,9 +15,9 @@ Topology (identical in every scenario)
 
     pw-cat (1 kHz tone) ─► input.Holaf_FX_b ─► [filter-chain] ─► output.Holaf_FX_b
                                                                     │
-                                                        Holaf_Strip_b (null-sink)
-                                                                    │
-                                                    Holaf_Strip_b.monitor ─► pw-cat -r
+                                                    Holaf_Bus_Bench (null-sink)   ← or the
+                                                                    │              N-channel device
+                                            Holaf_Bus_Bench.monitor ─► pw-cat -r   (--device-channels)
 
 Scenarios
 ---------
@@ -27,6 +27,17 @@ Scenarios
     holafd   chain hosted by holafd, in-process
              → CASE B, the shape of the Rust engine (the reported bug)
     fxhost   chain hosted by `holafd --fx-host` (dedicated process, after fix)
+
+Variants
+--------
+`--device-channels 4` feeds the chain into a **4-channel** null-sink
+(`audio.channels=4`, `audio.position=[ FL FR RL RR ]`) instead of the strip's
+own stereo bus, and captures that device's monitor.  It reproduces the topology
+of a 4-output USB interface (`alsa_output.usb-…pro-output-0  s32le 4ch`), where
+the engine links only FL/FR of a 4-port device — the setup the user reported
+"chopping on the headset, not on the 2ch speakers".  Measured here: identical
+holes/THD/steps with 2 and 4 channels, i.e. the channel count of the destination
+is not what chops.
 
 Metrics per run
 ---------------
@@ -61,10 +72,28 @@ HEADLESS = os.path.join(ROOT, "scripts", "start-pipewire-headless.sh")
 TONE = "/tmp/holaf-bench-tone.wav"
 WORK = "/tmp/holaf-bench"
 UID = "b"
+STRIP_LABEL = "Bench"
+# Node the chain feeds for a stereo run.  The default is the *legacy* name used
+# by the classic Python engine; when the daemon is the one creating the bus it is
+# refreshed from `status.strips[].node_name` (the bus is named after the label:
+# `Holaf_Bus_Bench`, see `holaf_core::graph` and docs/rust-rewrite-status.md).
 STRIP_NODE = f"Holaf_Strip_{UID}"
 FX_IN = f"input.Holaf_FX_{UID}"
 FX_OUT = f"output.Holaf_FX_{UID}"
-MONITOR = f"{STRIP_NODE}.monitor"
+
+# Number of channels of the node the chain feeds (see the "Variants" note).
+DEVICE_CHANNELS = 2
+
+
+def downstream_node() -> str:
+    """Node the chain's playback stream must feed.
+
+    With `--device-channels 2` (default) that is the strip's own stereo bus; with
+    4 (or more) it is a dedicated multi-channel null-sink, so the graph looks
+    like a strip driving a 4-output USB interface.
+    """
+    return STRIP_NODE if DEVICE_CHANNELS == 2 else f"BenchDev{DEVICE_CHANNELS}ch"
+
 
 # Where the built binaries live (release first, then debug).
 def bin_path(name: str) -> str:
@@ -198,11 +227,17 @@ def wait_node(name, timeout=10.0):
     return False
 
 
-def create_null_sink(name):
-    run(["pw-cli", "create-node", "adapter",
-         "{ factory.name=support.null-audio-sink "
-         f"node.name={name} node.description={name} media.class=Audio/Sink "
-         "object.linger=true audio.position=[ FL FR ] }"])
+def create_null_sink(name, channels: int = 2):
+    channels = max(channels, 2)
+    positions = " ".join(["FL", "FR", "RL", "RR", "SL", "SR", "TFL", "TFR",
+                          "TC", "TBL", "TBR", "LFE"][:channels])
+    spec = (
+        "{{ factory.name=support.null-audio-sink "
+        "node.name={name} node.description={name} media.class=Audio/Sink "
+        "object.linger=true audio.channels={channels} "
+        "audio.position=[ {positions} ] }}"
+    ).format(name=name, channels=channels, positions=positions)
+    run(["pw-cli", "create-node", "adapter", spec])
     if not wait_node(name, 8):
         raise SystemExit(f"null-sink {name} never appeared")
 
@@ -215,10 +250,11 @@ def ensure_chain_downstream_links():
     """Chain playback → strip input, exactly as the Python engine does it
     explicitly (WirePlumber may or may not have used `target.object`)."""
     listed = run(["pw-link", "-l"]).stdout
+    sink = downstream_node()
     made = 0
     for port in ("output_FL", "output_FR"):
         if f"{FX_OUT}:{port}" not in listed:
-            target = f"{STRIP_NODE}:playback_{port.split('_')[1]}"
+            target = f"{sink}:playback_{port.split('_')[1]}"
             r = link(f"{FX_OUT}:{port}", target)
             made += r.returncode == 0
     return made
@@ -241,14 +277,14 @@ def chain_graph_active() -> bool:
 # ---------------------------------------------------------------------------
 
 def setup_ref(poll_hz: float = 0.0):
-    create_null_sink(STRIP_NODE)
+    create_null_sink(downstream_node(), DEVICE_CHANNELS)
     return lambda: None
 
 
 def setup_pwcli(poll_hz: float = 0.0):
     """CASE A — host the chain in a separate, long-lived `pw-cli`, like the
     Python engine (`subprocess.Popen(['pw-cli'])` + `load-module …`)."""
-    create_null_sink(STRIP_NODE)
+    create_null_sink(downstream_node(), DEVICE_CHANNELS)
     cfg = chain_config()
     proc = subprocess.Popen(["pw-cli"], env=bench_env(), stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -272,18 +308,50 @@ def setup_pwcli(poll_hz: float = 0.0):
     return cleanup
 
 
-SNAPSHOT = {
-    "strips": [{
-        "uid": UID, "label": "Bench", "kind": "output", "mode": "virtual",
-        "volume": 1.0, "mute": False, "is_mono": False, "routes": [],
-        "device_name": None, "assigned_apps": [], "is_default": False,
-        "effects": {
-            "eq": {"active": True, "params": {}},
-            "compressor": {"active": False, "params": {}},
-            "tube": {"active": False, "params": {}},
-        },
-    }]
-}
+def refresh_strip_node(sock: str) -> None:
+    """Adopt the public bus name the daemon published for the bench strip.
+
+    The bus of a virtual strip is named after its **label** (`Holaf_Bus_Bench`),
+    not after its uid, so the bench must not guess it — it asks `status`, the
+    documented entry point (`strips[].node_name`).  A daemon that does not
+    publish the field (older build) keeps the legacy default.
+    """
+    global STRIP_NODE
+    r = run([bin_path("holafctl"), "--socket", sock, "status"])
+    try:
+        doc = json.loads(r.stdout)
+    except Exception:
+        return
+    # `holafctl` prints the IPC envelope ({"id":…, "ok":…, "result":{…}}).
+    doc = (doc or {}).get("result", doc) or {}
+    for strip in doc.get("strips") or []:
+        if strip.get("uid") == UID and strip.get("node_name"):
+            STRIP_NODE = strip["node_name"]
+            log(f"bench strip bus: {STRIP_NODE}")
+
+
+def snapshot() -> dict:
+    """The bench strip, as the daemon receives it.
+
+    With `--device-channels > 2` the strip is backed by the multi-channel test
+    device (`device_name`), so the daemon anchors the FX chain to it exactly as
+    it would to a real 4-output interface; otherwise it is a plain virtual strip
+    and the daemon creates its own stereo bus.
+    """
+    return {
+        "strips": [{
+            "uid": UID, "label": STRIP_LABEL, "kind": "output",
+            "mode": "virtual" if DEVICE_CHANNELS == 2 else "physical",
+            "volume": 1.0, "mute": False, "is_mono": False, "routes": [],
+            "device_name": None if DEVICE_CHANNELS == 2 else downstream_node(),
+            "assigned_apps": [], "is_default": False,
+            "effects": {
+                "eq": {"active": True, "params": {}},
+                "compressor": {"active": False, "params": {}},
+                "tube": {"active": False, "params": {}},
+            },
+        }]
+    }
 
 
 def start_holafd(fx_host_mode: str = "external"):
@@ -291,6 +359,10 @@ def start_holafd(fx_host_mode: str = "external"):
     for p in (sock,):
         if os.path.exists(p):
             os.unlink(p)
+    # The multi-channel variant needs its device to exist *before* the
+    # snapshot: the daemon anchors the chain to it and defers otherwise.
+    if DEVICE_CHANNELS != 2:
+        create_null_sink(downstream_node(), DEVICE_CHANNELS)
     logf = open(os.path.join(WORK, "holafd.log"), "w")
     proc = subprocess.Popen(
         [bin_path("holafd"), "--backend", "pipewire", "--socket", sock,
@@ -307,11 +379,12 @@ def start_holafd(fx_host_mode: str = "external"):
     time.sleep(0.2)
     snap = os.path.join(WORK, "snapshot.json")
     with open(snap, "w") as f:
-        json.dump(SNAPSHOT, f)
+        json.dump(snapshot(), f)
     r = run([bin_path("holafctl"), "--socket", sock, "apply-snapshot",
              "--config", snap], timeout=180)
     if r.returncode != 0:
         log("apply-snapshot FAILED:", r.returncode, r.stdout[-400:], r.stderr[-400:])
+    refresh_strip_node(sock)
     return proc, sock
 
 
@@ -376,7 +449,12 @@ SETUPS = {
 # ---------------------------------------------------------------------------
 
 def play_target(scenario: str) -> str:
-    return STRIP_NODE if scenario == "ref" else FX_IN
+    return downstream_node() if scenario == "ref" else FX_IN
+
+
+def monitor_name() -> str:
+    """The source to record: the monitor of the node the chain feeds."""
+    return f"{downstream_node()}.monitor"
 
 
 def read_wav_f32(path: str):
@@ -517,7 +595,7 @@ def measure(scenario: str, seconds: float = 5.0, latency: str = "500ms"):
     daemon_pids, child_pids = holafd_pids(split=True)
     cpu_before = (cpu_ticks(daemon_pids), cpu_ticks(child_pids))
     rec = subprocess.Popen(["pw-cat", "-r", "--latency", latency,
-                            "--target", MONITOR, "--format", "f32",
+                            "--target", monitor_name(), "--format", "f32",
                             "--rate", "48000", "--channels", "2", wav],
                            env=bench_env(), stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
@@ -741,8 +819,13 @@ def main():
         p.add_argument("--seconds", type=float, default=5.0)
         p.add_argument("--repeats", type=int, default=1)
         p.add_argument("--latency", default="500ms")
+        p.add_argument("--device-channels", type=int, default=2, metavar="N",
+                       help="feed the chain into an N-channel null-sink (4 = a "
+                            "4-output USB interface) instead of the stereo bus")
         p.add_argument("--json", default=None)
     args = ap.parse_args()
+    global DEVICE_CHANNELS
+    DEVICE_CHANNELS = max(2, args.device_channels)
     if args.cmd == "run":
         r = one_run(args.scenario, args.quantum, args.load, args.seconds,
                     args.poll, args.latency)

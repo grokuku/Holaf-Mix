@@ -266,7 +266,23 @@ impl PwSession {
         None
     }
 
-    fn create_null_sink(&self, name: &str, description: &str) -> Result<(), BackendError> {
+    /// Create a strip's **bus** null-sink under its planned name (see
+    /// [`graph::bus_node_name`]).
+    ///
+    /// The node also carries `holaf.uid` / `holaf.kind` / `holaf.label`
+    /// ([`graph::UID_PROP`], [`graph::KIND_PROP`], [`graph::LABEL_PROP`]).  They
+    /// are **informational** — they make `pw-dump` / `pw-cli info <node>`
+    /// self-explanatory — and deliberately not what the reconciler keys on:
+    /// PipeWire exports only a fixed key subset in registry globals, so a custom
+    /// key never reaches the client that would need it (see the `graph` module
+    /// docs).
+    fn create_null_sink(
+        &self,
+        name: &str,
+        description: &str,
+        uid: &str,
+        label: &str,
+    ) -> Result<(), BackendError> {
         let node = self
             .core
             .create_object::<pw::node::Node>(
@@ -279,18 +295,21 @@ impl PwSession {
                     "audio.channels" => "2",
                     "audio.position" => "[ FL, FR ]",
                     "object.linger" => "1",
+                    graph::UID_PROP => uid,
+                    graph::KIND_PROP => graph::KIND_BUS,
+                    graph::LABEL_PROP => label,
                 },
             )
-            .map_err(|e| BackendError::internal("create null sink", e))?;
+            .map_err(|e| BackendError::internal("create bus", e))?;
         // Keep the owning proxy alive: dropping it would destroy the node.
         self.created_nodes.borrow_mut().push(node);
         if self.wait_node(name, NODE_POLL_ATTEMPTS, NODE_POLL_DELAY_MS).is_none() {
             return Err(BackendError::new(
                 "node_not_ready",
-                format!("null-sink '{name}' never appeared in the registry"),
+                format!("bus '{name}' never appeared in the registry"),
             ));
         }
-        log::info!("created null-sink '{name}'");
+        log::info!("created bus '{name}' (uid '{uid}')");
         Ok(())
     }
 
@@ -429,6 +448,15 @@ pub struct Engine {
     avail: PluginSet,
     /// Desired strips (post-migration), keyed by uid — for `status` and diffs.
     strips: IndexMap<String, Strip>,
+    /// `uid → bus node name` of the current snapshot (see
+    /// [`graph::NodeNames`]).
+    ///
+    /// One plan for the whole snapshot, so that the volume push, the FX chain
+    /// anchor, the routes and the metering all agree on the same name.  It is
+    /// re-derived at every `apply_snapshot` and *kept* (the plan is sticky) so
+    /// the reconciler can still find, and tear down, the node of a strip that
+    /// just disappeared from the snapshot.
+    names: graph::NodeNames,
     /// Where this engine's filter-chain modules live: in a dedicated child
     /// process (`holafd --fx-host`, the default) or inside this process.
     /// See [`ChainHost`] — the engine is deliberately agnostic to the answer.
@@ -491,6 +519,7 @@ impl Engine {
             session,
             avail,
             strips: IndexMap::new(),
+            names: graph::NodeNames::default(),
             host,
             routes: HashSet::new(),
             default_sink: None,
@@ -816,6 +845,15 @@ impl Engine {
         // until an unrelated *second* apply — the "much louder than the Python
         // engine" report).
         self.strips = desired;
+        // The naming plan of this snapshot: sticky (a strip keeps the name it
+        // already had while its label slugs to the same base) and collision-free
+        // (`Holaf_Bus_Mix_Out`, `Holaf_Bus_Mix_Out_2`, …).  Every later phase
+        // derives its names from this single plan.
+        let previous_names = std::mem::take(&mut self.names);
+        self.names = graph::NodeNames::plan(self.strips.values(), &previous_names);
+        // A strip whose label changed publishes a new bus name: the node under
+        // the old name is ours and must go (its FX chain is anchored to it).
+        self.drop_renamed_buses(&previous_names);
         let uids: Vec<String> = self.strips.keys().cloned().collect();
 
         // 3) strip nodes first (null-sinks) — no link before its node exists.
@@ -864,6 +902,11 @@ impl Engine {
             let _ = self.set_default_sink(&uid);
         }
 
+        // Nothing named like one of our buses may live outside the plan: that
+        // is what guarantees a renamed or removed strip never leaves an orphan
+        // bus behind (and what replaces a node created by an older build).
+        self.sweep_stale_buses();
+
         self.running = true;
         // A respawn during this apply restored chains whose links this same
         // pass may already have rebuilt — re-verify them through the repair
@@ -909,10 +952,20 @@ impl Engine {
     /// Reconcile the strip's own node: a null-sink for a virtual strip, and for
     /// a physical strip nothing to create — but a *missing device* is recorded
     /// so the graph heals as soon as it shows up.
+    ///
+    /// # Renaming (label change)
+    ///
+    /// The bus name follows the strip **label**, so renaming a strip in the UI
+    /// changes its public node name.  [`Engine::drop_renamed_buses`] destroys
+    /// the node published under the old name (unloading its FX chain first, since
+    /// the chain's `target.object` still names it), and this function then
+    /// creates the bus under the new one.  Nothing is left behind: the naming
+    /// plan is the ownership record, and [`Engine::sweep_stale_buses`] enforces
+    /// it at the end of every apply.
     fn sync_strip_node(&mut self, strip: &Strip) {
         let uid = &strip.uid;
         if graph::is_physical(strip) {
-            let device = graph::master_node_name(strip);
+            let device = self.names.master_node(strip);
             if self.session.view().node_named(&device).is_none() {
                 // Headless / unplugged / not negotiated yet: the device node is
                 // owned by its driver, we cannot create it.  Record it so a
@@ -929,14 +982,24 @@ impl Engine {
             }
             return;
         }
-        let name = graph::strip_node_name(uid);
+
+        let name = self.bus_name(uid);
+
+        // The bus is already published under the name this snapshot's plan
+        // gives it: nothing to do (the common case on every apply).
+        //
+        // Names are collision-free *within* a plan, so a live node carrying
+        // exactly this name is this strip's bus (a rename was already handled
+        // by [`Engine::drop_renamed_buses`], any other leftover by
+        // [`Engine::sweep_stale_buses`]).
         if self.session.view().node_named(&name).is_some() {
             return;
         }
+
         let desc = format!("Holaf Mix: {}", strip.label);
-        if let Err(e) = self.session.create_null_sink(&name, &desc) {
+        if let Err(e) = self.session.create_null_sink(&name, &desc, uid, &strip.label) {
             log::warn!(
-                "strip '{}': null-sink '{name}' could not be created: {}",
+                "strip '{}': bus '{name}' could not be created: {}",
                 strip.label,
                 e.message
             );
@@ -945,6 +1008,112 @@ impl Engine {
                 e.message,
                 Retry::Strip { uid: uid.clone() },
             );
+        }
+    }
+
+    /// Destroy a node **and every link touching it**.
+    ///
+    /// A leftover link would reference a destroyed node — WirePlumber then
+    /// spends a moment re-deriving the graph, and on PipeWire 0.3.65 the stale
+    /// link objects can keep a destroyed node's id alive in the registry.
+    fn destroy_node_with_links(&mut self, node_id: u32) {
+        let links: Vec<u32> = self
+            .session
+            .view()
+            .links_of_node(node_id)
+            .map(|l| l.id)
+            .collect();
+        for id in links {
+            self.session.destroy_global(id);
+        }
+        self.session.destroy_global(node_id);
+        for _ in 0..2 {
+            self.session.roundtrip();
+        }
+    }
+
+    /// Destroy the bus a strip published under a **previous** name.
+    ///
+    /// Renaming a strip in the UI changes its label, hence its bus name (see
+    /// [`graph::NodeNames`]).  Left alone, the old node would keep playing the
+    /// same signal under a name nobody can trace back to a strip — and, worse,
+    /// the strip would own two sinks.  The node is recognised by the name the
+    /// *previous* plan gave it (we are the only creator of `Holaf_Bus_*`), the
+    /// FX chain is unloaded first because its `target.object` still names it,
+    /// and the new bus is created by the node phase that follows.
+    fn drop_renamed_buses(&mut self, previous: &graph::NodeNames) {
+        let renamed: Vec<(String, String, String)> = self
+            .strips
+            .values()
+            .filter_map(|strip| {
+                let old = previous.get(&strip.uid)?;
+                let new = self.names.get(&strip.uid)?;
+                (old != new).then(|| (strip.uid.clone(), strip.label.clone(), old.to_string()))
+            })
+            .collect();
+        for (uid, label, old_name) in renamed {
+            let Some(id) = self.session.view().node_named(&old_name).map(|n| n.id) else {
+                continue; // never published (e.g. the strip was physical)
+            };
+            log::info!(
+                "strip '{label}': bus renamed '{old_name}' → '{}' (label changed)",
+                self.bus_name(&uid)
+            );
+            // The chain is anchored to the old name: drop it, the chain phase
+            // rebuilds it against the new bus.
+            self.unload_chain(&uid);
+            self.destroy_node_with_links(id);
+        }
+    }
+
+    /// Destroy every bus-looking node that is **not** in the current plan.
+    ///
+    /// One invariant, checked after every apply: the live set of
+    /// `Holaf_Bus_*` / `Holaf_Strip_*` nodes must be exactly what the plan
+    /// asks for.  Everything else is debris — a bus left by a renamed strip, a
+    /// strip removed from the snapshot, a node created by an older build (or by
+    /// the legacy Python engine), a crashed run.  Names are collision-free
+    /// within a plan, so this can never destroy a live bus.
+    ///
+    /// FX chain nodes (`Holaf_FX_*`, `input./output.Holaf_FX_*`) are **not**
+    /// touched: they belong to the chain host's handles, which own their
+    /// lifecycle.
+    fn sweep_stale_buses(&mut self) {
+        let planned: HashSet<String> = self
+            .strips
+            .values()
+            .filter(|s| !graph::is_physical(s))
+            .map(|s| self.bus_name(&s.uid))
+            .collect();
+        let stale: Vec<(u32, String)> = {
+            let view = self.session.view();
+            view.nodes()
+                .iter()
+                .filter(|n| {
+                    n.name.starts_with(graph::BUS_PREFIX)
+                        || n.name.starts_with(graph::LEGACY_STRIP_PREFIX)
+                })
+                .filter(|n| !planned.contains(&n.name))
+                .map(|n| (n.id, n.name.clone()))
+                .collect()
+        };
+        for (id, name) in stale {
+            log::info!("destroying stale bus '{name}' (not part of the snapshot)");
+            self.destroy_node_with_links(id);
+        }
+    }
+
+    /// The public bus name of a strip (`Holaf_Bus_<Label>`, suffix included),
+    /// see [`graph::NodeNames`].
+    fn bus_name(&self, uid: &str) -> String {
+        if let Some(name) = self.names.get(uid) {
+            return name.to_string();
+        }
+        match self.strips.get(uid) {
+            Some(strip) => graph::bus_node_name(&strip.label, 1),
+            // Not a strip we know (teardown of a phantom uid): fall back to the
+            // historical name so any legacy node is still found.
+            None => graph::legacy_strip_node_name(uid),
         }
     }
 
@@ -984,7 +1153,7 @@ impl Engine {
             // output strip's chain ended up playing into another strip's
             // null-sink, i.e. a completely wrong audio path — and the explicit
             // intra-strip link could never be made.  Defer instead.
-            let anchor = graph::master_node_name(strip);
+            let anchor = self.names.master_node(strip);
             if self.session.view().node_named(&anchor).is_none() {
                 // Warn once, then debug: the repair pass retries this every few
                 // seconds while the device is away.
@@ -1065,7 +1234,7 @@ impl Engine {
         if !self.host.contains(uid) {
             return true;
         }
-        let anchor = graph::master_node_name(strip);
+        let anchor = self.names.master_node(strip);
         let (source, target, mono) = match ChainFlavour::of(strip) {
             ChainFlavour::Output => (
                 graph::fx_output_node_name(uid),
@@ -1113,12 +1282,12 @@ impl Engine {
     /// a few milliseconds after the node shows up in the registry.  Our
     /// `set_param` therefore races with it, and the restore can overwrite the
     /// volume we just applied (measured on the sandbox: a stale
-    /// `Holaf_Strip_…:channelVolumes=1.0;1.0` came back right after the snapshot
+    /// `Holaf_Bus_…:channelVolumes=1.0;1.0` came back right after the snapshot
     /// had set 0.085).  Re-asserting once after the node has settled makes the
     /// strip's configured volume win, which is what the Python engine got for
     /// free by calling `pactl` after the node existed.
     fn sync_strip_volume(&mut self, strip: &Strip) {
-        let master = graph::master_node_name(strip);
+        let master = self.names.master_node(strip);
         match self.session.bind_node_by_name(&master) {
             Ok(Some(node)) => {
                 if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute) {
@@ -1235,7 +1404,8 @@ impl Engine {
     /// then let the verification pass wire the intra-strip link.
     fn create_chain(&mut self, strip: &Strip) -> Result<(), BackendError> {
         let uid = &strip.uid;
-        let spec = ChainSpec::for_strip(strip)?;
+        let bus = self.bus_name(uid);
+        let spec = ChainSpec::for_strip(strip, &bus)?;
         let flavour = ChainFlavour::of(strip);
         let fx_name = spec.fx_name.clone();
         self.host.load(uid, &spec.config)?;
@@ -1396,10 +1566,11 @@ impl Engine {
     ///
     /// Runtime orders (`set_volume`, `set_mute`) resolve the strip through the
     /// engine state; the *reconciler* never does (it derives the name from the
-    /// strip it is holding, see [`graph::master_node_name`]) — looking it up
-    /// here during the first apply was exactly the volume bug.
+    /// strip it is holding plus the snapshot's naming plan, see
+    /// [`graph::NodeNames::master_node`]) — looking it up here during the first
+    /// apply was exactly the volume bug.
     fn strip_master_node_name(&self, uid: &str) -> Option<String> {
-        self.strips.get(uid).map(graph::master_node_name)
+        self.strips.get(uid).map(|s| self.names.master_node(s))
     }
 
     fn set_volume(&mut self, uid: &str, value: f32) -> Result<JsonValue, BackendError> {
@@ -1532,7 +1703,7 @@ impl Engine {
         // just created:
         //
         // - a brand-new chain moves the endpoints of every route this strip is
-        //   part of (`Holaf_Strip_<uid>` → `output.Holaf_FX_<uid>` / …);
+        //   part of (`Holaf_Bus_<Label>` → `output.Holaf_FX_<uid>` / …);
         // - and a toggle is the user's only lever on a graph that was built
         //   wrong at startup (chain created while its target was absent, links
         //   dropped by a sweep, ports that appeared late).  It used to do
@@ -1592,7 +1763,7 @@ impl Engine {
         if self.host.contains(uid) {
             return Some(graph::fx_output_node_name(uid));
         }
-        Some(graph::master_node_name(strip))
+        Some(self.names.master_node(strip))
     }
 
     /// Effective *target* sink node name of a strip: chain capture sink if the
@@ -1602,7 +1773,7 @@ impl Engine {
         if self.host.contains(uid) {
             return Some(graph::fx_input_node_name(uid));
         }
-        Some(graph::master_node_name(strip))
+        Some(self.names.master_node(strip))
     }
 
 
@@ -1762,8 +1933,8 @@ impl Engine {
         let Some(target_strip) = self.strips.get(target_uid).cloned() else {
             return;
         };
-        for src in graph::route_source_candidates(&source_strip) {
-            for dst in graph::route_target_candidates(&target_strip) {
+        for src in self.names.route_source_candidates(&source_strip) {
+            for dst in self.names.route_target_candidates(&target_strip) {
                 self.unlink_nodes(&src, &dst);
             }
         }
@@ -1812,7 +1983,7 @@ impl Engine {
         let node_name = if graph::is_physical(&strip) {
             strip.device_name.clone()
         } else {
-            Some(graph::strip_node_name(uid))
+            Some(self.bus_name(uid))
         };
         let Some(node_name) = node_name else {
             return Err(BackendError::new("no_node", format!("strip '{uid}' has no node")));
@@ -1838,9 +2009,7 @@ impl Engine {
             .iter()
             .filter(|n| {
                 matches!(n.media_class.as_str(), "Audio/Sink" | "Audio/Source")
-                    && !n.name.starts_with("Holaf_")
-                    && !n.name.starts_with("input.Holaf_FX_")
-                    && !n.name.starts_with("output.Holaf_FX_")
+                    && !is_holaf_node(n)
             })
             .map(|n| {
                 json!({
@@ -1854,19 +2023,30 @@ impl Engine {
     }
 
     fn status(&mut self) -> Result<JsonValue, BackendError> {
+        // Every strip plus its **public handle**: `node_name` is the bus node
+        // other programs target (`Holaf_Bus_<Label>`, see
+        // [`graph::bus_node_name`]).  Clients (the Qt UI moving an app onto a
+        // strip, scripts, the user's own tooling) must use this field rather
+        // than rebuilding a name from the uid — the name no longer contains it.
         let strips: Vec<JsonValue> = self
             .strips
             .values()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(|e| BackendError::internal("status", e))?;
+            .map(|strip| {
+                let mut value = serde_json::to_value(strip)
+                    .map_err(|e| BackendError::internal("status", e))?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("node_name".into(), json!(self.bus_name(&strip.uid)));
+                }
+                Ok(value)
+            })
+            .collect::<Result<_, _>>()?;
 
         // Live Holaf_* node names (external verification / debugging).
         let view = self.session.view();
         let mut holaf_nodes: Vec<&str> = view
             .nodes()
             .iter()
-            .filter(|n| n.name.starts_with("Holaf_") || n.name.contains("Holaf_FX_"))
+            .filter(|n| is_holaf_node(n))
             .map(|n| n.name.as_str())
             .collect();
         holaf_nodes.sort();
@@ -1926,7 +2106,7 @@ impl Engine {
         for strip in self.strips.values() {
             sources.insert(
                 strip.uid.clone(),
-                JsonValue::String(graph::meter_source_name(strip)),
+                JsonValue::String(self.names.meter_source(strip)),
             );
         }
         sources.into()
@@ -1944,12 +2124,24 @@ impl Engine {
     // Teardown / cleanup
     // ------------------------------------------------------------------
 
+    /// Remove one strip from the graph and from the engine state.
+    ///
+    /// The bus is looked up under the name the *current* plan gave it (this runs
+    /// before the plan of the new snapshot is computed, so that name is the one
+    /// the node was published under), with the historical
+    /// `Holaf_Strip_<uid>` as a second net for a node left by an older build.
+    /// Missing it here would orphan a bus forever — and only
+    /// [`Engine::sweep_stale_buses`] would catch it, at the next apply.
     fn teardown_strip(&mut self, uid: &str) {
         self.unload_chain(uid);
-        let name = graph::strip_node_name(uid);
+        let planned = self.bus_name(uid);
+        let legacy = graph::legacy_strip_node_name(uid);
         let node_and_links = {
             let view = self.session.view();
-            match view.node_named(&name) {
+            let node = view
+                .node_named(&planned)
+                .or_else(|| view.node_named(&legacy));
+            match node {
                 Some(node) => {
                     let links: Vec<u32> = view.links_of_node(node.id).map(|l| l.id).collect();
                     Some((node.id, links))
@@ -1965,6 +2157,9 @@ impl Engine {
             self.session.roundtrip();
         }
         self.strips.shift_remove(uid);
+        // The plan must forget it too: the uid may be recycled by a brand new
+        // strip, which then starts from a fresh name.
+        self.names = graph::NodeNames::plan(self.strips.values(), &self.names);
         self.routes.retain(|(s, t)| s != uid && t != uid);
         // Do not keep retrying work that belongs to a strip nobody wants.
         let key = Self::strip_key(uid);
@@ -1992,11 +2187,7 @@ impl Engine {
         let nodes: Vec<u32> = view
             .nodes()
             .iter()
-            .filter(|n| {
-                n.name.starts_with("Holaf_Strip_")
-                    || n.name.starts_with("input.Holaf_FX_")
-                    || n.name.starts_with("output.Holaf_FX_")
-            })
+            .filter(|n| is_holaf_node(n))
             .map(|n| n.id)
             .collect();
         drop(view);
@@ -2008,6 +2199,7 @@ impl Engine {
             self.session.sleep_pumping(Duration::from_millis(40));
         }
         self.strips.clear();
+        self.names = graph::NodeNames::default();
         self.routes.clear();
         self.pending.clear();
         self.repair_attempts = 0;
@@ -2015,14 +2207,19 @@ impl Engine {
         log::info!("engine teardown complete");
     }
 
-    /// Destroy every live object whose name contains `Holaf_` (debris from a
-    /// previous crashed run) — mirrors Python `_clean_zombie_nodes`.
+    /// Destroy every live node of ours (debris from a previous crashed run) —
+    /// mirrors Python `_clean_zombie_nodes`.
+    ///
+    /// Two detections, so a rename can never hide a node: the authoritative
+    /// `holaf.uid` marker (see [`graph::UID_PROP`]) and the historical `Holaf_`
+    /// name prefix (which also catches nodes created by an older build, or by
+    /// the legacy Python engine, before the marker existed).
     fn sweep_zombies(&mut self) {
         let view = self.session.view();
         let ids: Vec<u32> = view
             .nodes()
             .iter()
-            .filter(|n| n.name.contains("Holaf_"))
+            .filter(|n| is_holaf_node(n))
             .map(|n| n.id)
             .collect();
         drop(view);
@@ -2066,7 +2263,7 @@ impl ChainSpec {
     /// Build the chain spec of `strip`, or `fx_graph_empty` when none of the
     /// active effects has an installed plugin (the Python engine behaviour:
     /// no usable plugin → no chain).
-    pub fn for_strip(strip: &Strip) -> Result<ChainSpec, BackendError> {
+    pub fn for_strip(strip: &Strip, bus: &str) -> Result<ChainSpec, BackendError> {
         let graph = spa::build_graph(strip, true);
         if graph.is_empty() {
             return Err(BackendError::new(
@@ -2080,7 +2277,7 @@ impl ChainSpec {
         let is_output = matches!(ChainFlavour::of(strip), ChainFlavour::Output);
         let fx_name = graph::fx_node_name(&strip.uid);
         let description = sanitize_description(&strip.label);
-        let target = chain_target_object(strip);
+        let target = chain_target_object(strip, bus);
         let config = spa_config::build_filter_chain_config(
             &fx_name,
             &format!("Holaf FX {description}"),
@@ -2101,8 +2298,8 @@ impl ChainSpec {
 /// strip's master node (device for a physical strip, null-sink otherwise) — an
 /// output chain's playback stream drives it, an input chain's capture stream
 /// reads it.
-fn chain_target_object(strip: &Strip) -> Option<String> {
-    Some(graph::master_node_name(strip))
+fn chain_target_object(strip: &Strip, bus: &str) -> Option<String> {
+    Some(graph::master_node_name(strip, bus))
 }
 
 /// Sanitize a user label into an SPA-safe description (alnum + space only).
@@ -2125,6 +2322,19 @@ fn sanitize_description(label: &str) -> String {
 
 fn unknown_strip(uid: &str) -> BackendError {
     BackendError::new("unknown_strip", format!("no strip with uid '{uid}'"))
+}
+
+/// Is `node` one of the nodes this engine owns (and may destroy)?
+///
+/// The `holaf.uid` marker ([`graph::UID_PROP`]) is authoritative — it is the
+/// only identity that survives a label change.  The name prefixes are kept as a
+/// second net, because nodes created by an older build (or by the legacy Python
+/// engine) carry no marker at all and must still be swept.
+fn is_holaf_node(node: &LiveNode) -> bool {
+    node.is_ours()
+        || node.name.contains("Holaf_")
+        || node.name.starts_with("input.Holaf_FX_")
+        || node.name.starts_with("output.Holaf_FX_")
 }
 
 fn app_list_stub() -> JsonValue {
@@ -2305,15 +2515,22 @@ mod tests {
         assert_eq!(LinkReport { created: 1, existing: 1 }.total(), 2);
     }
 
-    /// A physical strip with an empty `device_name` must resolve to its null
-    /// sink, never to an empty node name (the old code produced `""` and every
-    /// link attempt on it failed).
+    /// A physical strip with an empty `device_name` must resolve to its bus,
+    /// never to an empty node name (the old code produced `""` and every link
+    /// attempt on it failed).
     #[test]
     fn chain_anchor_never_resolves_to_an_empty_name() {
         let mut strip = Strip::with_uid("x", "Casque", holaf_core::model::StripType::Output);
         strip.device_name = Some(String::new());
-        assert_eq!(chain_target_object(&strip), Some("Holaf_Strip_x".to_string()));
+        let bus = graph::bus_node_name(&strip.label, 1);
+        assert_eq!(
+            chain_target_object(&strip, &bus),
+            Some("Holaf_Bus_Casque".to_string())
+        );
         strip.device_name = Some("alsa_output.usb".into());
-        assert_eq!(chain_target_object(&strip), Some("alsa_output.usb".to_string()));
+        assert_eq!(
+            chain_target_object(&strip, &bus),
+            Some("alsa_output.usb".to_string())
+        );
     }
 }
