@@ -69,6 +69,7 @@ use serde_json::Value;
 use holaf_core::backend::{Backend, BackendError};
 use holaf_core::model::{EffectKey, Strip};
 
+use crate::chainhost::FxHostMode;
 use crate::engine::{Engine, EngineOp};
 
 /// How long an operation may block on the PipeWire worker before the backend
@@ -88,6 +89,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// (measured 0.7 % CPU with a chain loaded).  With no chain hosted there is
 /// nothing to service, so the worker blocks on the channel instead: 0 %.
 const IDLE_PUMP_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// How often the worker checks that a **dedicated FX host is still alive**
+/// while it has nothing else to do.
+///
+/// With the chains hosted in a child process the worker has no mainloop to
+/// service, so it blocks on its order channel — but it must still notice the
+/// child dying (a crash, an OOM kill, a user `kill`), otherwise the graph keeps
+/// reporting a chain that no longer exists until some unrelated order happens
+/// to call `load`.  Two `waitpid`-cheap wake-ups per second; a respawn is
+/// immediate and the repair pass then re-links the restored chains.
+const HOST_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Message sent to the worker thread.
 enum WorkerMsg {
@@ -120,15 +132,21 @@ pub struct PipeWireBackend {
 
 impl PipeWireBackend {
     /// Connect to the PipeWire daemon of the process environment and spawn
-    /// the worker thread that owns the graph.
+    /// the worker thread that owns the graph, hosting the FX chains in a
+    /// dedicated child process (see [`FxHostMode`]).
     pub fn connect() -> Result<Self, BackendError> {
+        PipeWireBackend::connect_with(FxHostMode::default())
+    }
+
+    /// Same, choosing who hosts the strips' filter-chains.
+    pub fn connect_with(fx_host: FxHostMode) -> Result<Self, BackendError> {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), BackendError>>(1);
 
         let worker = thread::Builder::new()
             .name("holaf-pw".into())
             .spawn(move || {
-                let engine = match Engine::connect() {
+                let engine = match Engine::connect_with(fx_host) {
                     Ok(engine) => {
                         let _ = ready_tx.send(Ok(()));
                         engine
@@ -231,7 +249,7 @@ fn worker_loop(rx: Receiver<WorkerMsg>, mut engine: Engine) {
             }
         }
 
-        if engine.hosts_chains() {
+        if engine.needs_idle_pumping() {
             // Keep the hosted filter-chains serviced (see the doc comment).
             // A negative return means the loop could not be iterated (e.g. a
             // signal interrupted it): back off instead of spinning hot.
@@ -257,10 +275,22 @@ fn worker_loop(rx: Receiver<WorkerMsg>, mut engine: Engine) {
                 Err(RecvTimeoutError::Timeout) => engine.repair_pending(),
                 Err(RecvTimeoutError::Disconnected) => return,
             }
+        } else if engine.hosts_external() {
+            // Nothing of ours runs in this process (a child hosts the FX
+            // chains) and the graph is complete: sleep on the channel, but wake
+            // up periodically to check that the child is still there.
+            match rx.recv_timeout(HOST_WATCHDOG_INTERVAL) {
+                Ok(msg) => {
+                    if run_order(&mut engine, msg) == Flow::Stop {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => engine.maintain(),
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         } else {
-            // Nothing of ours runs in this process and the graph is complete:
-            // block on the channel (zero CPU) and wake up as soon as an order
-            // arrives.
+            // Nothing of ours runs anywhere and the graph is complete: block on
+            // the channel (zero CPU) and wake up as soon as an order arrives.
             match rx.recv() {
                 Ok(msg) => {
                     if run_order(&mut engine, msg) == Flow::Stop {

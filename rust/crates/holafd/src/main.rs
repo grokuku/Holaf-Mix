@@ -29,7 +29,7 @@ use std::thread;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use holaf_pw::PipeWireBackend;
+use holaf_pw::{FxHostMode, PipeWireBackend};
 use holafd::config_check::{load_plan, print_plan};
 use holafd::{FakeBackend, Server, UnimplementedBackend};
 
@@ -38,6 +38,8 @@ holafd — Holaf-Mix daemon (NDJSON Unix-socket server)
 
 USAGE:
     holafd [--socket <path>] [--backend fake|unimplemented|pipewire]
+           [--fx-host-mode external|inprocess]
+    holafd --fx-host
     holafd --check-config <config.json>
     holafd --help
 
@@ -47,6 +49,18 @@ OPTIONS:
                            (default) or 'pipewire' (real PipeWire engine).  The
                            pipewire backend connects through the PipeWire env
                            (XDG_RUNTIME_DIR / PIPEWIRE_RUNTIME_DIR / PIPEWIRE_REMOTE).
+    --fx-host-mode <mode>  Who hosts the strips' filter-chains:
+                           'external' (default) delegates them to a dedicated
+                           child process — `holafd --fx-host`, spawned on
+                           demand — whose only job is to run a PipeWire
+                           mainloop, exactly like the `pw-cli` the Python
+                           engine uses; 'inprocess' keeps them inside this
+                           process (the pre-2026-11 behaviour, and the
+                           automatic fallback if the child cannot be spawned).
+                           Env: $HOLAF_FX_HOST.
+    --fx-host              Run as the FX host child (internal: started by
+                           holafd itself; talks NDJSON on stdin/stdout and
+                           never opens a socket).
     --check-config <path>  Load config.json, run migrations and print the graph
                            plan WITHOUT connecting to PipeWire; exit 0.
     --help                 Show this help and exit
@@ -66,7 +80,10 @@ enum Command {
     Run {
         socket: PathBuf,
         backend: BackendKind,
+        fx_host: FxHostMode,
     },
+    /// `--fx-host`: be the FX host process (child of a `Run` daemon).
+    FxHost,
     CheckConfig(PathBuf),
     Help,
 }
@@ -75,6 +92,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut socket: Option<PathBuf> = None;
     let mut backend = BackendKind::Unimplemented;
     let mut check_config: Option<PathBuf> = None;
+    let mut fx_host = match std::env::var("HOLAF_FX_HOST") {
+        Ok(v) if !v.is_empty() => {
+            FxHostMode::parse(&v).map_err(|e| format!("HOLAF_FX_HOST: {e}"))?
+        }
+        _ => FxHostMode::default(),
+    };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -100,6 +123,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     }
                 };
             }
+            "--fx-host" => return Ok(Command::FxHost),
+            "--fx-host-mode" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--fx-host-mode requires external|inprocess".to_string())?;
+                fx_host = FxHostMode::parse(value)?;
+            }
             "--check-config" => {
                 let value = iter
                     .next()
@@ -118,7 +148,11 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
 
     let socket = socket.unwrap_or_else(default_socket_path);
-    Ok(Command::Run { socket, backend })
+    Ok(Command::Run {
+        socket,
+        backend,
+        fx_host,
+    })
 }
 
 /// Resolve the default socket: `$HOLAF_SOCKET`, else `/tmp/holaf-$USER.sock`.
@@ -162,7 +196,11 @@ fn run_check_config(path: &Path) -> i32 {
     }
 }
 
-fn run_daemon(socket: PathBuf, backend: BackendKind) -> Result<(), Box<dyn std::error::Error>> {
+fn run_daemon(
+    socket: PathBuf,
+    backend: BackendKind,
+    fx_host: FxHostMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     // Install the handlers *before* binding/connecting so a Ctrl-C during a
     // slow PipeWire connect is still honoured.
@@ -173,7 +211,7 @@ fn run_daemon(socket: PathBuf, backend: BackendKind) -> Result<(), Box<dyn std::
         BackendKind::Unimplemented => Server::bind_boxed(&socket, Box::new(UnimplementedBackend))?,
         BackendKind::PipeWire => {
             log::info!("connecting to the PipeWire daemon of the current environment…");
-            let pw = PipeWireBackend::connect().map_err(|e| {
+            let pw = PipeWireBackend::connect_with(fx_host).map_err(|e| {
                 std::io::Error::other(format!("cannot start the pipewire backend: {e}"))
             })?;
             Server::bind(&socket, pw)?
@@ -241,7 +279,15 @@ fn main() {
             0
         }
         Command::CheckConfig(path) => run_check_config(&path),
-        Command::Run { socket, backend } => match run_daemon(socket, backend) {
+        // The FX host is a *child* process: it never opens a socket, never
+        // accepts orders, and its whole job is running a PipeWire mainloop
+        // while it hosts filter-chains (see holaf_pw::fxhost).
+        Command::FxHost => holaf_pw::fxhost::run_host(),
+        Command::Run {
+            socket,
+            backend,
+            fx_host,
+        } => match run_daemon(socket, backend, fx_host) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -282,9 +328,16 @@ mod tests {
     fn parse_run_defaults() {
         let args: Vec<String> = vec![];
         match parse_args(&args).unwrap() {
-            Command::Run { backend, socket } => {
+            Command::Run {
+                backend,
+                socket,
+                fx_host,
+            } => {
                 assert_eq!(backend, BackendKind::Unimplemented);
                 assert!(socket.as_os_str().to_string_lossy().contains("holaf-"));
+                // Default hosting: a dedicated child process (the `pw-cli`
+                // shape the Python engine proved).
+                assert_eq!(fx_host, FxHostMode::External);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -306,6 +359,29 @@ mod tests {
             Command::Run { backend, .. } => assert_eq!(backend, BackendKind::PipeWire),
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_fx_host_mode_flag() {
+        let args: Vec<String> = vec!["--fx-host-mode".into(), "inprocess".into()];
+        match parse_args(&args).unwrap() {
+            Command::Run { fx_host, .. } => assert_eq!(fx_host, FxHostMode::InProcess),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_fx_host_mode_rejects_nonsense() {
+        let args: Vec<String> = vec!["--fx-host-mode".into(), "elsewhere".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_fx_host_subcommand() {
+        let args: Vec<String> = vec!["--fx-host".into()];
+        assert!(matches!(parse_args(&args).unwrap(), Command::FxHost));
+        // It must not be treated as a daemon run (which would open a socket).
+        assert!(!matches!(parse_args(&args).unwrap(), Command::Run { .. }));
     }
 
     #[test]

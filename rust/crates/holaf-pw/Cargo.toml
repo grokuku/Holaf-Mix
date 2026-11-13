@@ -21,3 +21,7 @@ env_logger = { workspace = true }
 [[bin]]
 name = "holaf-spike"
 path = "src/bin/holaf-spike.rs"
+
+[[bin]]
+name = "holaf-fxcfg"
+path = "src/bin/holaf-fxcfg.rs"

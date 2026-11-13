@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use holaf_core::backend::Backend;
 use holaf_core::model::{EffectKey, Strip, StripType};
-use holaf_pw::PipeWireBackend;
+use holaf_pw::{FxHostMode, PipeWireBackend};
 
 /// Both live tests drive the *same* daemon (one shared graph, `stop()` between
 /// phases), so they must never overlap: cargo runs tests in parallel by
@@ -42,6 +42,41 @@ fn live_allowed() -> bool {
         .or_else(|_| std::env::var("PIPEWIRE_RUNTIME_DIR"))
         .unwrap_or_default();
     dir.contains("pw-runtime") || dir.contains("holaf")
+}
+
+/// Is the runtime dir the *sandbox* (so restarting it is safe)?
+fn sandbox_runtime() -> bool {
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .or_else(|_| std::env::var("PIPEWIRE_RUNTIME_DIR"))
+        .unwrap_or_default();
+    dir.contains("pw-runtime") || dir.contains("holaf")
+}
+
+/// Restart the headless sandbox daemon so every live test starts from a
+/// pristine graph (never touches a real session).
+///
+/// Measured in this sandbox: PipeWire 0.3.65 stops publishing `Port` globals
+/// after many create/destroy cycles on one long-lived daemon, after which every
+/// link creation fails ("input null-sink monitor must be linked to the chain
+/// capture sink (got 0 links)").  The FX-host tests add chain churn (respawn,
+/// restore), so each test now restarts the daemon first, exactly like
+/// `apply_robustness.rs` does.
+fn fresh_sandbox_daemon() {
+    if !sandbox_runtime() {
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../scripts/start-pipewire-headless.sh"
+    );
+    let _ = Command::new("bash").arg(script).arg("restart").output();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if run("pw-dump", &[]).is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn run(bin: &str, args: &[&str]) -> Option<String> {
@@ -174,6 +209,7 @@ fn apply_snapshot_creates_chain_and_reads_back_eq_params() {
         return;
     }
 
+    fresh_sandbox_daemon();
     let mut backend = match PipeWireBackend::connect() {
         Ok(b) => b,
         Err(e) => {
@@ -353,6 +389,7 @@ fn meter_sources_expose_recordable_pulse_sources() {
         eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
         return;
     }
+    fresh_sandbox_daemon();
     let mut backend = match PipeWireBackend::connect() {
         Ok(b) => b,
         Err(e) => {
@@ -456,20 +493,25 @@ fn mainloop_pumps(backend: &mut PipeWireBackend) -> u64 {
 ///
 /// # What is asserted
 ///
-/// With a chain hosted and **no order issued at all**, the idle pump counter
-/// must keep growing (the worker is servicing the mainloop instead of blocking
-/// on the channel); without a chain it must stay frozen (the worker blocks and
-/// costs 0 % CPU).  Both directions are checked so the test cannot be satisfied
-/// by a busy loop.
+/// With a chain hosted **in this process** ([`FxHostMode::InProcess`]) and no
+/// order issued at all, the idle pump counter must keep growing (the worker is
+/// servicing the mainloop instead of blocking on the channel); without a chain
+/// it must stay frozen (the worker blocks and costs 0 % CPU).  Both directions
+/// are checked so the test cannot be satisfied by a busy loop.
+///
+/// The **default** hosting mode delegates all of this to a child process; see
+/// [`dedicated_fx_host_owns_the_mainloop_and_respawns`], which asserts the
+/// mirror-image invariant (the daemon does *not* pump, the child is alive).
 #[test]
-fn mainloop_is_pumped_while_the_daemon_is_idle() {
+fn in_process_hosting_pumps_the_mainloop_while_the_daemon_is_idle() {
     let _guard = live_lock();
     let _ = env_logger::try_init();
     if !live_allowed() {
         eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
         return;
     }
-    let mut backend = match PipeWireBackend::connect() {
+    fresh_sandbox_daemon();
+    let mut backend = match PipeWireBackend::connect_with(FxHostMode::InProcess) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
@@ -505,4 +547,170 @@ fn mainloop_is_pumped_while_the_daemon_is_idle() {
         idle_before, idle_after,
         "with no chain hosted the worker must block on its order channel (no idle pumping)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The dedicated FX host: who services the chain, and what happens when it dies
+// ---------------------------------------------------------------------------
+
+/// Is `pid` a live process (and not a zombie)?
+fn pid_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            // Field 3 (after the parenthesised comm) is the state letter.
+            let state = stat
+                .rsplit(") ")
+                .next()
+                .and_then(|tail| tail.chars().next());
+            !matches!(state, Some('Z') | None)
+        }
+        Err(_) => false,
+    }
+}
+
+fn fx_host_status(backend: &mut PipeWireBackend) -> serde_json::Value {
+    backend.status().expect("status")["fx_host"].clone()
+}
+
+/// The default hosting mode must put the chain in a **dedicated child process**
+/// and leave the daemon's own mainloop idle.
+///
+/// # Why this is the fix
+///
+/// A `module-filter-chain` lives inside the client process that loaded it: its
+/// streams are made schedulable by that process's mainloop and its `process`
+/// callbacks run on its data loop.  Hosting it in `holafd` therefore mixes the
+/// chain with IPC, reconciliation, repair and logging on the same thread — the
+/// reported "chops only in Rust mode, on a USB device" symptom.  A dedicated
+/// process that does nothing but run `pw_main_loop_run()` is exactly what the
+/// Python engine has always done with `pw-cli`, and it never chopped.
+///
+/// # What is asserted
+///
+/// 1. `status.fx_host.mode == "external"` with a **live** child pid, and the
+///    chains listed there;
+/// 2. during 400 ms of complete inactivity the daemon performs **no** idle
+///    pumping (the child owns the loop now) while the child stays alive;
+/// 3. the chain is really usable from the daemon's side (its flat `Props` can
+///    still be written through the daemon-side node, i.e. hot-reload works
+///    across the process boundary);
+/// 4. killing the child makes the next order respawn it and restore the chain
+///    **without the user doing anything** (same chain uids, live pid again).
+#[test]
+fn dedicated_fx_host_owns_the_mainloop_and_respawns() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    fresh_sandbox_daemon();
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    let uid = "fxhost-live";
+    backend
+        .apply_snapshot(&[output_strip(uid, true)])
+        .expect("apply_snapshot with FX");
+
+    // 1) the chain is hosted by a live child, not by us.
+    let host = fx_host_status(&mut backend);
+    assert_eq!(host["mode"], "external", "default hosting must be external: {host}");
+    let pid = host["pid"].as_u64().expect("status.fx_host.pid") as u32;
+    assert!(pid_alive(pid), "the FX host (pid {pid}) must be running");
+    assert_ne!(pid, std::process::id(), "the FX host must be another process");
+    let chains: Vec<String> = host["chains"]
+        .as_array()
+        .expect("status.fx_host.chains")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(chains, vec![uid.to_string()], "the chain must be listed");
+
+    // The chain's stream nodes exist in the daemon (hosted elsewhere, wired
+    // here) and the intra-strip link was made.
+    let names: Vec<String> = backend.status().expect("status")["holaf_nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == &format!("input.Holaf_FX_{uid}")),
+        "chain capture node missing: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == &format!("output.Holaf_FX_{uid}")),
+        "chain playback node missing: {names:?}"
+    );
+
+    // 2) the daemon must NOT be servicing a chain while idle any more.
+    let before = mainloop_pumps(&mut backend);
+    std::thread::sleep(Duration::from_millis(400));
+    let after = mainloop_pumps(&mut backend);
+    assert_eq!(
+        before, after,
+        "the daemon pumped its mainloop {} time(s) while idle: with a dedicated FX host          it has no chain to service and must block on its order channel",
+        after - before
+    );
+    assert!(pid_alive(pid), "the FX host must have kept running while idle");
+
+    // 3) hot-reload still crosses the process boundary.
+    let params = holaf_core::fx::default_params(EffectKey::Eq);
+    backend
+        .fx_set_params(uid, EffectKey::Eq, &params)
+        .expect("fx_set_params reaches the externally hosted chain");
+
+    // 4) the child dies → the next order respawns it and restores the chain.
+    let killed = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("kill the FX host");
+    assert!(killed.success());
+    // Wait for the kernel to reap it, then poke the daemon: `apply_snapshot`
+    // is what a UI order looks like, and it must heal without any special case.
+    for _ in 0..100 {
+        if !pid_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let params2 = holaf_core::fx::default_params(EffectKey::Eq);
+    backend
+        .apply_snapshot(&[output_strip(uid, true)])
+        .expect("apply_snapshot after the FX host died");
+    let _ = backend.fx_set_params(uid, EffectKey::Eq, &params2);
+
+    let host = fx_host_status(&mut backend);
+    // Note: the *pid* is deliberately not compared — a container can hand the
+    // same pid to the replacement process.  The respawn counter, the restored
+    // chain list and a live child are what actually prove the recovery.
+    let pid2 = host["pid"].as_u64().expect("status.fx_host.pid") as u32;
+    assert!(pid_alive(pid2), "the respawned FX host must be running");
+    assert_eq!(host["mode"], "external", "{host}");
+    assert!(
+        host["respawns"].as_u64().unwrap_or(0) >= 1,
+        "the respawn must be counted: {host}"
+    );
+    let chains: Vec<String> = host["chains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        chains,
+        vec![uid.to_string()],
+        "the chain must have been restored in the new host: {host}"
+    );
+
+    // Teardown must leave no FX host behind.
+    backend.stop().expect("stop");
+    assert!(!pid_alive(pid2), "the FX host (pid {pid2}) must not outlive stop()");
 }

@@ -72,9 +72,9 @@ use holaf_core::model::{EffectKey, Strip};
 use holaf_core::spa;
 use holaf_core::fx::PluginSet;
 
+use crate::chainhost::{ChainHost, FxHostMode};
 use crate::live::{collect_view, LiveNode, LiveView, PortDir};
 use crate::spa_config;
-use crate::sys::{self, LocalModule};
 
 /// Polling knobs (same order of magnitude as the Python audio_engine).
 const NODE_POLL_ATTEMPTS: u32 = 40;
@@ -429,8 +429,10 @@ pub struct Engine {
     avail: PluginSet,
     /// Desired strips (post-migration), keyed by uid — for `status` and diffs.
     strips: IndexMap<String, Strip>,
-    /// Locally-hosted filter-chain modules, one per strip uid.
-    modules: IndexMap<String, LocalModule>,
+    /// Where this engine's filter-chain modules live: in a dedicated child
+    /// process (`holafd --fx-host`, the default) or inside this process.
+    /// See [`ChainHost`] — the engine is deliberately agnostic to the answer.
+    host: ChainHost,
     /// Active routes `(source_uid, target_uid)`.
     routes: HashSet<(String, String)>,
     default_sink: Option<String>,
@@ -455,6 +457,11 @@ impl Engine {
     /// honoured by PipeWire, so pointing the backend at the headless daemon is
     /// purely an environment concern).
     pub fn connect() -> Result<Engine, BackendError> {
+        Engine::connect_with(FxHostMode::default())
+    }
+
+    /// Connect and pick where the FX chains are hosted ([`FxHostMode`]).
+    pub fn connect_with(host_mode: FxHostMode) -> Result<Engine, BackendError> {
         pw::init();
         let mainloop = pw::main_loop::MainLoopRc::new(None)
             .map_err(|e| BackendError::new("pipewire_error", format!("mainloop: {e}")))?;
@@ -476,11 +483,15 @@ impl Engine {
             "PipeWire engine connected — {} LADSPA plugin(s) available",
             avail.count()
         );
+        // The FX host is built *after* the context exists: the in-process
+        // flavour needs it, and a failed external spawn falls back to it.
+        let host = ChainHost::from_mode(host_mode, session.context.clone());
+        log::info!("FX chains are hosted by: {}", host.describe());
         Ok(Engine {
             session,
             avail,
             strips: IndexMap::new(),
-            modules: IndexMap::new(),
+            host,
             routes: HashSet::new(),
             default_sink: None,
             running: false,
@@ -491,13 +502,16 @@ impl Engine {
         })
     }
 
-    /// Does this process currently host at least one filter-chain module?
+    /// Must this process keep servicing its mainloop *while it is idle*?
     ///
-    /// Drives the worker's idle policy: chains only get scheduled through
-    /// mainloop traffic, so the loop must be pumped while any is loaded (and
-    /// may block on the order channel otherwise, at zero CPU cost).
-    pub fn hosts_chains(&self) -> bool {
-        !self.modules.is_empty()
+    /// Only when it hosts at least one filter-chain module **itself**: such a
+    /// module is only schedulable through its host's mainloop traffic, so the
+    /// loop must be pumped while one is loaded (and may block on the order
+    /// channel otherwise, at zero CPU cost).  With a dedicated FX host the
+    /// child pumps its own loop and the daemon has nothing to service when no
+    /// order is in flight — which is exactly the point of the split.
+    pub fn needs_idle_pumping(&self) -> bool {
+        self.host.pumps_own_mainloop()
     }
 
     /// Service the PipeWire mainloop once, blocking up to `timeout` for events.
@@ -546,6 +560,10 @@ impl Engine {
     /// Stop the engine and tear down the whole graph (Python `shutdown`).
     pub fn stop(&mut self) -> Result<(), BackendError> {
         self.teardown_all();
+        // No chain may outlive the graph that pointed at it: with a dedicated
+        // FX host this reaps the child process (a later `load` respawns it).
+        self.host.shutdown();
+        log::info!("FX chains are hosted by: {}", self.host.describe());
         self.running = false;
         self.pending.clear();
         self.repair_attempts = 0;
@@ -621,6 +639,49 @@ impl Engine {
     /// Is a repair pass due right now?
     pub fn repair_due(&self) -> bool {
         self.repair_delay() == Some(Duration::ZERO)
+    }
+
+    /// Does a **separate process** host the FX chains?  (Drives the worker's
+    /// maintenance tick: only then can the host die without the daemon
+    /// noticing.)
+    pub fn hosts_external(&self) -> bool {
+        self.host.mode() == FxHostMode::External
+    }
+
+    /// Periodic maintenance of the FX host, called by the worker while the
+    /// daemon is idle.
+    ///
+    /// Two jobs, both cheap when nothing happened:
+    ///
+    /// 1. **notice a dead host** and respawn it ([`ChainHost::ensure_alive`]) —
+    ///    otherwise a host that died while the UI was silent would only be
+    ///    replaced by the next order that happens to call `load`;
+    /// 2. turn every chain the respawn restored into a [`PendingIssue`], so the
+    ///    regular repair pass redoes the intra-strip link and the volume: the
+    ///    chain's stream nodes are brand new (the old ones died with the old
+    ///    client connection), so a restored-but-unlinked chain would be a
+    ///    silent strip.
+    pub fn maintain(&mut self) {
+        let before = self.host.respawns();
+        if let Err(e) = self.host.ensure_alive() {
+            log::warn!("cannot restart the FX host: {}", e.message);
+        } else if self.host.respawns() != before {
+            log::warn!("the FX host was restarted — chains have to be re-verified");
+        }
+        self.drain_host_recoveries();
+    }
+
+    /// Turn "this chain was restored by a respawn" into pending graph work.
+    fn drain_host_recoveries(&mut self) {
+        for uid in self.host.take_restored() {
+            if self.strips.contains_key(&uid) {
+                self.note_pending(
+                    Self::strip_key(&uid),
+                    "FX host restarted — re-verifying its chain",
+                    Retry::Strip { uid },
+                );
+            }
+        }
     }
 
     /// Retry every pending item (called by the worker between orders).
@@ -804,6 +865,10 @@ impl Engine {
         }
 
         self.running = true;
+        // A respawn during this apply restored chains whose links this same
+        // pass may already have rebuilt — re-verify them through the repair
+        // machinery rather than assuming either way.
+        self.drain_host_recoveries();
         let count = self.strips.len();
         if self.pending.is_empty() {
             log::info!("apply_snapshot: {count} strip(s) reconciled");
@@ -896,7 +961,7 @@ impl Engine {
         // live: a sweep, an external `pw-cli destroy` or a module crash can
         // remove them underneath us.  Detect that *before* using the handle,
         // otherwise the reconciler is stuck in `chain_gone` forever.
-        let mut chain_exists = self.modules.contains_key(uid);
+        let mut chain_exists = self.host.contains(uid);
         let mut topology_changed = false;
         if chain_exists && !self.chain_streams_live(uid) {
             log::warn!(
@@ -904,12 +969,7 @@ impl Engine {
                  dropping it so the chain is rebuilt",
                 strip.label
             );
-            if let Some(module) = self.modules.shift_remove(uid) {
-                // SAFETY: deferred destroy from outside any module callback.
-                unsafe {
-                    module.schedule_destroy();
-                }
-            }
+            self.host.mark_stale(uid);
             self.settle(2);
             chain_exists = false;
             topology_changed = true;
@@ -1002,7 +1062,7 @@ impl Engine {
     /// startup stayed broken while toggling the EQ changed nothing.
     fn ensure_chain_links(&mut self, strip: &Strip) -> bool {
         let uid = &strip.uid;
-        if !self.modules.contains_key(uid) {
+        if !self.host.contains(uid) {
             return true;
         }
         let anchor = graph::master_node_name(strip);
@@ -1170,44 +1230,19 @@ impl Engine {
     // Chain lifecycle
     // ------------------------------------------------------------------
 
-    /// Load a filter-chain module for `strip` into our local context, wait for
-    /// its two streams, then wire the intra-strip link (chain output → sink /
-    /// source → chain input).
+    /// Have `strip`'s filter-chain loaded **by the chain host** (a dedicated
+    /// child process by default, see [`ChainHost`]), wait for its two streams,
+    /// then let the verification pass wire the intra-strip link.
     fn create_chain(&mut self, strip: &Strip) -> Result<(), BackendError> {
         let uid = &strip.uid;
-        let graph = spa::build_graph(strip, true);
-        if graph.is_empty() {
-            return Err(BackendError::new(
-                "fx_graph_empty",
-                format!("cannot build FX chain for '{}': no plugin available", strip.label),
-            ));
-        }
+        let spec = ChainSpec::for_strip(strip)?;
         let flavour = ChainFlavour::of(strip);
-        let is_output = matches!(flavour, ChainFlavour::Output);
-        let fx_name = graph::fx_node_name(uid);
-        let description = sanitize_description(&strip.label);
-        let target = chain_target_object(strip);
-        let cfg = spa_config::build_filter_chain_config(
-            &fx_name,
-            &format!("Holaf FX {description}"),
-            &graph,
-            is_output,
-            target.as_deref(),
-        );
+        let fx_name = spec.fx_name.clone();
+        self.host.load(uid, &spec.config)?;
 
-        let module = unsafe {
-            // SAFETY: the context lives as long as the worker; the module is
-            // tracked in self.modules and explicitly destroyed on teardown.
-            sys::load_module(
-                &self.session.context,
-                "libpipewire-module-filter-chain",
-                Some(&cfg),
-                None,
-            )
-            .map_err(|e| BackendError::internal("load filter-chain module", e))?
-        };
-
-        // Wait for both stream nodes to appear in the daemon registry.
+        // Wait for both stream nodes to appear in the daemon registry.  This
+        // works identically for both hosts: the nodes are exported to the
+        // daemon by whichever process loaded the module.
         let in_name = graph::fx_input_node_name(uid);
         let out_name = graph::fx_output_node_name(uid);
         let in_node = self
@@ -1223,20 +1258,14 @@ impl Engine {
                 in_node.is_some(),
                 out_node.is_none()
             );
-            unsafe {
-                module.schedule_destroy();
-            }
-            for _ in 0..CHAIN_TEARDOWN_ROUNDTRIPS {
-                self.session.roundtrip();
-                self.session.sleep_pumping(Duration::from_millis(40));
-            }
+            self.host.unload(uid);
+            self.settle(CHAIN_TEARDOWN_ROUNDTRIPS);
             return Err(BackendError::new(
                 "fx_node_not_ready",
                 format!("FX chain '{}' streams never became ready", strip.label),
             ));
         }
 
-        self.modules.insert(uid.clone(), module);
         log::info!(
             "created FX chain '{}' ({:?}) — {} / {}",
             fx_name,
@@ -1256,23 +1285,24 @@ impl Engine {
         Ok(())
     }
 
-    /// Unload (destroy) every chain module we host.
+    /// Unload (destroy) every chain the host holds for us.
     fn unload_all_chains(&mut self) {
-        for uid in self.modules.keys().cloned().collect::<Vec<_>>() {
-            self.unload_chain(&uid);
+        let uids = self.host.uids();
+        if uids.is_empty() {
+            return;
         }
+        self.host.unload_all();
+        self.settle(CHAIN_TEARDOWN_ROUNDTRIPS);
     }
 
-    /// Unload (destroy) the chain module for `uid`, if any.
+    /// Unload (destroy) the chain of `uid`, if any.
     fn unload_chain(&mut self, uid: &str) {
-        let Some(module) = self.modules.shift_remove(uid) else {
+        if !self.host.contains(uid) {
             return;
-        };
-        // SAFETY: deferred destroy from outside any module callback; the
-        // roundtrips below let the context finish the teardown.
-        unsafe {
-            module.schedule_destroy();
         }
+        self.host.unload(uid);
+        // Give the host (or our own context) time to finish the teardown before
+        // the caller rebuilds or links anything.
         self.settle(CHAIN_TEARDOWN_ROUNDTRIPS);
         log::info!("unloaded FX chain for strip '{uid}'");
     }
@@ -1289,7 +1319,7 @@ impl Engine {
 
     /// Are both stream nodes of `uid`'s chain still in the registry?
     ///
-    /// The module handles in `self.modules` are the only record of a chain we
+    /// The handles kept by the [`ChainHost`] are the only record of a chain we
     /// host, but the *nodes* they export can disappear underneath us (a sweep
     /// after a failed apply, an external `pw-cli destroy`, a module crash).
     /// A stale handle makes every later `push_chain_params` fail with
@@ -1302,27 +1332,54 @@ impl Engine {
             && view.node_named(&graph::fx_output_node_name(uid)).is_some()
     }
 
-    /// `set-param(Props)` with the flat params struct on `input.Holaf_FX_<uid>`.
+    /// Push the flat `Props.params` of `strip`'s chain (hot-reload path).
+    ///
+    /// Two ways to reach the module's `input.Holaf_FX_<uid>` node, and the
+    /// chain host decides which one applies:
+    ///
+    /// * **external host** — the module lives in another process, which owns
+    ///   the node proxy; it applies the params itself
+    ///   ([`ChainHost::set_params`]).
+    /// * **in-process host** — we bind the node from *our* registry view and
+    ///   `set_param` on it directly (the behaviour before the FX-host split).
+    ///
+    /// Either way the values reach the same node through the daemon; the
+    /// difference is only which client writes them.
     fn push_chain_params(&mut self, strip: &Strip) -> Result<(), BackendError> {
         let avail = self.avail.clone();
         let uid = &strip.uid;
+        let pairs = spa::control_pairs_with(strip, &avail);
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        match self.host.set_params(uid, &pairs) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                // The dedicated host no longer knows this chain: its stream
+                // nodes are gone, so stop believing we host it and let the
+                // reconciler rebuild (same self-healing as the in-process path).
+                if e.code == "unknown_chain" || e.code == "chain_gone" {
+                    // The chain's nodes are gone: drop the handle so the
+                    // reconciler rebuilds, but keep wanting the chain.
+                    self.host.mark_stale(uid);
+                }
+                return Err(e);
+            }
+        }
         let in_name = graph::fx_input_node_name(uid);
         let node = match self.session.bind_node_by_name(&in_name)? {
             Some(n) => n,
             None => {
                 // Chain module gone (daemon restart).  Drop our stale handle so
                 // the next activation rebuilds it.
-                self.modules.shift_remove(uid);
+                self.host.mark_stale(uid);
                 return Err(BackendError::new(
                     "chain_gone",
-                    format!("chain '{}' not in registry", in_name),
+                    format!("chain '{in_name}' not in registry"),
                 ));
             }
         };
-        let pairs = spa::control_pairs_with(strip, &avail);
-        if pairs.is_empty() {
-            return Ok(());
-        }
         push_params_pod(&node, &pairs)?;
         // Flush the outbound set_param (delivery happens on mainloop
         // iteration — without this the message would sit in the proxy queue
@@ -1432,7 +1489,7 @@ impl Engine {
         let clone = strip.clone();
 
         let want_chain = graph::wants_fx_chain(&clone, &self.avail);
-        let chain_exists = self.modules.contains_key(uid);
+        let chain_exists = self.host.contains(uid);
         if want_chain && !chain_exists {
             // First activation → build the chain (the intra-strip link is made
             // by `ensure_chain_links` below, which also reports a deferred
@@ -1516,7 +1573,7 @@ impl Engine {
 
         // Hot-reload only makes sense on a live chain; without one the params
         // are stored and applied at the next chain creation/activation.
-        if self.modules.contains_key(uid) {
+        if self.host.contains(uid) {
             self.push_chain_params(&clone)?;
         }
         let state_json = serde_json::to_value(&self.strips[uid].effects[&effect])
@@ -1532,7 +1589,7 @@ impl Engine {
     /// an FX chain, else its master node (device source / null-sink).
     fn effective_source_name(&self, strip: &Strip) -> Option<String> {
         let uid = &strip.uid;
-        if self.modules.contains_key(uid) {
+        if self.host.contains(uid) {
             return Some(graph::fx_output_node_name(uid));
         }
         Some(graph::master_node_name(strip))
@@ -1542,7 +1599,7 @@ impl Engine {
     /// strip has an FX chain, else its master node (device sink / null-sink).
     fn effective_target_name(&self, strip: &Strip) -> Option<String> {
         let uid = &strip.uid;
-        if self.modules.contains_key(uid) {
+        if self.host.contains(uid) {
             return Some(graph::fx_input_node_name(uid));
         }
         Some(graph::master_node_name(strip))
@@ -1818,7 +1875,7 @@ impl Engine {
             .strips
             .values()
             .map(|s| {
-                let has_chain = self.modules.contains_key(&s.uid);
+                let has_chain = self.host.contains(&s.uid);
                 json!({ "uid": s.uid, "chain": has_chain })
             })
             .collect();
@@ -1838,6 +1895,17 @@ impl Engine {
             // a user debugging a crackling chain — prove the daemon is really
             // servicing the modules it hosts.
             "mainloop_pumps": self.idle_pumps,
+            // Who hosts the FX chains.  `external` means a dedicated child
+            // process (`holafd --fx-host`) is doing nothing but running its
+            // PipeWire mainloop — the `pw-cli` shape the Python engine proved.
+            // `inprocess` means the chains live in this process (legacy, and
+            // the automatic fallback when the child cannot be spawned).
+            "fx_host": {
+                "mode": self.host.mode().name(),
+                "pid": self.host.pid(),
+                "respawns": self.host.respawns(),
+                "chains": self.host.uids(),
+            },
             // Incomplete graph work (missing device / unlinked route / chain
             // that could not be built).  `degraded: true` explains a graph
             // that sounds wrong without anything being logged as an error, and
@@ -1976,6 +2044,59 @@ impl Engine {
 // Pure/static helpers
 // ---------------------------------------------------------------------------
 
+/// Everything needed to load one strip's filter-chain module.
+///
+/// Built by [`ChainSpec::for_strip`] and consumed by [`Engine::create_chain`]
+/// (in-process hosting) as well as by the `holaf-fxcfg` diagnostic binary and
+/// the external `--fx-host` process (`holafd` ships it over the NDJSON
+/// protocol, so both sides share one single source of truth for the SPA-JSON).
+pub struct ChainSpec {
+    /// Base node name, `Holaf_FX_<uid>`.
+    pub fx_name: String,
+    /// Chain capture stream node, `input.Holaf_FX_<uid>`.
+    pub input_node: String,
+    /// Chain playback stream node, `output.Holaf_FX_<uid>`.
+    pub output_node: String,
+    /// Module argument string (`filter.graph` + `capture.props` +
+    /// `playback.props`), ready for `pw_context_load_module`.
+    pub config: String,
+}
+
+impl ChainSpec {
+    /// Build the chain spec of `strip`, or `fx_graph_empty` when none of the
+    /// active effects has an installed plugin (the Python engine behaviour:
+    /// no usable plugin → no chain).
+    pub fn for_strip(strip: &Strip) -> Result<ChainSpec, BackendError> {
+        let graph = spa::build_graph(strip, true);
+        if graph.is_empty() {
+            return Err(BackendError::new(
+                "fx_graph_empty",
+                format!(
+                    "cannot build FX chain for '{}': no plugin available",
+                    strip.label
+                ),
+            ));
+        }
+        let is_output = matches!(ChainFlavour::of(strip), ChainFlavour::Output);
+        let fx_name = graph::fx_node_name(&strip.uid);
+        let description = sanitize_description(&strip.label);
+        let target = chain_target_object(strip);
+        let config = spa_config::build_filter_chain_config(
+            &fx_name,
+            &format!("Holaf FX {description}"),
+            &graph,
+            is_output,
+            target.as_deref(),
+        );
+        Ok(ChainSpec {
+            fx_name,
+            input_node: graph::fx_input_node_name(&strip.uid),
+            output_node: graph::fx_output_node_name(&strip.uid),
+            config,
+        })
+    }
+}
+
 /// What `target.object` a chain's playback/capture should point at: the
 /// strip's master node (device for a physical strip, null-sink otherwise) — an
 /// output chain's playback stream drives it, an input chain's capture stream
@@ -2024,7 +2145,10 @@ fn app_move_stub() -> JsonValue {
 
 /// Serialize the flat `Props.params` struct of the filter-chain to a Pod and
 /// `set_param(Props)` on a node proxy (the J1-corrected hot-reload path).
-fn push_params_pod(node: &pw::node::Node, pairs: &[(String, f32)]) -> Result<(), BackendError> {
+pub(crate) fn push_params_pod(
+    node: &pw::node::Node,
+    pairs: &[(String, f32)],
+) -> Result<(), BackendError> {
     let mut struct_values: Vec<Value> = Vec::with_capacity(pairs.len() * 2);
     for (name, value) in pairs {
         struct_values.push(Value::String(name.clone()));

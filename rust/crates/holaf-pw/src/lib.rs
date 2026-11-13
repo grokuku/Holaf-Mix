@@ -9,6 +9,11 @@
 //!   pipewire-rs proper.
 //! - [`spa_config`] — SPA-JSON builders kept as a compact reference (the
 //!   generic filter-chain graph / flat-Props builders live in `holaf-core`).
+//! - [`fxhost`] / [`chainhost`] — the dedicated FX host process (`holafd
+//!   --fx-host`): the filter-chain modules a strip needs live **there**, in a
+//!   process that does nothing but run a PipeWire mainloop, exactly like the
+//!   `pw-cli` the Python engine uses.  `ChainHost` picks between that process
+//!   and in-process hosting (the pre-refactor behaviour).
 //! - [`backend`] / [`engine`] / [`live`] — the real J2 **PipeWireBackend**
 //!   behind the `holaf_core::backend::Backend` trait: a graph reconciler that
 //!   creates null-sinks + filter-chains + links on a live daemon, with volume/
@@ -26,12 +31,15 @@
 //! (`src/bin/holaf-spike.rs`).
 
 pub mod backend;
+pub mod chainhost;
 pub mod engine;
+pub mod fxhost;
 pub mod live;
 pub mod spa_config;
 pub mod sys;
 
 pub use backend::PipeWireBackend;
+pub use chainhost::{ChainHost, FxHostMode};
 pub use live::LiveView;
 // Backwards-compatible re-export for the holaf-spike binary (J1 helpers).
 pub use spa_config::*;

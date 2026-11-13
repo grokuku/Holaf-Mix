@@ -201,6 +201,34 @@ python3 -m unittest tests.test_daemon_lifecycle -v
 
 ---
 
+## 2.3 Les chaînes FX sont hébergées par un processus dédié (`--fx-host`)
+
+Le symptôme « hachage audio en mode Rust seulement, sur une carte USB, quand une
+chaîne FX est active » a une cause structurelle : `module-filter-chain`
+s'exécute **dans le processus client**, et c'est la boucle d'événements de ce
+processus qui rend ses deux *streams* programmables.  Le moteur Python n'a
+jamais haché parce qu'il charge la chaîne dans un `pw-cli` dont le seul métier
+est `pw_main_loop_run()` ; `holafd` l'hébergeait sur la même boucle que l'IPC,
+la réconciliation, la réparation et le logging.
+
+Depuis ce correctif, `holafd` **délègue** l'hébergement à un processus enfant
+`holafd --fx-host` (protocole NDJSON sur stdin/stdout, `stdin` enregistré comme
+source d'IO du mainloop, aucun autre travail sur ce thread) et garde tout le
+graphe : null-sinks, liens, volume/mute, sink par défaut, métriques, routage.
+
+* mode par défaut : `--fx-host-mode external` (env `HOLAF_FX_HOST`) ;
+* repli automatique et **bruyant** vers `inprocess` si l'enfant ne peut pas être
+  lancé (le graphe marche quand même) ;
+* mort de l'hôte : respawn + rejeu des chaînes désirées (l'état désiré est chez
+  le parent) puis re-vérification du lien intra-strip par la passe de
+  réparation ; `status.fx_host = {mode, pid, respawns, chains}` ;
+* l'hôte meurt avec `holafd` (EOF sur son tube, donc `SIGKILL` inclus).
+
+Détails, protocole, mesures CPU et protocole de vérification sur machine réelle :
+[`fx-host.md`](./fx-host.md).
+
+---
+
 ## 3. Comment tester chaque brique
 
 ### 3.1 Rust pur (J0 + J3) — sans PipeWire
