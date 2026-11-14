@@ -152,7 +152,12 @@ impl Textures {
 ///
 /// `pixels_per_point` converts the point-space geometry to pixels; the caller
 /// passes the same value it gave the `Context` (a value > 1 is supersampling).
-pub fn render(fb: &mut Framebuffer, primitives: &[ClippedPrimitive], textures: &Textures, pixels_per_point: f32) {
+pub fn render(
+    fb: &mut Framebuffer,
+    primitives: &[ClippedPrimitive],
+    textures: &Textures,
+    pixels_per_point: f32,
+) {
     let ppp = if pixels_per_point > 0.0 {
         pixels_per_point
     } else {
@@ -184,7 +189,12 @@ pub fn render(fb: &mut Framebuffer, primitives: &[ClippedPrimitive], textures: &
 }
 
 /// Pixel-space clip rectangle, or `None` when fully off-screen.
-fn clip_pixels(rect: Rect, ppp: f32, width: usize, height: usize) -> Option<(usize, usize, usize, usize)> {
+fn clip_pixels(
+    rect: Rect,
+    ppp: f32,
+    width: usize,
+    height: usize,
+) -> Option<(usize, usize, usize, usize)> {
     let min_x = (rect.min.x * ppp).floor().max(0.0) as usize;
     let min_y = (rect.min.y * ppp).floor().max(0.0) as usize;
     let max_x = (rect.max.x * ppp).ceil().min(width as f32) as usize;
@@ -344,6 +354,36 @@ pub fn render_frame(
     time: f64,
     supersample: usize,
     background: Color32,
+    ui_fn: impl FnMut(&mut egui::Ui),
+) -> Framebuffer {
+    render_frame_in_canvas(
+        ctx,
+        size_points,
+        Rect::from_min_size(egui::Pos2::ZERO, size_points),
+        time,
+        supersample,
+        background,
+        ui_fn,
+    )
+}
+
+/// [`render_frame`] with the **window** rectangle decoupled from the canvas.
+///
+/// The canvas is what gets rasterised; `window` is the viewport egui lays the UI
+/// out in (it becomes `RawInput::screen_rect`, which is what the views measure
+/// with `Context::content_rect`).  A canvas wider than the window is therefore
+/// painted with `background` outside the window, and — the reason this exists —
+/// **a dialog never widens the window it floats over**: an `egui::Area` can ask
+/// for more room than the window has, but the strip layout must keep the width
+/// `layout::enforce_window_width` locks, or the two columns get stretched and the
+/// capture grows a trailing band that no real window shows.
+pub fn render_frame_in_canvas(
+    ctx: &egui::Context,
+    canvas_points: egui::Vec2,
+    window: Rect,
+    time: f64,
+    supersample: usize,
+    background: Color32,
     mut ui_fn: impl FnMut(&mut egui::Ui),
 ) -> Framebuffer {
     let factor = supersample.max(1);
@@ -354,17 +394,16 @@ pub fn render_frame(
     // 10 000 points by default) by that factor — which would silently override
     // the `screen_rect` below and yield a 5 000 pt root Ui.  The honest way is
     // to declare the scale as the viewport's *native* pixels-per-point.
-    let rect = Rect::from_min_size(egui::Pos2::ZERO, size_points);
     let viewport_info = egui::ViewportInfo {
         native_pixels_per_point: Some(pixels_per_point),
-        inner_rect: Some(rect),
-        outer_rect: Some(rect),
+        inner_rect: Some(window),
+        outer_rect: Some(window),
         ..Default::default()
     };
     let raw_input = egui::RawInput {
         viewport_id: egui::ViewportId::ROOT,
         viewports: std::iter::once((egui::ViewportId::ROOT, viewport_info)).collect(),
-        screen_rect: Some(rect),
+        screen_rect: Some(window),
         time: Some(time),
         ..Default::default()
     };
@@ -376,8 +415,8 @@ pub fn render_frame(
     let textures = Textures::from_context(ctx);
 
     let mut fb = Framebuffer::new(
-        (size_points.x * pixels_per_point).round() as usize,
-        (size_points.y * pixels_per_point).round() as usize,
+        (canvas_points.x * pixels_per_point).round() as usize,
+        (canvas_points.y * pixels_per_point).round() as usize,
         background,
     );
     render(&mut fb, &primitives, &textures, pixels_per_point);
@@ -455,8 +494,16 @@ mod tests {
         );
         let clip = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 20.0));
         render(&mut fb, &[clipped(mesh, clip)], &white_textures(), 1.0);
-        assert_eq!(fb.pixels[10 * 20 + 5], [0.0, 1.0, 0.0, 1.0], "inside the clip");
-        assert_eq!(fb.pixels[10 * 20 + 15], [0.0, 0.0, 0.0, 1.0], "outside the clip");
+        assert_eq!(
+            fb.pixels[10 * 20 + 5],
+            [0.0, 1.0, 0.0, 1.0],
+            "inside the clip"
+        );
+        assert_eq!(
+            fb.pixels[10 * 20 + 15],
+            [0.0, 0.0, 0.0, 1.0],
+            "outside the clip"
+        );
     }
 
     #[test]
@@ -466,7 +513,12 @@ mod tests {
             Rect::from_min_size(egui::pos2(5.0, 5.0), egui::vec2(10.0, 10.0)),
             Color32::WHITE,
         );
-        render(&mut fb, &[clipped(mesh, Rect::EVERYTHING)], &white_textures(), 2.0);
+        render(
+            &mut fb,
+            &[clipped(mesh, Rect::EVERYTHING)],
+            &white_textures(),
+            2.0,
+        );
         // In points the quad is 5..15; at ppp=2 that is 10..30 px.
         assert_eq!(fb.pixels[20 * 40 + 20], [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(fb.pixels[2 * 40 + 2], [0.0, 0.0, 0.0, 1.0]);
@@ -493,7 +545,11 @@ mod tests {
         let mesh = solid_mesh(Rect::EVERYTHING, Color32::WHITE);
         let clip = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(4.0, 4.0));
         render(&mut fb, &[clipped(mesh, clip)], &white_textures(), 1.0);
-        assert!(fb.pixels.iter().all(|p| p.iter().all(|c| c.is_finite())), "{:?}", fb.pixels[0]);
+        assert!(
+            fb.pixels.iter().all(|p| p.iter().all(|c| c.is_finite())),
+            "{:?}",
+            fb.pixels[0]
+        );
         assert!(fb.pixels.iter().all(|p| *p == [0.0, 0.0, 0.0, 1.0]));
     }
 
@@ -535,7 +591,11 @@ mod tests {
         fb.pixels[0] = [1.0, 1.0, 1.0, 1.0];
         let small = fb.downsample(2);
         assert_eq!(small.width, 1);
-        assert!((small.pixels[0][0] - 0.25).abs() < 1e-6, "{:?}", small.pixels[0]);
+        assert!(
+            (small.pixels[0][0] - 0.25).abs() < 1e-6,
+            "{:?}",
+            small.pixels[0]
+        );
     }
 
     #[test]
@@ -569,7 +629,10 @@ mod tests {
 
     #[test]
     fn bilinear_sampling_clamps_outside_the_texture() {
-        let image = ColorImage::new([2, 2], vec![Color32::RED, Color32::GREEN, Color32::BLUE, Color32::WHITE]);
+        let image = ColorImage::new(
+            [2, 2],
+            vec![Color32::RED, Color32::GREEN, Color32::BLUE, Color32::WHITE],
+        );
         // Corners of the UV square are clamped, never wrapped.
         let top_left = sample_bilinear(&image, -5.0, -5.0);
         assert_eq!(top_left, [1.0, 0.0, 0.0, 1.0]);
@@ -592,7 +655,9 @@ mod tests {
         render(
             &mut fb,
             &[clipped(mesh, whole)],
-            &Textures { font_atlas: texture },
+            &Textures {
+                font_atlas: texture,
+            },
             1.0,
         );
         let pixel = fb.pixels[3]; // (x=1, y=1) in a 2 × 2 framebuffer
@@ -626,20 +691,13 @@ mod tests {
     #[test]
     fn render_frame_supersamples_then_the_caller_downsamples() {
         let ctx = egui::Context::default();
-        let fb = render_frame(
-            &ctx,
-            egui::vec2(20.0, 20.0),
-            1.0,
-            2,
-            Color32::BLACK,
-            |ui| {
-                ui.painter().rect_filled(
-                    Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(20.0, 20.0)),
-                    egui::CornerRadius::ZERO,
-                    Color32::WHITE,
-                );
-            },
-        );
+        let fb = render_frame(&ctx, egui::vec2(20.0, 20.0), 1.0, 2, Color32::BLACK, |ui| {
+            ui.painter().rect_filled(
+                Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(20.0, 20.0)),
+                egui::CornerRadius::ZERO,
+                Color32::WHITE,
+            );
+        });
         assert_eq!((fb.width, fb.height), (40, 40));
         let small = fb.downsample(2);
         assert_eq!((small.width, small.height), (20, 20));
@@ -675,12 +733,50 @@ mod tests {
         assert!(ink > 20, "expected white glyph pixels, found {ink}");
     }
 
+    /// The reason `render_frame_in_canvas` exists: a canvas wider than the
+    /// window must not change the layout.  The window rectangle becomes
+    /// `Context::content_rect`, so the UI sees its locked width; the columns
+    /// outside it keep the background colour.
+    #[test]
+    fn the_canvas_can_be_wider_than_the_window() {
+        let ctx = egui::Context::default();
+        let window = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0));
+        let mut content = egui::vec2(0.0, 0.0);
+        let fb = render_frame_in_canvas(
+            &ctx,
+            egui::vec2(100.0, 30.0),
+            window,
+            1.0,
+            1,
+            Color32::BLACK,
+            |ui| {
+                content = ui.ctx().content_rect().size();
+                ui.painter().rect_filled(
+                    ui.ctx().content_rect(),
+                    egui::CornerRadius::ZERO,
+                    Color32::from_rgb(255, 0, 0),
+                );
+            },
+        );
+        assert_eq!(fb.width, 100, "the canvas is rasterised as asked");
+        assert_eq!(fb.height, 30);
+        assert_eq!(
+            content,
+            egui::vec2(40.0, 30.0),
+            "the UI is laid out in the window, not in the canvas"
+        );
+        // Inside the window: painted.  Outside: the background colour.
+        assert_eq!(fb.pixels[10 * 100 + 10], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(fb.pixels[10 * 100 + 60], [0.0, 0.0, 0.0, 1.0]);
+    }
+
     #[test]
     fn an_empty_primitive_list_leaves_the_background() {
         let mut fb = Framebuffer::new(8, 8, Color32::from_rgb(35, 35, 35));
         render(&mut fb, &[], &white_textures(), 1.0);
-        assert!(fb.pixels.iter().all(|p| {
-            (p[0] - 35.0 / 255.0).abs() < 1e-6 && p[3] == 1.0
-        }));
+        assert!(fb
+            .pixels
+            .iter()
+            .all(|p| { (p[0] - 35.0 / 255.0).abs() < 1e-6 && p[3] == 1.0 }));
     }
 }

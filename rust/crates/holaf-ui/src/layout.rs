@@ -87,17 +87,15 @@ pub fn section_width(strip_count: usize) -> u32 {
         return QT_MIN_SECTION_WIDTH as u32;
     }
     let n = strip_count as f32;
-    let total = n * QT_STRIP_WIDTH + (n - 1.0).max(0.0) * QT_STRIP_SPACING + QT_SECTION_MARGIN_TOTAL;
+    let total =
+        n * QT_STRIP_WIDTH + (n - 1.0).max(0.0) * QT_STRIP_SPACING + QT_SECTION_MARGIN_TOTAL;
     total.max(QT_MIN_SECTION_WIDTH) as u32
 }
 
 /// `(inputs, outputs)` — the two section counts `_adjust_window_size` reads from
 /// `content_layout.count()`.
 pub fn counts(strips: &[Strip]) -> (usize, usize) {
-    let inputs = strips
-        .iter()
-        .filter(|s| s.kind == StripType::Input)
-        .count();
+    let inputs = strips.iter().filter(|s| s.kind == StripType::Input).count();
     (inputs, strips.len() - inputs)
 }
 
@@ -314,8 +312,11 @@ pub fn available_strip_height(theme: &Theme, window_height: f32) -> f32 {
 /// sections — which is what keeps INPUTS and OUTPUTS (and the strips inside a
 /// section) exactly aligned.
 pub fn strip_height_for(theme: &Theme, window_height: f32, route_targets: usize) -> f32 {
-    available_strip_height(theme, window_height)
-        .max(strip_min_height(theme, StripType::Input, route_targets))
+    available_strip_height(theme, window_height).max(strip_min_height(
+        theme,
+        StripType::Input,
+        route_targets,
+    ))
 }
 
 /// Smallest window height that still shows a whole input strip with the minimum
@@ -334,7 +335,7 @@ mod tests {
     use crate::theme::Theme;
 
     fn demo_strips() -> Vec<Strip> {
-        crate::app::AppState::demo().strips
+        crate::app::AppState::demo().strips.clone()
     }
 
     #[test]
@@ -380,7 +381,11 @@ mod tests {
         // Already right (or within rounding): no command, no feedback loop.
         assert_eq!(width_correction(794.0, 794), None);
         assert_eq!(width_correction(795.5, 794), None);
-        assert_eq!(width_correction(792.0, 794), None, "exactly 2 px is tolerated");
+        assert_eq!(
+            width_correction(792.0, 794),
+            None,
+            "exactly 2 px is tolerated"
+        );
         // Off by more than the tolerance: ask for the exact width.
         assert_eq!(width_correction(800.0, 794), Some(794.0));
         assert_eq!(width_correction(452.0, 794), Some(794.0));
@@ -454,7 +459,10 @@ mod tests {
         assert_eq!(routing_plate_height(&t, 3), 68.0);
         assert_eq!(routing_plate_height(&t, 0), 18.0);
         // Inputs: 17 + 12 + 18 + 18 + 14 + 18 + 68 = 165, 7 gaps of 5.
-        assert_eq!(strip_rows_before_fader(&t, StripType::Input, 3), 165.0 + 35.0);
+        assert_eq!(
+            strip_rows_before_fader(&t, StripType::Input, 3),
+            165.0 + 35.0
+        );
         // Outputs: 17 + 12 + 18 + 18 + 20 = 85, 5 gaps of 5.
         assert_eq!(
             strip_rows_before_fader(&t, StripType::Output, 3),
@@ -463,7 +471,10 @@ mod tests {
         // Below the fader: gap + MONO/MUTE + gap + MIDI = 5 + 20 + 5 + 20.
         assert_eq!(strip_rows_after_fader(&t), 50.0);
         // + strip padding 5 + bottom padding 10.
-        assert_eq!(strip_fixed_height(&t, StripType::Input, 3), 200.0 + 50.0 + 15.0);
+        assert_eq!(
+            strip_fixed_height(&t, StripType::Input, 3),
+            200.0 + 50.0 + 15.0
+        );
         assert_eq!(
             strip_fixed_height(&t, StripType::Output, 3),
             110.0 + 50.0 + 15.0
@@ -517,10 +528,7 @@ mod tests {
         assert!((405.0..425.0).contains(&natural), "{natural}");
         assert_eq!(strip_min_height(&t, StripType::Input, 3), natural - 110.0);
         // The minimum window height is the one that still fits that strip.
-        assert_eq!(
-            minimum_window_height(&t, 3),
-            40.0 + 305.0 + 10.0 + 18.0
-        );
+        assert_eq!(minimum_window_height(&t, 3), 40.0 + 305.0 + 10.0 + 18.0);
         assert!(minimum_window_height(&t, 3) < 600.0);
         // The window floor is narrower than any real configuration.
         assert_eq!(minimum_window_width(), 320.0);

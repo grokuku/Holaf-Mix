@@ -25,6 +25,7 @@ use std::hash::Hash;
 
 use egui::{Align2, FontId, Rect, Response, Sense, Ui, Vec2};
 
+use crate::midi::MidiTarget;
 use crate::theme::paint;
 use crate::theme::{HexColor, Theme};
 
@@ -186,7 +187,12 @@ pub fn button_in(
             .unwrap_or_else(|| look.bg.lerp(HexColor::rgb(255, 255, 255), 0.08));
         look.fg = look.fg_hover.unwrap_or(look.fg);
     }
-    paint::fill_rect(&painter, rect, crate::theme::Fill::solid(look.bg), look.radius);
+    paint::fill_rect(
+        &painter,
+        rect,
+        crate::theme::Fill::solid(look.bg),
+        look.radius,
+    );
     if let Some(border) = look.border {
         paint::stroke_rect(&painter, rect, look.radius, border);
     }
@@ -208,7 +214,13 @@ fn button_alloc(ui: &mut Ui, text: &str, size: Vec2, look: &ButtonLook) -> Respo
 // ---------------------------------------------------------------------------
 
 /// One FX toggle (`GT` `RN` `EQ` `TB` `CP`) in the theme's fixed size.
-pub fn fx_button(ui: &mut Ui, salt: impl Hash + std::fmt::Debug, label: &str, active: bool, theme: &Theme) -> Response {
+pub fn fx_button(
+    ui: &mut Ui,
+    salt: impl Hash + std::fmt::Debug,
+    label: &str,
+    active: bool,
+    theme: &Theme,
+) -> Response {
     let size = Vec2::new(
         theme.dimensions.fx_button_width,
         theme.dimensions.fx_button_height,
@@ -246,7 +258,13 @@ pub fn fx_button_in(
 // ---------------------------------------------------------------------------
 
 /// A routing chip that fills the available width.
-pub fn route_button(ui: &mut Ui, salt: impl Hash + std::fmt::Debug, label: &str, active: bool, theme: &Theme) -> Response {
+pub fn route_button(
+    ui: &mut Ui,
+    salt: impl Hash + std::fmt::Debug,
+    label: &str,
+    active: bool,
+    theme: &Theme,
+) -> Response {
     let width = ui.available_width().max(20.0);
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(width, theme.dimensions.route_button_height),
@@ -333,12 +351,50 @@ pub fn state_button_in(
 // MIDI
 // ---------------------------------------------------------------------------
 
+/// What a strip's MIDI button shows.
+///
+/// Three states, in priority order: a learn is armed (`LEARNING...`, orange —
+/// `set_learning(true)` in Qt), a control was just learned (`CC 19`, green for
+/// [`MIDI_FLASH_INTERVAL`](crate::app::MIDI_FLASH_INTERVAL): the Qt UI reverted to
+/// a plain `MIDI` with no confirmation), or nothing special.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MidiButtonState<'a> {
+    /// The property a learn is waiting for (`LEARNING...` while `Some`); it is
+    /// also what the strip's MIDI menu shows as armed.
+    pub armed: Option<MidiTarget>,
+    /// Text shown after a learn (`Binding::short_label`).
+    pub flash: Option<&'a str>,
+    /// Hover text: the strip's current mappings and what a click opens.
+    pub tooltip: Option<&'a str>,
+}
+
+impl MidiButtonState<'_> {
+    /// Is a learn armed (the whole strip paints orange, `set_learning(true)`)?
+    pub fn learning(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// The text the button paints.
+    pub fn label(&self) -> &str {
+        if self.learning() {
+            "LEARNING..."
+        } else {
+            self.flash.unwrap_or("MIDI")
+        }
+    }
+}
+
 /// MIDI button (`background-color: #333; color: #888`), orange while learning.
-pub fn midi_button(ui: &mut Ui, salt: impl Hash + std::fmt::Debug, learning: bool, theme: &Theme) -> Response {
+pub fn midi_button(
+    ui: &mut Ui,
+    salt: impl Hash + std::fmt::Debug,
+    state: MidiButtonState<'_>,
+    theme: &Theme,
+) -> Response {
     let width = ui.available_width().max(20.0);
     let size = Vec2::new(width, theme.dimensions.midi_button_height);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    midi_button_in(ui, salt, rect, learning, theme)
+    midi_button_in(ui, salt, rect, state, theme)
 }
 
 /// MIDI button into an explicit rect.
@@ -347,11 +403,22 @@ pub fn midi_button(ui: &mut Ui, salt: impl Hash + std::fmt::Debug, learning: boo
 ///           { background-color: #333; color: #888; border: none; font-size: 10px; }
 /// :hover    { background-color: #444; color: white; }
 /// learning  { background-color: #f39c12; color: black; font-weight: bold; }
+/// learned   { background-color: #2ecc71; color: white; }   (Rust-only flash)
 /// ```
-pub fn midi_button_in(ui: &Ui, salt: impl Hash + std::fmt::Debug, rect: Rect, learning: bool, theme: &Theme) -> Response {
+pub fn midi_button_in(
+    ui: &Ui,
+    salt: impl Hash + std::fmt::Debug,
+    rect: Rect,
+    state: MidiButtonState<'_>,
+    theme: &Theme,
+) -> Response {
     let c = &theme.colors;
-    let look = if learning {
+    let look = if state.learning() {
         ButtonLook::new(c.learning, HexColor::rgb(0, 0, 0))
+            .with_font_size(theme.typography.midi)
+            .bold(theme.typography.bold_extra)
+    } else if state.flash.is_some() {
+        ButtonLook::new(c.accent, c.accent_text)
             .with_font_size(theme.typography.midi)
             .bold(theme.typography.bold_extra)
     } else {
@@ -360,8 +427,7 @@ pub fn midi_button_in(ui: &Ui, salt: impl Hash + std::fmt::Debug, rect: Rect, le
             .with_radius(0.0)
             .with_hover(c.midi_hover_bg, c.midi_hover_text)
     };
-    let text = if learning { "LEARNING..." } else { "MIDI" };
-    button_in(ui, salt, rect, text, &look)
+    button_in(ui, salt, rect, state.label(), &look)
 }
 
 // ---------------------------------------------------------------------------

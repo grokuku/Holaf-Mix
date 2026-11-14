@@ -74,6 +74,7 @@ use holaf_core::fx::PluginSet;
 
 use crate::chainhost::{ChainHost, FxHostMode};
 use crate::live::{collect_view, LiveNode, LiveView, PortDir};
+use crate::sink_inputs;
 use crate::spa_config;
 
 /// Polling knobs (same order of magnitude as the Python audio_engine).
@@ -580,8 +581,8 @@ impl Engine {
             EngineOp::RoutingList => Ok(self.routing_list_json()),
             EngineOp::SetDefaultSink { uid } => self.set_default_sink(&uid),
             EngineOp::DeviceList => self.device_list(),
-            EngineOp::AppList => Ok(app_list_stub()),
-            EngineOp::AppMove { .. } => Ok(app_move_stub()),
+            EngineOp::AppList => self.app_list(),
+            EngineOp::AppMove { app_id, sink_name } => self.app_move(&app_id, &sink_name),
             EngineOp::MeterSources => Ok(self.meter_sources_json()),
         }
     }
@@ -2066,6 +2067,9 @@ impl Engine {
             "running": self.running,
             "strips": strips,
             "routes": routes["routes"],
+            // Streams are listed by their own operation (`EngineOp::AppList`):
+            // listing them here would spawn `pactl` on every status poll, and
+            // the UI asks for the list on its own cycle.
             "apps": [],
             "default_sink": self.default_sink,
             "holaf_nodes": holaf_nodes,
@@ -2086,6 +2090,12 @@ impl Engine {
                 "respawns": self.host.respawns(),
                 "chains": self.host.uids(),
             },
+            // Clock settings + processing statistics (`pw-metadata -n settings`,
+            // and `pw-top -b` when the tool supports it).  What is not
+            // available is reported with its reason: `small_quantum` and
+            // `pwt_errors` are computed by the UI from these fields, and
+            // `pw_top_unavailable` prints `timing.pw_top.reason` verbatim.
+            "timing": crate::timing::collect(),
             // Incomplete graph work (missing device / unlinked route / chain
             // that could not be built).  `degraded: true` explains a graph
             // that sounds wrong without anything being logged as an error, and
@@ -2093,6 +2103,46 @@ impl Engine {
             "degraded": !self.pending.is_empty(),
             "pending": self.pending_json(),
         }))
+    }
+
+    // ------------------------------------------------------------------
+    // Per-application routing (Python `get_sink_inputs` / `move_sink_input`)
+    // ------------------------------------------------------------------
+
+    /// The audio streams playing on the server, minus the daemon's own.
+    ///
+    /// Everything about the *policy* (parsing, name/pid fallbacks, exclusions)
+    /// lives in [`crate::sink_inputs`] and is unit-tested there; this method only
+    /// supplies the two process facts it needs: our pid and the parent-pid probe
+    /// that recognises the `pw-cat` recorders feeding the VU meters.
+    ///
+    /// `pactl` missing (no `pipewire-pulse` on the machine) is reported as an
+    /// error, not as an empty list: "nothing is playing" and "this daemon cannot
+    /// see streams" must not look the same in the UI.
+    fn app_list(&self) -> Result<JsonValue, BackendError> {
+        sink_inputs::list(std::process::id(), &sink_inputs::parent_pid)
+    }
+
+    /// Move stream `app_id` (a sink-input index) onto the sink whose `node.name`
+    /// is `sink_name`, with a read-back (see [`crate::sink_inputs::move_stream`]).
+    ///
+    /// The move goes through the session manager on purpose: PipeWire's links
+    /// belong to WirePlumber, and a hand-made link is undone the next time the
+    /// client re-creates its stream — which is why the UI enforces the routing
+    /// every 5 s instead of linking once.
+    fn app_move(&self, app_id: &str, sink_name: &str) -> Result<JsonValue, BackendError> {
+        let payload = sink_inputs::move_stream(
+            app_id,
+            sink_name,
+            std::process::id(),
+            &sink_inputs::parent_pid,
+        )?;
+        if payload.get("ok").and_then(JsonValue::as_bool) == Some(true) {
+            log::info!("apps: stream {app_id} moved to {sink_name}");
+        } else {
+            log::warn!("apps: stream {app_id} -> {sink_name} refused: {payload}");
+        }
+        Ok(payload)
     }
 
     /// `{uid: source_name}` for the Python VU-meter engine (spec §6).
@@ -2335,22 +2385,6 @@ fn is_holaf_node(node: &LiveNode) -> bool {
         || node.name.contains("Holaf_")
         || node.name.starts_with("input.Holaf_FX_")
         || node.name.starts_with("output.Holaf_FX_")
-}
-
-fn app_list_stub() -> JsonValue {
-    json!({
-        "apps": [],
-        "stub": true,
-        "note": "sink-input management is not implemented in J2 — no per-application controls yet",
-    })
-}
-
-fn app_move_stub() -> JsonValue {
-    json!({
-        "ok": false,
-        "stub": true,
-        "note": "sink-input management is not implemented in J2 — app.move is a documented stub",
-    })
 }
 
 /// Serialize the flat `Props.params` struct of the filter-chain to a Pod and

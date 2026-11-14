@@ -240,13 +240,8 @@ macro_rules! hex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Fill {
-    Solid {
-        color: HexColor,
-    },
-    VerticalGradient {
-        top: HexColor,
-        bottom: HexColor,
-    },
+    Solid { color: HexColor },
+    VerticalGradient { top: HexColor, bottom: HexColor },
 }
 
 impl Fill {
@@ -1057,8 +1052,14 @@ mod tests {
 
     #[test]
     fn hex_color_parses_all_forms() {
-        assert_eq!(HexColor::parse("#3ecc6a"), Some(HexColor::rgb(0x3e, 0xcc, 0x6a)));
-        assert_eq!(HexColor::parse("3ecc6a"), Some(HexColor::rgb(0x3e, 0xcc, 0x6a)));
+        assert_eq!(
+            HexColor::parse("#3ecc6a"),
+            Some(HexColor::rgb(0x3e, 0xcc, 0x6a))
+        );
+        assert_eq!(
+            HexColor::parse("3ecc6a"),
+            Some(HexColor::rgb(0x3e, 0xcc, 0x6a))
+        );
         assert_eq!(HexColor::parse("#fff"), Some(HexColor::rgb(255, 255, 255)));
         assert_eq!(
             HexColor::parse("#3ecc6a80"),
@@ -1068,12 +1069,23 @@ mod tests {
             HexColor::parse("#0008"),
             Some(HexColor::rgba(0, 0, 0, 0x88))
         );
-        assert_eq!(HexColor::parse(" #FFF "), Some(HexColor::rgb(255, 255, 255)));
+        assert_eq!(
+            HexColor::parse(" #FFF "),
+            Some(HexColor::rgb(255, 255, 255))
+        );
     }
 
     #[test]
     fn hex_color_rejects_garbage() {
-        for bad in ["", "#", "#12", "#12345", "#1234567", "not-a-colour", "#gggggg"] {
+        for bad in [
+            "",
+            "#",
+            "#12",
+            "#12345",
+            "#1234567",
+            "not-a-colour",
+            "#gggggg",
+        ] {
             assert_eq!(HexColor::parse(bad), None, "{bad:?} should not parse");
         }
     }
@@ -1114,9 +1126,15 @@ mod tests {
         let c = HexColor::rgb(10, 20, 30);
         assert_eq!(c.scale_alpha(0.5).a(), 128);
         assert_eq!(c.scale_alpha(2.0).a(), 255);
-        assert_eq!(c.lerp(HexColor::rgb(20, 40, 60), 0.5), HexColor::rgb(15, 30, 45));
+        assert_eq!(
+            c.lerp(HexColor::rgb(20, 40, 60), 0.5),
+            HexColor::rgb(15, 30, 45)
+        );
         assert_eq!(c.lerp(HexColor::rgb(20, 40, 60), 0.0), c);
-        assert_eq!(c.lerp(HexColor::rgb(20, 40, 60), 1.0), HexColor::rgb(20, 40, 60));
+        assert_eq!(
+            c.lerp(HexColor::rgb(20, 40, 60), 1.0),
+            HexColor::rgb(20, 40, 60)
+        );
         // Out-of-range t is clamped, not wrapped.
         assert_eq!(c.lerp(HexColor::rgb(20, 40, 60), -1.0), c);
     }
@@ -1127,7 +1145,10 @@ mod tests {
         assert_eq!(fill.at(0.0), HexColor::rgb(0, 0, 0));
         assert_eq!(fill.at(1.0), HexColor::rgb(100, 200, 40));
         assert_eq!(fill.at(0.5), HexColor::rgb(50, 100, 20));
-        assert_eq!(Fill::solid(HexColor::rgb(1, 2, 3)).at(0.9), HexColor::rgb(1, 2, 3));
+        assert_eq!(
+            Fill::solid(HexColor::rgb(1, 2, 3)).at(0.9),
+            HexColor::rgb(1, 2, 3)
+        );
     }
 
     #[test]
@@ -1140,12 +1161,27 @@ mod tests {
     #[test]
     fn default_theme_matches_the_pyside_stylesheets() {
         let t = Theme::holaf_dark();
-        assert_eq!(t.backgrounds.window, Fill::solid(HexColor::parse("#232323").unwrap()));
+        assert_eq!(
+            t.backgrounds.window,
+            Fill::solid(HexColor::parse("#232323").unwrap())
+        );
         // `_create_section("INPUTS", "#2b2b2b", …)` / `"OUTPUTS", "#1e1e1e"`.
-        assert_eq!(t.sections.input.background, HexColor::parse("#2b2b2b").unwrap());
-        assert_eq!(t.sections.output.background, HexColor::parse("#1e1e1e").unwrap());
-        assert_eq!(t.sections.input.title_color, HexColor::parse("#ffffff").unwrap());
-        assert_eq!(t.sections.output.title_color, HexColor::parse("#ffffff").unwrap());
+        assert_eq!(
+            t.sections.input.background,
+            HexColor::parse("#2b2b2b").unwrap()
+        );
+        assert_eq!(
+            t.sections.output.background,
+            HexColor::parse("#1e1e1e").unwrap()
+        );
+        assert_eq!(
+            t.sections.input.title_color,
+            HexColor::parse("#ffffff").unwrap()
+        );
+        assert_eq!(
+            t.sections.output.title_color,
+            HexColor::parse("#ffffff").unwrap()
+        );
         // `_update_base_style`: `stop:0 #444` → `stop:1 <accent>`.
         assert_eq!(
             t.strips.input.body,
@@ -1175,7 +1211,10 @@ mod tests {
                 HexColor::parse("#f39c12").unwrap()
             )
         );
-        assert_eq!(t.strips.learning.border, HexColor::parse("#f39c12").unwrap());
+        assert_eq!(
+            t.strips.learning.border,
+            HexColor::parse("#f39c12").unwrap()
+        );
         for kind in [StripKind::Input, StripKind::Output, StripKind::Bus] {
             assert_eq!(
                 t.kind_style(kind).border,
@@ -1187,15 +1226,30 @@ mod tests {
         assert_eq!(t.colors.accent, HexColor::parse("#2ecc71").unwrap());
         assert_eq!(t.colors.accent_text, HexColor::parse("#ffffff").unwrap());
         assert_eq!(t.colors.fx_inactive_bg, HexColor::parse("#333333").unwrap());
-        assert_eq!(t.colors.fx_inactive_text, HexColor::parse("#666666").unwrap());
-        assert_eq!(t.colors.fx_inactive_hover_bg, HexColor::parse("#444444").unwrap());
-        assert_eq!(t.colors.fx_inactive_hover_text, HexColor::parse("#999999").unwrap());
+        assert_eq!(
+            t.colors.fx_inactive_text,
+            HexColor::parse("#666666").unwrap()
+        );
+        assert_eq!(
+            t.colors.fx_inactive_hover_bg,
+            HexColor::parse("#444444").unwrap()
+        );
+        assert_eq!(
+            t.colors.fx_inactive_hover_text,
+            HexColor::parse("#999999").unwrap()
+        );
         // `set_routing_targets`.
         assert_eq!(t.colors.route_active, HexColor::parse("#4caf50").unwrap());
         assert_eq!(t.colors.route_inactive, HexColor::parse("#333333").unwrap());
-        assert_eq!(t.colors.route_inactive_text, HexColor::parse("#888888").unwrap());
+        assert_eq!(
+            t.colors.route_inactive_text,
+            HexColor::parse("#888888").unwrap()
+        );
         assert_eq!(t.colors.route_hover_bg, HexColor::parse("#444444").unwrap());
-        assert_eq!(t.colors.route_hover_text, HexColor::parse("#ffffff").unwrap());
+        assert_eq!(
+            t.colors.route_hover_text,
+            HexColor::parse("#ffffff").unwrap()
+        );
         // `_update_mute_style` / `_update_mono_style`.
         assert_eq!(t.colors.mute, HexColor::parse("#ff4444").unwrap());
         assert_eq!(t.colors.mute_text_idle, HexColor::parse("#ffffff").unwrap());
@@ -1205,7 +1259,10 @@ mod tests {
         assert_eq!(t.colors.midi_bg, HexColor::parse("#333333").unwrap());
         assert_eq!(t.colors.midi_text, HexColor::parse("#888888").unwrap());
         assert_eq!(t.colors.midi_hover_bg, HexColor::parse("#444444").unwrap());
-        assert_eq!(t.colors.midi_hover_text, HexColor::parse("#ffffff").unwrap());
+        assert_eq!(
+            t.colors.midi_hover_text,
+            HexColor::parse("#ffffff").unwrap()
+        );
         assert_eq!(t.colors.learning, HexColor::parse("#f39c12").unwrap());
         // Text roles.
         assert_eq!(t.colors.text_primary, HexColor::parse("#ffffff").unwrap());
@@ -1216,10 +1273,16 @@ mod tests {
         // Surfaces.
         assert_eq!(t.colors.border, HexColor::parse("#555555").unwrap());
         assert_eq!(t.colors.widget_bg, HexColor::parse("#444444").unwrap());
-        assert_eq!(t.colors.widget_bg_hover, HexColor::parse("#666666").unwrap());
+        assert_eq!(
+            t.colors.widget_bg_hover,
+            HexColor::parse("#666666").unwrap()
+        );
         assert_eq!(t.colors.widget_text, HexColor::parse("#ffffff").unwrap());
         assert_eq!(t.colors.apps_button_bg, HexColor::parse("#555555").unwrap());
-        assert_eq!(t.colors.apps_button_bg_hover, HexColor::parse("#777777").unwrap());
+        assert_eq!(
+            t.colors.apps_button_bg_hover,
+            HexColor::parse("#777777").unwrap()
+        );
         assert_eq!(t.colors.combo_bg, HexColor::parse("#222222").unwrap());
         assert_eq!(t.colors.combo_border, HexColor::parse("#444444").unwrap());
         assert_eq!(t.colors.delete, HexColor::parse("#888888").unwrap());
@@ -1284,7 +1347,9 @@ mod tests {
         let input = t.sections.input.background;
         let output = t.sections.output.background;
         assert_ne!(input, output, "the columns must be distinguishable");
-        let luma = |c: HexColor| 0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b());
+        let luma = |c: HexColor| {
+            0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())
+        };
         assert!(
             luma(input) > luma(output),
             "INPUTS ({input}) must be the lighter column, OUTPUTS ({output}) the darker"
@@ -1362,7 +1427,10 @@ mod tests {
         let json = file.to_json();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let entry = parsed["strips"]["uid-1"].as_object().unwrap();
-        assert!(entry.is_empty(), "unset overrides must not be written: {entry:?}");
+        assert!(
+            entry.is_empty(),
+            "unset overrides must not be written: {entry:?}"
+        );
     }
 
     #[test]
@@ -1391,7 +1459,10 @@ mod tests {
     fn future_version_is_rejected() {
         let json = format!(r#"{{"version":{}}}"#, THEME_FORMAT_VERSION + 1);
         let err = ThemeFile::from_json(&json).unwrap_err();
-        assert!(matches!(err, ThemeError::UnsupportedVersion { .. }), "{err}");
+        assert!(
+            matches!(err, ThemeError::UnsupportedVersion { .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("newer"));
     }
 

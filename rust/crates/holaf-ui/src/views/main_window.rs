@@ -19,7 +19,7 @@
 //! The geometry itself (widths, row heights, the resize decision) lives in
 //! [`crate::layout`]; this module only paints.
 
-use egui::{Rect, Ui, UiBuilder, Vec2};
+use egui::{Rect, Sense, Ui, UiBuilder, Vec2};
 
 use holaf_core::model::StripType;
 
@@ -28,12 +28,43 @@ use crate::layout;
 use crate::theme::paint;
 use crate::views::{strip_ui, text_centered};
 
+/// Height of the "engine disconnected" banner drawn over the section headers.
+///
+/// 18 px is the smallest line the theme's `small` font fits in; the header is
+/// 40 px tall and its content (title, "+") sits in the middle, so the banner
+/// never hides a control.
+pub const ENGINE_BANNER_HEIGHT: f32 = 18.0;
+
 /// Draw the whole window into `ui`.
 pub fn render(state: &mut AppState, ui: &mut Ui) {
     // `ui.max_rect()` is the *available* area (5000 × 5000 in a root Ui), not
     // the window: `content_rect()` is the real screen rectangle.
     let screen = ui.ctx().content_rect();
     let mut actions: Vec<UiAction> = Vec::new();
+
+    // Right click anywhere that is not a control: the window context menu
+    // ("Restart audio engine" / "Debug window" / "Open project page").
+    //
+    // egui gives a click to the **last** widget registered under the pointer, so
+    // this interaction is registered before every strip and header: a strip's
+    // own widgets keep their clicks and everything else (background, VU meters,
+    // the empty space of a column) falls through to the application menu — the
+    // Qt rule (`contextMenuEvent` + the `DefaultContextMenu` event filter).
+    let background = ui.interact(
+        screen,
+        ui.scope_id().with("holaf-window-background"),
+        Sense::click(),
+    );
+    if background.secondary_clicked() {
+        let pos = ui
+            .ctx()
+            .input(|input| input.pointer.interact_pos())
+            .unwrap_or(screen.center());
+        actions.push(UiAction::OpenContextMenu {
+            kind: crate::menus::ContextMenuKind::Window,
+            pos,
+        });
+    }
 
     // The drawing scope borrows `state.theme` (immutably) and `state.strips`
     // (immutably) while pushing into `state.image_cache` (mutably) — disjoint
@@ -144,7 +175,9 @@ pub fn render(state: &mut AppState, ui: &mut Ui) {
             );
             let mut header_ui = ui.new_child(UiBuilder::new().max_rect(add_rect));
             if crate::widgets::round_add_button(&mut header_ui, kind.as_str(), theme).clicked() {
-                actions.push(UiAction::AddStrip { kind });
+                // The Qt "+" opens a name dialog (`QInputDialog.getText`) before
+                // anything is added — `dialogs::draw_add_strip` is its twin.
+                actions.push(UiAction::BeginAddStrip { kind });
             }
 
             // strips, left to right
@@ -165,10 +198,27 @@ pub fn render(state: &mut AppState, ui: &mut Ui) {
                 }
                 let strip = &state.strips[index];
                 let levels = state.levels_for(index);
-                let learning = state
-                    .midi_learning
-                    .as_ref()
-                    .is_some_and(|(uid, _)| uid == &strip.uid);
+                // The MIDI button carries three states: idle, `LEARNING...` while
+                // a learn is armed for this strip, and the CC it just learned for
+                // a moment afterwards.
+                let flash = state.midi_button_text(&strip.uid);
+                let summary = state.midi_summary(&strip.uid);
+                let midi_button = crate::widgets::MidiButtonState {
+                    armed: state
+                        .midi_learning
+                        .as_ref()
+                        .filter(|(uid, _)| uid == &strip.uid)
+                        .map(|(_, target)| *target),
+                    flash: flash
+                        .as_deref()
+                        .filter(|_| !state.is_midi_learning(&strip.uid)),
+                    tooltip: Some(summary.as_str()),
+                };
+                let presence = if strip.device_name.is_some() {
+                    state.device_presence(&strip.uid)
+                } else {
+                    crate::devices::DevicePresence::Found
+                };
                 actions.extend(strip_ui(
                     ui,
                     rect,
@@ -177,7 +227,8 @@ pub fn render(state: &mut AppState, ui: &mut Ui) {
                     &outputs,
                     levels,
                     &mut state.image_cache,
-                    learning,
+                    midi_button,
+                    presence,
                 ));
                 x += dims.strip_width + dims.strip_gap;
             }
@@ -197,6 +248,32 @@ pub fn render(state: &mut AppState, ui: &mut Ui) {
 
     for action in actions {
         state.apply(action);
+    }
+
+    // Engine banner: "disconnected mode" is a first-class UI state, not a
+    // console line.  Drawn over the (mostly empty) top of the section headers
+    // so it costs no layout: the strips keep their geometry, the user keeps
+    // every control, only the audio path is dead.
+    if let Some(reason) = state.engine_error() {
+        let theme = &state.theme.theme;
+        let painter = ui.painter().with_clip_rect(screen);
+        let banner =
+            Rect::from_min_size(screen.min, Vec2::new(screen.width(), ENGINE_BANNER_HEIGHT));
+        painter.rect_filled(
+            banner,
+            egui::CornerRadius::ZERO,
+            egui::Color32::from_rgb(0x8b, 0x1a, 0x1a),
+        );
+        let text = format!(
+            "engine disconnected - {reason} (strips are editable, audio actions are ignored)"
+        );
+        painter.text(
+            egui::pos2(banner.left() + 6.0, banner.center().y),
+            egui::Align2::LEFT_CENTER,
+            &text,
+            egui::FontId::proportional(theme.typography.small.min(11.0)),
+            egui::Color32::WHITE,
+        );
     }
 
     // Status line, drawn last so it sits on top of everything.
@@ -248,7 +325,64 @@ mod tests {
         );
         // With its 150 px fader an input strip is ~397 px tall at rest.
         let natural = layout::strip_natural_height(&t, StripType::Input, 3);
-        assert!((405.0..425.0).contains(&natural), "natural height {natural}");
+        assert!(
+            (405.0..425.0).contains(&natural),
+            "natural height {natural}"
+        );
+    }
+
+    /// A right click on the window background (here: the 10 px gap between two
+    /// strips) must open the application menu — the Qt `contextMenuEvent` rule.
+    /// The strips' own controls keep their clicks, which is why the background
+    /// interaction is registered *before* them.
+    #[test]
+    fn a_right_click_on_the_background_opens_the_window_menu() {
+        let ctx = crate::test_support::headless_context();
+        let mut state = AppState::demo();
+        // The demo has 4 inputs (column ends at x≈455 with an 800 px window) and
+        // the first two outputs are separated by a `strip_gap` at x≈570: an area
+        // where no widget of any strip lives.
+        let pos = egui::pos2(570.0, 300.0);
+        let run = |state: &mut AppState, time: f64, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| crate::render(state, ui));
+            output.textures_delta.clear();
+        };
+        // egui turns a click into a *press then release* over two frames: the
+        // release frame is the one that reports `secondary_clicked()`.
+        run(&mut state, 1.0, vec![egui::Event::PointerMoved(pos)]);
+        run(
+            &mut state,
+            1.1,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        run(
+            &mut state,
+            1.2,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        match &state.context_menu {
+            Some(menu) => assert_eq!(menu.kind, crate::menus::ContextMenuKind::Window),
+            None => panic!("a right click on the background opened no menu"),
+        }
     }
 
     #[test]
@@ -284,6 +418,54 @@ mod tests {
         // Below the floor the strip stops shrinking (the fader keeps 40 px).
         let squeezed = layout::strip_height_for(&t, 200.0, 3);
         assert_eq!(squeezed, layout::strip_min_height(&t, StripType::Input, 3));
-        assert_eq!(squeezed, layout::strip_fixed_height(&t, StripType::Input, 3) + 40.0);
+        assert_eq!(
+            squeezed,
+            layout::strip_fixed_height(&t, StripType::Input, 3) + 40.0
+        );
+    }
+
+    /// "Disconnected mode" must be *visible*: the banner is a red band across the
+    /// top of the window, drawn by the same `render` the app uses.
+    #[test]
+    fn the_disconnected_banner_is_painted() {
+        use crate::app::EngineState;
+        use crate::raster::{render as rasterize, Framebuffer, Textures};
+        use egui::Color32;
+
+        // Two renders of the same state, connected vs. disconnected: the only
+        // pixels that may change are the banner band.
+        let paint = |engine: EngineState| {
+            let ctx = crate::test_support::headless_context();
+            let mut state = AppState::demo();
+            state.engine = engine;
+            let primitives =
+                crate::test_support::run_pass(&ctx, Vec2::new(800.0, 600.0), 1.0, |ui| {
+                    render(&mut state, ui)
+                });
+            let textures = Textures::from_context(&ctx);
+            let mut fb = Framebuffer::new(800, 600, Color32::BLACK);
+            rasterize(&mut fb, &primitives, &textures, 1.0);
+            fb
+        };
+        let connected = paint(EngineState::None);
+        let disconnected = paint(EngineState::Disconnected(
+            "cannot connect to PipeWire".to_string(),
+        ));
+        let differs = |y: usize| {
+            (0..800)
+                .filter(|x| {
+                    let a = connected.pixels[y * 800 + x];
+                    let b = disconnected.pixels[y * 800 + x];
+                    (a[0] - b[0]).abs() > 1e-3 || (a[1] - b[1]).abs() > 1e-3
+                })
+                .count()
+        };
+        let band: usize = (0..ENGINE_BANNER_HEIGHT as usize).map(differs).sum();
+        let below: usize = (ENGINE_BANNER_HEIGHT as usize + 1..600).map(differs).sum();
+        assert!(
+            band > 500,
+            "the disconnected banner is not visible ({band} px)"
+        );
+        assert_eq!(below, 0, "the banner leaked out of its band");
     }
 }

@@ -14,6 +14,13 @@
 //!   process that does nothing but run a PipeWire mainloop, exactly like the
 //!   `pw-cli` the Python engine uses.  `ChainHost` picks between that process
 //!   and in-process hosting (the pre-refactor behaviour).
+//! - [`timing`] — clock settings (`pw-metadata -n settings`: rate, quantum,
+//!   forced values) and, when the tool supports batch mode, the per-node
+//!   `pw-top` statistics the diagnostics use to explain crackling.  What is not
+//!   available is reported **with its reason**, never invented.
+//! - [`sink_inputs`] — per-application routing (`app_list` / `app_move`): the
+//!   streams playing on the server, minus the daemon's own, moved through the
+//!   session manager (`pactl`), exactly like `pipewire_utils.py`.
 //! - [`backend`] / [`engine`] / [`live`] — the real J2 **PipeWireBackend**
 //!   behind the `holaf_core::backend::Backend` trait: a graph reconciler that
 //!   creates null-sinks + filter-chains + links on a live daemon, with volume/
@@ -35,6 +42,8 @@ pub mod chainhost;
 pub mod engine;
 pub mod fxhost;
 pub mod live;
+pub mod sink_inputs;
+pub mod timing;
 pub mod spa_config;
 pub mod sys;
 

@@ -125,10 +125,8 @@ pub fn fader_with_vu(
 ) -> FaderOutput {
     // One interaction id per strip: `push_id` scopes the auto-generated id of
     // the allocation below, so two faders on screen never share one.
-    ui.push_id(id_salt, |ui| {
-        fader_inner(ui, volume, levels, style, height)
-    })
-    .inner
+    ui.push_id(id_salt, |ui| fader_inner(ui, volume, levels, style, height))
+        .inner
 }
 
 /// The fader body, without the id scoping (see [`fader_with_vu`]).
@@ -317,13 +315,25 @@ mod tests {
     #[test]
     fn vu_colour_goes_green_yellow_red_from_bottom_to_top() {
         let s = style();
-        assert_eq!(vu_color_at(0.0, &s), HexColor::parse("#33ff33").unwrap().color32());
-        assert_eq!(vu_color_at(1.0, &s), HexColor::parse("#ff3333").unwrap().color32());
+        assert_eq!(
+            vu_color_at(0.0, &s),
+            HexColor::parse("#33ff33").unwrap().color32()
+        );
+        assert_eq!(
+            vu_color_at(1.0, &s),
+            HexColor::parse("#ff3333").unwrap().color32()
+        );
         // The yellow stop sits 20 % below the top (`setColorAt(0.2, #ffff33)`),
         // so 80 % on the meter is exactly the yellow, not 50 %.
-        assert_eq!(vu_color_at(0.8, &s), HexColor::parse("#ffff33").unwrap().color32());
+        assert_eq!(
+            vu_color_at(0.8, &s),
+            HexColor::parse("#ffff33").unwrap().color32()
+        );
         let mid = vu_color_at(0.5, &s);
-        assert!(mid.g() > 200 && mid.r() > 60, "half scale is a yellow-green: {mid:?}");
+        assert!(
+            mid.g() > 200 && mid.r() > 60,
+            "half scale is a yellow-green: {mid:?}"
+        );
         // Below the yellow stop, everything is a green→yellow ramp.
         let low = vu_color_at(0.25, &s);
         assert!(low.g() > 200 && low.r() > 100, "unexpected colour {low:?}");
@@ -339,25 +349,30 @@ mod tests {
         let ctx = crate::test_support::headless_context();
         let style = style();
         let mut volume = 0.5_f32;
-        let primitives = crate::test_support::run_pass(
-            &ctx,
-            egui::vec2(44.0, 104.0),
-            1.0,
-            |ui| {
-                fader_with_vu(ui, "test", &mut volume, [0.8, 0.8], &style, 100.0);
-            },
-        );
+        let primitives = crate::test_support::run_pass(&ctx, egui::vec2(44.0, 104.0), 1.0, |ui| {
+            fader_with_vu(ui, "test", &mut volume, [0.8, 0.8], &style, 100.0);
+        });
         let textures = Textures::from_context(&ctx);
         let mut fb = Framebuffer::new(44, 104, Color32::BLACK);
         render(&mut fb, &primitives, &textures, 1.0);
 
-        let count = |pred: &dyn Fn([f32; 4]) -> bool| fb.pixels.iter().filter(|p| pred(**p)).count();
+        let count =
+            |pred: &dyn Fn([f32; 4]) -> bool| fb.pixels.iter().filter(|p| pred(**p)).count();
         let green = count(&|p| p[1] > 0.6 && p[0] < 0.6 && p[2] < 0.6);
         let white = count(&|p| p[0] > 0.9 && p[1] > 0.9 && p[2] > 0.9);
         let dark = count(&|p| p[0] < 0.2 && p[1] < 0.2 && p[2] < 0.2);
-        assert!(green > 200, "the VU fill must be visible, found {green} green pixels");
-        assert!(white > 50, "the handle must be visible, found {white} white pixels");
-        assert!(dark > 50, "the rail and the VU background must be visible, {dark}");
+        assert!(
+            green > 200,
+            "the VU fill must be visible, found {green} green pixels"
+        );
+        assert!(
+            white > 50,
+            "the handle must be visible, found {white} white pixels"
+        );
+        assert!(
+            dark > 50,
+            "the rail and the VU background must be visible, {dark}"
+        );
     }
 
     #[test]

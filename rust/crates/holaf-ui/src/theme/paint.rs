@@ -188,7 +188,10 @@ pub fn rounded_rect_points(rect: Rect, radius: f32) -> Vec<Pos2> {
     }
     // (centre, start angle in radians) per corner, clockwise from the top-left.
     let corners = [
-        (egui::pos2(rect.left() + r, rect.top() + r), std::f32::consts::PI),
+        (
+            egui::pos2(rect.left() + r, rect.top() + r),
+            std::f32::consts::PI,
+        ),
         (
             egui::pos2(rect.right() - r, rect.top() + r),
             std::f32::consts::FRAC_PI_2 * 3.0,
@@ -202,7 +205,8 @@ pub fn rounded_rect_points(rect: Rect, radius: f32) -> Vec<Pos2> {
     let mut points = Vec::with_capacity(corners.len() * (CORNER_SEGMENTS + 1));
     for (center, start) in corners {
         for step in 0..=CORNER_SEGMENTS {
-            let angle = start + std::f32::consts::FRAC_PI_2 * (step as f32 / CORNER_SEGMENTS as f32);
+            let angle =
+                start + std::f32::consts::FRAC_PI_2 * (step as f32 / CORNER_SEGMENTS as f32);
             points.push(egui::pos2(
                 center.x + r * angle.cos(),
                 center.y + r * angle.sin(),
@@ -256,10 +260,7 @@ pub fn image_mapping(fit: Fit, rect: Rect, texture: Vec2) -> ImageMapping {
             let scale = (rect.width() / texture.x).min(rect.height() / texture.y);
             let size = Vec2::new(texture.x * scale, texture.y * scale);
             let dest = Rect::from_center_size(rect.center(), size);
-            ImageMapping {
-                dest,
-                uv: full_uv,
-            }
+            ImageMapping { dest, uv: full_uv }
         }
         Fit::Tile => {
             let u = rect.width() / texture.x;
@@ -353,17 +354,16 @@ mod tests {
         let points = rounded_rect_points(rect, 1000.0);
         let min_x = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
         let max_x = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-        assert!(min_x >= -0.01 && max_x <= 20.01, "min_x={min_x} max_x={max_x}");
+        assert!(
+            min_x >= -0.01 && max_x <= 20.01,
+            "min_x={min_x} max_x={max_x}"
+        );
     }
 
     #[test]
     fn gradient_mesh_has_a_fan_topology() {
         let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(100.0, 400.0));
-        let mesh = gradient_rounded_rect(
-            rect,
-            5.0,
-            Fill::vertical(hex("#000000"), hex("#ffffff")),
-        );
+        let mesh = gradient_rounded_rect(rect, 5.0, Fill::vertical(hex("#000000"), hex("#ffffff")));
         let rim = rounded_rect_points(rect, 5.0).len();
         assert_eq!(mesh.vertices.len(), rim + 1);
         assert_eq!(mesh.indices.len(), rim * 3);
@@ -383,17 +383,16 @@ mod tests {
             .map(|v| v.color)
             .collect::<Vec<_>>();
         assert!(!bottom.is_empty());
-        assert!(bottom.iter().all(|c| c.r() == 255), "bottom rim must be #ffffff");
+        assert!(
+            bottom.iter().all(|c| c.r() == 255),
+            "bottom rim must be #ffffff"
+        );
     }
 
     #[test]
     fn gradient_mesh_indices_are_valid() {
         let rect = Rect::from_min_size(egui::pos2(5.0, 5.0), Vec2::new(90.0, 300.0));
-        let mesh = gradient_rounded_rect(
-            rect,
-            5.0,
-            Fill::vertical(hex("#444444"), hex("#3daee9")),
-        );
+        let mesh = gradient_rounded_rect(rect, 5.0, Fill::vertical(hex("#444444"), hex("#3daee9")));
         let n = mesh.vertices.len() as u32;
         assert!(mesh.indices.iter().all(|&i| i < n));
         assert!(mesh.is_valid());
@@ -411,11 +410,15 @@ mod tests {
         let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(6.0, 100.0));
         let mesh = vertical_gradient_rect(
             rect,
-            &[(0.0, hex("#00ff00")), (0.5, hex("#ffff00")), (1.0, hex("#ff0000"))],
+            &[
+                (0.0, hex("#00ff00")),
+                (0.5, hex("#ffff00")),
+                (1.0, hex("#ff0000")),
+            ],
         );
         assert_eq!(mesh.vertices.len(), 8); // 2 bands × 4 vertices
         assert_eq!(mesh.indices.len(), 12); // 2 bands × 2 triangles
-        // The top of the first band is green, the bottom of the last is red.
+                                            // The top of the first band is green, the bottom of the last is red.
         let first_top = mesh
             .vertices
             .iter()
@@ -460,21 +463,30 @@ mod tests {
         assert!(m.uv.min.x > 0.0 && m.uv.max.x < 1.0, "{:?}", m.uv);
         // The visible region is a sub-rectangle of the texture…
         let visible = Vec2::new(m.uv.width() * 200.0, m.uv.height() * 100.0);
-        assert!(visible.x <= 200.0 + 1e-3 && visible.y <= 100.0 + 1e-3, "{visible:?}");
+        assert!(
+            visible.x <= 200.0 + 1e-3 && visible.y <= 100.0 + 1e-3,
+            "{visible:?}"
+        );
         // …that fills the rect with ONE uniform scale on both axes (that is what
         // "cover" means: no distortion)…
         let scale_x = rect.width() / visible.x;
         let scale_y = rect.height() / visible.y;
         assert!((scale_x - scale_y).abs() < 1e-4, "{scale_x} != {scale_y}");
         // …and it must touch both edges of the texture on the cropped axis.
-        assert!((visible.y - 100.0).abs() < 1e-3, "the shorter axis is fully used: {visible:?}");
+        assert!(
+            (visible.y - 100.0).abs() < 1e-3,
+            "the shorter axis is fully used: {visible:?}"
+        );
     }
 
     #[test]
     fn image_contain_fits_inside_and_centres() {
         let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(100.0, 100.0));
         let m = image_mapping(Fit::Contain, rect, Vec2::new(200.0, 100.0));
-        assert_eq!(m.uv, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)));
+        assert_eq!(
+            m.uv,
+            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+        );
         assert_eq!(m.dest.width(), 100.0);
         assert_eq!(m.dest.height(), 50.0);
         assert_eq!(m.dest.center(), rect.center());

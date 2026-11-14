@@ -33,7 +33,13 @@ pub fn text_centered(
     }
     let font = FontId::proportional(font_size.max(1.0));
     let color32 = color.color32();
-    painter.text(rect.center(), Align2::CENTER_CENTER, text, font.clone(), color32);
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        font.clone(),
+        color32,
+    );
     if bold_extra > 0.0 {
         painter.text(
             rect.center() + egui::vec2(bold_extra, 0.0),
@@ -79,7 +85,21 @@ mod tests {
         let painter = ctx.debug_painter();
         let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 0.0));
         let theme = Theme::holaf_dark();
-        text_centered(&painter, rect, "INPUTS", 13.5, theme.colors.text_primary, 0.35);
-        text_elided_left(&painter, rect, "device", 9.0, theme.colors.text_primary, 0.0);
+        text_centered(
+            &painter,
+            rect,
+            "INPUTS",
+            13.5,
+            theme.colors.text_primary,
+            0.35,
+        );
+        text_elided_left(
+            &painter,
+            rect,
+            "device",
+            9.0,
+            theme.colors.text_primary,
+            0.0,
+        );
     }
 }

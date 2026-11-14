@@ -107,11 +107,7 @@ impl<'a> StripDescriptor<'a> {
     /// `declared` accepts either [`StripType`] or [`StripKind`] (a `Bus` is
     /// stored as an output without device, so the conversion is lossless for
     /// the resolver's purposes).
-    pub fn new(
-        uid: &'a str,
-        declared: impl Into<StripType>,
-        device_name: Option<&'a str>,
-    ) -> Self {
+    pub fn new(uid: &'a str, declared: impl Into<StripType>, device_name: Option<&'a str>) -> Self {
         Self {
             uid,
             declared: declared.into(),
@@ -309,7 +305,11 @@ mod tests {
         assert!(!style.body.is_gradient());
         // Opacity is applied on top of the override body.
         assert_eq!(style.body, solid.scale_alpha(1.0));
-        assert_eq!(style.kind, StripKind::Bus, "kind is unaffected by the override");
+        assert_eq!(
+            style.kind,
+            StripKind::Bus,
+            "kind is unaffected by the override"
+        );
     }
 
     #[test]
@@ -362,17 +362,18 @@ mod tests {
         assert_eq!(style.body.at(1.0).a(), 128);
         // Colours themselves are untouched by the opacity.
         assert_eq!(style.body.at(0.0).r(), 0x44);
-        assert_eq!(style.body.at(1.0), HexColor::parse("#3daee9").unwrap().with_alpha(128));
+        assert_eq!(
+            style.body.at(1.0),
+            HexColor::parse("#3daee9").unwrap().with_alpha(128)
+        );
     }
 
     #[test]
     fn per_strip_opacity_overrides_the_global_one() {
         let mut f = file();
         f.theme.backgrounds.body_opacity = 0.4;
-        f.strips.insert(
-            "u1".to_string(),
-            StripOverride::default().with_opacity(1.0),
-        );
+        f.strips
+            .insert("u1".to_string(), StripOverride::default().with_opacity(1.0));
         let style = resolve(&f, &StripDescriptor::new("u1", StripType::Input, None));
         assert_eq!(style.opacity, 1.0);
         assert_eq!(style.body.at(0.0).a(), 255);

@@ -23,11 +23,21 @@ name = "holaf-ui-snapshot"
 path = "src/bin/holaf-ui-snapshot.rs"
 
 [features]
-default = []
-# Off by default: the demo/skeleton UI must build on a machine WITHOUT
-# libpipewire.  Enabling it links the real engine (holaf-pw), see
-# `docs/ui-rust-design.md` §"EngineBridge".
+# The real engine is what makes the UI a mixer, and MIDI is how the user drives
+# it (the AKAI MIDI Mix is the primary controller — see `docs/ui-rust-design.md`
+# §"MIDI"), so both are ON by default.  The crate still builds without either
+# (`--no-default-features` = no `holaf-pw`, no `midir`, mock engine + config-only
+# MIDI mappings), which is what the headless snapshot and a machine with no
+# libpipewire/libasound need.
+default = ["engine-pw", "midi"]
 engine-pw = ["dep:holaf-pw"]
+# MIDI control (CC/note → volume/mute/mono, learn, LED feedback, port picker,
+# reconnection).  Needs an ALSA sequencer at run time (`libasound2-dev` at build
+# time) — present on every desktop; where it is missing the UI says so in the
+# status bar instead of failing.  The mapping *policy* is always compiled and
+# always tested (`src/midi.rs`); only the `midir` device I/O lives behind this
+# feature.
+midi = ["dep:midir"]
 
 [dependencies]
 # `default-features = false` everywhere: we do not want the wgpu/x11+wayland
@@ -46,3 +56,4 @@ log = { workspace = true }
 env_logger = { workspace = true }
 holaf-core = { path = "../holaf-core" }
 holaf-pw = { path = "../holaf-pw", optional = true }
+midir = { version = "0.11", optional = true }

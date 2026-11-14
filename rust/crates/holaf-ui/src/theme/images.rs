@@ -183,10 +183,16 @@ mod tests {
     fn relative_paths_resolve_against_the_base_dir() {
         let cache = ImageCache::with_base_dir("/themes/holaf");
         let spec = ImageSpec::new("bg.png");
-        assert_eq!(cache.resolve_path(&spec), PathBuf::from("/themes/holaf/bg.png"));
+        assert_eq!(
+            cache.resolve_path(&spec),
+            PathBuf::from("/themes/holaf/bg.png")
+        );
 
         let absolute = ImageSpec::new("/elsewhere/bg.png");
-        assert_eq!(cache.resolve_path(&absolute), PathBuf::from("/elsewhere/bg.png"));
+        assert_eq!(
+            cache.resolve_path(&absolute),
+            PathBuf::from("/elsewhere/bg.png")
+        );
 
         let no_base = ImageCache::new();
         assert_eq!(no_base.resolve_path(&spec), PathBuf::from("bg.png"));

@@ -35,7 +35,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -45,8 +45,8 @@
                     "active": false,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -96,7 +96,7 @@
             "label": "HP",
             "kind": "output",
             "mode": "physical",
-            "volume": 0.33070866141732286,
+            "volume": 0.33070865273475647,
             "mute": false,
             "is_mono": false,
             "routes": [],
@@ -126,7 +126,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -136,8 +136,8 @@
                     "active": false,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -219,7 +219,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -229,8 +229,8 @@
                     "active": true,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -313,7 +313,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -323,8 +323,8 @@
                     "active": false,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -410,7 +410,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -420,8 +420,8 @@
                     "active": false,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -507,7 +507,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -517,8 +517,8 @@
                     "active": false,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -586,7 +586,7 @@
                         "Attack (ms)": 5.0,
                         "Hold (ms)": 50.0,
                         "Decay (ms)": 200.0,
-                        "LF key filter (Hz)": 33.6,
+                        "LF key filter (Hz)": 33.599998474121094,
                         "HF key filter (Hz)": 23520.0,
                         "Range (dB)": -90.0,
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)": 0.0
@@ -596,8 +596,8 @@
                     "active": false,
                     "params": {
                         "VAD Threshold (%)": 74.25,
-                        "VAD Grace Period (ms)": 500,
-                        "Retroactive VAD Grace (ms)": 100,
+                        "VAD Grace Period (ms)": 500.0,
+                        "Retroactive VAD Grace (ms)": 100.0,
                         "Dry Mix": 0.0
                     }
                 },
@@ -646,7 +646,7 @@
     "window": {
         "x": 0,
         "y": 0,
-        "height": 423,
+        "height": 423.0,
         "maximized": false
     },
     "window_geometry": "01d9d0cb00030000000000000000000000000319000002530000000000000000000003190000025300000001000000000a0000000000000000000000031900000253",

@@ -36,15 +36,26 @@
 //!   hidden control.
 //! * **Rename.** Qt opens a `QInputDialog` on double click; here the view emits
 //!   [`UiAction::BeginRename`] and the main window draws the dialog.
+//! * **FX settings.** Qt opens a `customContextMenu` on right click whose first
+//!   entry opens the settings dialog; the Rust view reproduces that (right click
+//!   → [`crate::menus`], first entry "Effect settings") and *also* accepts a
+//!   double click, which is the shortcut the old port had.
+//!   Known quirk: the first click of a double click also toggles the effect (egui
+//!   reports it as a click on the previous frame) — right click is the clean way.
+//! * **Delete.** The `×` only *requests* the deletion ([`UiAction::RequestDelete`]);
+//!   the confirmation dialog decides (`Delete`).
 //! * **Device combo.** Qt fills it from `pipewire_utils.get_audio_nodes()`;
 //!   the device list arrives with the engine bridge, so the combo displays the
-//!   current device and emits [`UiAction::OpenDevicePicker`] on click.
+//!   current device and emits [`UiAction::OpenDevicePicker`] on click.  When the
+//!   stored device is absent from the engine's list the combo shows
+//!   `<name> (Not Found)`, exactly like `set_device_list` in Qt.
 
 use egui::{Rect, Sense, Ui, UiBuilder, Vec2};
 
 use holaf_core::model::{EffectKey, Strip, StripType};
 
 use crate::app::UiAction;
+use crate::devices::DevicePresence;
 use crate::layout::{row_gap, CONTROL_ROW_HEIGHT, MIN_FADER_HEIGHT};
 use crate::theme::images::ImageCache;
 use crate::theme::paint;
@@ -53,7 +64,7 @@ use crate::theme::ThemeFile;
 use crate::views::text_centered;
 use crate::widgets::{
     combo_display, fader_with_vu, flat_button, fx_button_in, midi_button_in, route_button_in,
-    state_button_in, FaderStyle,
+    state_button_in, FaderStyle, MidiButtonState,
 };
 
 /// Short label of an FX button (the Qt code uses `GT`/`RN`/`EQ`/`TB`/`CP`).
@@ -86,9 +97,11 @@ pub fn strip_ui(
     outputs: &[(String, String)],
     levels: [f32; 2],
     image_cache: &mut ImageCache,
-    midi_learning: bool,
+    midi_button: MidiButtonState<'_>,
+    device_presence: DevicePresence,
 ) -> Vec<UiAction> {
     let theme = &theme_file.theme;
+    let midi_learning = midi_button.learning();
     // The learning flag is part of the descriptor, not a post-paint override:
     // `_update_base_style` paints the whole frame orange while learning.
     let style = resolve(
@@ -121,7 +134,10 @@ pub fn strip_ui(
     let pad = dims.strip_padding;
     let content = Rect::from_min_max(
         egui::pos2(rect.left() + pad, rect.top() + pad),
-        egui::pos2(rect.right() - pad, rect.bottom() - dims.strip_padding_bottom),
+        egui::pos2(
+            rect.right() - pad,
+            rect.bottom() - dims.strip_padding_bottom,
+        ),
     );
     if content.width() <= 4.0 || content.height() <= 4.0 {
         return actions;
@@ -140,8 +156,10 @@ pub fn strip_ui(
     let avail_w = content.width();
 
     // 1. header: label + delete glyph
-    let (header_rect, _) =
-        child.allocate_exact_size(Vec2::new(avail_w, theme.typography.body + 6.0), Sense::hover());
+    let (header_rect, _) = child.allocate_exact_size(
+        Vec2::new(avail_w, theme.typography.body + 6.0),
+        Sense::hover(),
+    );
     let delete_size = 16.0;
     let label_rect = Rect::from_min_max(
         header_rect.left_top(),
@@ -180,7 +198,10 @@ pub fn strip_ui(
         delete_color.color32(),
     );
     if delete_response.clicked() {
-        actions.push(UiAction::Delete {
+        // Qt asks for confirmation first (`QMessageBox.question`, default No):
+        // the view requests it, `dialogs::draw_delete_confirm` asks, and only
+        // the confirmed action mutates the model.
+        actions.push(UiAction::RequestDelete {
             uid: strip.uid.clone(),
         });
     }
@@ -194,11 +215,24 @@ pub fn strip_ui(
             uid: strip.uid.clone(),
         });
     }
+    // Right click on the label: the strip's own menu (Rename / Delete + the
+    // application entries) — the Qt `StripWidget` context menu.
+    if label_response.secondary_clicked() {
+        actions.push(UiAction::OpenContextMenu {
+            kind: crate::menus::ContextMenuKind::Strip {
+                uid: strip.uid.clone(),
+                label: strip.label.clone(),
+            },
+            pos: pointer_pos(ui, label_rect),
+        });
+    }
     child.add_space(row_gap(theme));
 
     // 2. caption (SOURCE IN / DEVICE OUT / VIRTUAL BUS)
-    let (caption_rect, _) =
-        child.allocate_exact_size(Vec2::new(avail_w, theme.typography.tiny + 4.0), Sense::hover());
+    let (caption_rect, _) = child.allocate_exact_size(
+        Vec2::new(avail_w, theme.typography.tiny + 4.0),
+        Sense::hover(),
+    );
     let (caption, caption_color, caption_bold) = match style.kind {
         StripKind::Input => ("SOURCE IN", style.text_secondary, 0.0),
         StripKind::Output => ("DEVICE OUT", style.text_secondary, 0.0),
@@ -221,7 +255,7 @@ pub fn strip_ui(
 
     // 3. device combo
     let device_text = match strip.device_name.as_deref() {
-        Some(name) => device_display_name(name),
+        Some(name) => device_combo_text(name, device_presence),
         None => match style.kind {
             StripKind::Input => "Apps / Virtual".to_string(),
             _ => "Virtual Sink (Bus)".to_string(),
@@ -239,14 +273,11 @@ pub fn strip_ui(
     // `_update_app_btn_visibility`: the "SELECT APPS" row only exists on a
     // virtual, non-default input, which makes this strip 23 px shorter than its
     // sibling and gives the fader 23 px more.
-    let apps_row = style.kind == StripKind::Input
-        && strip.device_name.is_none()
-        && !strip.is_default;
+    let apps_row =
+        style.kind == StripKind::Input && strip.device_name.is_none() && !strip.is_default;
     if style.kind == StripKind::Input {
-        let (check_rect, _) = child.allocate_exact_size(
-            Vec2::new(avail_w, dims.checkbox_height),
-            Sense::hover(),
-        );
+        let (check_rect, _) =
+            child.allocate_exact_size(Vec2::new(avail_w, dims.checkbox_height), Sense::hover());
         let response = child.interact(
             check_rect,
             child.scope_id().with(("default", strip.uid.as_str())),
@@ -306,12 +337,10 @@ pub fn strip_ui(
     let effects: Vec<EffectKey> = EffectKey::for_strip(strip.kind);
     let fx_spacing = 2.0;
     let fx_count = effects.len().max(1) as f32;
-    let fx_width = ((avail_w - fx_spacing * (fx_count - 1.0)) / fx_count)
-        .clamp(14.0, dims.fx_button_width);
-    let (fx_rect, _) = child.allocate_exact_size(
-        Vec2::new(avail_w, dims.fx_button_height),
-        Sense::hover(),
-    );
+    let fx_width =
+        ((avail_w - fx_spacing * (fx_count - 1.0)) / fx_count).clamp(14.0, dims.fx_button_width);
+    let (fx_rect, _) =
+        child.allocate_exact_size(Vec2::new(avail_w, dims.fx_button_height), Sense::hover());
     for (idx, effect) in effects.iter().enumerate() {
         let active = strip
             .effects
@@ -319,12 +348,37 @@ pub fn strip_ui(
             .map(|state| state.active)
             .unwrap_or(false);
         let button_rect = Rect::from_min_size(
-            egui::pos2(fx_rect.left() + idx as f32 * (fx_width + fx_spacing), fx_rect.top()),
+            egui::pos2(
+                fx_rect.left() + idx as f32 * (fx_width + fx_spacing),
+                fx_rect.top(),
+            ),
             Vec2::new(fx_width, dims.fx_button_height),
         );
-        if fx_button_in(&child, strip.uid.as_str(), button_rect, fx_label(*effect), active, theme)
-            .clicked()
-        {
+        let response = fx_button_in(
+            &child,
+            strip.uid.as_str(),
+            button_rect,
+            fx_label(*effect),
+            active,
+            theme,
+        );
+        // Left click toggles; a double click opens the settings dialog; a right
+        // click opens the FX context menu, whose first entry is "Effect
+        // settings" — the Qt shape (`effect_toggled` + `customContextMenu`).
+        if response.secondary_clicked() {
+            actions.push(UiAction::OpenContextMenu {
+                kind: crate::menus::ContextMenuKind::Fx {
+                    uid: strip.uid.clone(),
+                    effect: *effect,
+                },
+                pos: pointer_pos(ui, button_rect),
+            });
+        } else if response.double_clicked() {
+            actions.push(UiAction::OpenFxSettings {
+                uid: strip.uid.clone(),
+                effect: *effect,
+            });
+        } else if response.clicked() {
             actions.push(UiAction::ToggleFx {
                 uid: strip.uid.clone(),
                 effect: *effect,
@@ -338,9 +392,12 @@ pub fn strip_ui(
     match strip.kind {
         StripType::Input => {
             let plate_h = crate::layout::routing_plate_height(theme, outputs.len());
-            let (plate, _) =
-                child.allocate_exact_size(Vec2::new(avail_w, plate_h), Sense::hover());
-            painter.rect_filled(plate, paint::corner(3.0), theme.colors.routing_area.color32());
+            let (plate, _) = child.allocate_exact_size(Vec2::new(avail_w, plate_h), Sense::hover());
+            painter.rect_filled(
+                plate,
+                paint::corner(3.0),
+                theme.colors.routing_area.color32(),
+            );
             let inner = plate.shrink(2.0);
             if outputs.is_empty() {
                 text_centered(
@@ -359,8 +416,15 @@ pub fn strip_ui(
                     Vec2::new(inner.width(), dims.route_button_height),
                 );
                 let active = strip.routes.iter().any(|r| r == uid);
-                if route_button_in(&child, strip.uid.as_str(), chip_rect, &route_label(label), active, theme)
-                    .clicked()
+                if route_button_in(
+                    &child,
+                    strip.uid.as_str(),
+                    chip_rect,
+                    &route_label(label),
+                    active,
+                    theme,
+                )
+                .clicked()
                 {
                     actions.push(UiAction::Route {
                         uid: strip.uid.clone(),
@@ -484,12 +548,24 @@ pub fn strip_ui(
     child.add_space(row_gap(theme));
 
     // 9. MIDI
-    let (midi_rect, _) =
-        child.allocate_exact_size(Vec2::new(avail_w, midi_h), Sense::hover());
-    if midi_button_in(&child, strip.uid.as_str(), midi_rect, midi_learning, theme).clicked() {
-        actions.push(UiAction::MidiLearn {
-            uid: strip.uid.clone(),
-            learning: !midi_learning,
+    //
+    // A click opens the strip's MIDI menu (`Learn Volume` / `Learn Mute` /
+    // `Learn Mono`, `Clear Mappings`) — the Qt `_show_midi_menu`, which is where
+    // a MIDI Mix owner assigns one fader/button per function.  Right-clicking
+    // opens the same menu, which is what a user tries first.
+    let (midi_rect, _) = child.allocate_exact_size(Vec2::new(avail_w, midi_h), Sense::hover());
+    let midi_response = midi_button_in(&child, strip.uid.as_str(), midi_rect, midi_button, theme);
+    if let Some(tooltip) = midi_button.tooltip {
+        midi_response.clone().on_hover_text(tooltip);
+    }
+    if midi_response.clicked() || midi_response.secondary_clicked() {
+        actions.push(UiAction::OpenContextMenu {
+            kind: crate::menus::ContextMenuKind::Midi {
+                uid: strip.uid.clone(),
+                label: strip.label.clone(),
+                armed: midi_button.armed,
+            },
+            pos: midi_response.rect.left_bottom(),
         });
     }
 
@@ -521,6 +597,33 @@ pub fn device_display_name(device_name: &str) -> String {
         short.push('…');
         short
     }
+}
+
+/// Where a context menu must open: under the pointer when egui knows it (a real
+/// click), else at the bottom-left of the widget it belongs to (so a keyboard or
+/// synthetic interaction still gets a usable position).
+pub fn pointer_pos(ui: &Ui, fallback: Rect) -> egui::Pos2 {
+    ui.ctx()
+        .input(|input| input.pointer.interact_pos())
+        .unwrap_or_else(|| fallback.left_bottom())
+}
+
+/// What the device combo says for a bound strip.
+///
+/// A device that the engine does not list is shown as `<name> (Not Found)`, the
+/// exact wording of `set_device_list` in Qt.  The label is then elided like the
+/// Qt `desc[:15] + "..."` rule, so a long node name cannot widen the combo
+/// (which is a fixed 90 px inside the strip).
+pub fn device_combo_text(device_name: &str, presence: DevicePresence) -> String {
+    let mut text = match presence {
+        DevicePresence::Missing => format!("{device_name} (Not Found)"),
+        DevicePresence::Found | DevicePresence::Unknown => device_display_name(device_name),
+    };
+    if text.chars().count() > 15 {
+        text = text.chars().take(14).collect();
+        text.push('…');
+    }
+    text
 }
 
 #[cfg(test)]
@@ -566,6 +669,28 @@ mod tests {
         assert!(long.ends_with('…'), "{long}");
     }
 
+    #[test]
+    fn a_missing_device_is_shown_as_not_found() {
+        assert_eq!(
+            device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Missing),
+            "alsa_output.go…"
+        );
+        assert_eq!(
+            device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Found),
+            "analog-stereo"
+        );
+        // Unknown (no engine answered) never claims the device is gone.
+        assert_eq!(
+            device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Unknown),
+            "analog-stereo"
+        );
+        // A short name fits, `(Not Found)` included.
+        assert_eq!(
+            device_combo_text("hp", DevicePresence::Missing),
+            "hp (Not Found)"
+        );
+    }
+
     /// Draw one strip headless in several heights: the layout maths must never
     /// panic (a negative height would panic inside `Rect`/`Ui::allocate`).
     #[test]
@@ -576,11 +701,8 @@ mod tests {
         for strip in &state.strips {
             for height in [200.0_f32, 430.0, 900.0] {
                 let mut cache = ImageCache::new();
-                let primitives = crate::test_support::run_pass(
-                    &ctx,
-                    Vec2::new(120.0, height),
-                    1.0,
-                    |ui| {
+                let primitives =
+                    crate::test_support::run_pass(&ctx, Vec2::new(120.0, height), 1.0, |ui| {
                         let rect = Rect::from_min_size(
                             egui::pos2(10.0, 10.0),
                             Vec2::new(100.0, height - 20.0),
@@ -593,11 +715,11 @@ mod tests {
                             &outputs,
                             [0.5, 0.6],
                             &mut cache,
-                            false,
+                            MidiButtonState::default(),
+                            DevicePresence::Unknown,
                         );
                         assert!(actions.is_empty(), "a paint-only pass must not act");
-                    },
-                );
+                    });
                 assert!(!primitives.is_empty(), "the strip painted nothing");
             }
         }

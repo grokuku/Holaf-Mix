@@ -161,16 +161,28 @@ Règles de câblage :
   moteur Python).
 - `device_list` : registry → nœuds `media.class` Audio/Sink|Source hors
   Holaf/streams.
-- `app_list`/`app_move` : **STUB documenté** (JSON `stub:true`) — pas de
-  gestion des sink-inputs en J2.
+- `app_list`/`app_move` : **implémentés** (2026-11-14) — `app_list` lit
+  `pactl -f json list sink-inputs` (+ `list sinks` pour résoudre le `node.name`
+  du bus) et exclut les flux du démon (son pid, ses enfants via
+  `/proc/<pid>/stat`, ses nœuds `Holaf_*`, l'app Qt) ; `app_move` passe par le
+  gestionnaire de session (`pactl move-sink-input`) puis **relit** la liste pour
+  prouver le déplacement. Politique pure et testée dans
+  `holaf-pw/src/sink_inputs.rs`, preuve live dans
+  `holaf-pw/tests/app_routing_live.rs`.
 - `set_default_sink` : bind de la metadata `default` du daemon + écriture de
   `default.audio.sink` (`{"name": "Holaf_Strip_<uid>"}` / device), pattern J1.
 - `set_mono` : ré-émission des liens sortants (force mono = FL dupliqué sur
   FL+FR, sans sommation) pour chaque route où le strip est source.
 - `device_list` : registry → nœuds `media.class` Audio/Sink|Source hors
   Holaf/streams.
-- `app_list`/`app_move` : **STUB documenté** (JSON `stub:true`) — pas de
-  gestion des sink-inputs en J2.
+- `app_list`/`app_move` : **implémentés** (2026-11-14) — `app_list` lit
+  `pactl -f json list sink-inputs` (+ `list sinks` pour résoudre le `node.name`
+  du bus) et exclut les flux du démon (son pid, ses enfants via
+  `/proc/<pid>/stat`, ses nœuds `Holaf_*`, l'app Qt) ; `app_move` passe par le
+  gestionnaire de session (`pactl move-sink-input`) puis **relit** la liste pour
+  prouver le déplacement. Politique pure et testée dans
+  `holaf-pw/src/sink_inputs.rs`, preuve live dans
+  `holaf-pw/tests/app_routing_live.rs`.
 
 ## 6. Tests
 

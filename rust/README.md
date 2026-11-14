@@ -25,14 +25,25 @@ rust/
                             #        (reconcilieur de graphe) + FFI + spike
   crates/holaf-ui/           # UI Rust/egui (port de l'interface PySide6) :
                             #        thème sérialisable, widgets, vue principale,
-                            #        EngineBridge, capture PNG headless
+                            #        EngineBridge + config.json + VU réels,
+                            #        dialogues, capture PNG headless
 ```
 
-L'UI Rust est un squelette **complet pour la fenêtre principale** mais pas
-encore branchée par défaut : elle se lance avec
-`cargo run -p holaf-ui` (strips de démonstration) et se capture sans serveur X
-avec `cargo run -p holaf-ui --bin holaf-ui-snapshot -- --out /tmp/ui.png`.
-Architecture, modèle de thème et plan de migration (`HOLAF_UI=rust|python`) :
+L'UI Rust est **fonctionnelle** : `cargo run -p holaf-ui` charge le vrai
+`config.json`, pilote le graphe (`holaf-pw`, feature `engine-pw` **par défaut**)
+et persiste chaque modification. Le **MIDI** est là aussi par défaut (`midir`,
+feature `midi`) : le contrôleur stocké dans `ui_rust.midi_port` est ouvert au
+démarrage (un AKAI MIDI Mix est reconnu par son nom), les mappings déjà écrits
+par l'UI Python sont repris tels quels, et le bouton `MIDI` d'un strip ouvre
+`Learn Volume` / `Learn Mute` / `Learn Mono` / `Clear Mappings`. Sans
+séquenceur ALSA (`libasound2-dev` au build, `/dev/snd/seq` au run) l'UI démarre
+quand même et l'explique.  Sans libpipewire :
+`cargo build -p holaf-ui --no-default-features` ; sans MIDI :
+`cargo build -p holaf-ui --no-default-features --features engine-pw` ; lister les
+contrôleurs : `cargo run -p holaf-ui -- --midi-list` ; capture sans serveur X :
+`cargo run -p holaf-ui --bin holaf-ui-snapshot -- --config ../config.json --out /tmp/ui.png`.
+Architecture, modèle de thème, MIDI (§10ter) et plan de migration
+(`HOLAF_UI=rust|python`) :
 [`docs/ui-rust-design.md`](../docs/ui-rust-design.md) ; valeurs mesurées de
 l'UI Qt : [`docs/ui-inventory.md`](../docs/ui-inventory.md).
 

@@ -10,26 +10,54 @@
 //! | [`theme`]     | serialisable design tokens + pure `strip → style` resolution |
 //! | [`widgets`]   | custom drawing: fader + VU, button family                    |
 //! | [`views`]     | layout: the main window and one strip                        |
-//! | [`app`]       | [`app::AppState`] (strips, theme, caches) + [`app::render`]   |
+//! | [`app`]       | [`app::AppState`] (strips, theme, engine, config) + `render`  |
 //! | [`layout`]    | window geometry: Qt width lock + strips filling the height    |
 //! | [`bridge`]    | `EngineBridge`: UI thread ↔ engine thread (mpsc)             |
+//! | [`config`]    | `config.json` load/save: migrations, unknown keys, debounce  |
+//! | [`meters`]    | RMS/peak maths, decay envelope, lock-free `MeterBoard`       |
+//! | [`capture`]   | `pw-cat` capture children feeding the meters (engine-pw)     |
+//! | [`dialogs`]   | FX settings, add strip, delete confirmation, device picker   |
+//! | [`devices`]   | device identity: description/structural matching             |
+//! | [`apps`]      | per-application routing: list, selection, 5 s enforcement    |
+//! | [`menus`]     | window/strip/FX context menus + their actions                |
+//! | [`diagnostics`] | the pure diagnostic report (collector + findings + text)   |
+//! | [`midi`]      | MIDI CC mapping / learn / LED feedback (I/O behind `midi`)   |
+//! | [`tray`]      | tray menu policy + always-on-top (the icon itself: TODO)     |
+//! | [`fx_ui`]     | FX control-port ranges/order (the Qt keyword table)          |
+//! | [`coalesce`]  | the 25 Hz fader throttle                                     |
 //! | [`raster`]    | software rasteriser used by the headless PNG snapshot        |
 //!
-//! `AppState::demo()` builds the same seven strips the Python app shows out of
-//! the box (4 inputs, 3 outputs, one of which is a virtual bus), so
-//! `holaf-ui-snapshot` renders a picture that can be compared side by side with
-//! a screenshot of the Qt build.
+//! The app itself starts from the user's `config.json`
+//! ([`app::AppState::from_config`]).  `AppState::demo()` builds the same seven
+//! strips the Python app shows out of the box (4 inputs, 3 outputs, one of
+//! which is a virtual bus) and is what `holaf-ui-snapshot` renders, so the
+//! picture can be compared side by side with a screenshot of the Qt build.
 //!
 //! See `docs/ui-rust-design.md` for the migration plan (`HOLAF_UI=rust|python`)
 //! and `docs/ui-inventory.md` for the measured Qt geometry/colours.
 
 pub mod app;
+pub mod apps;
 pub mod bridge;
+pub mod coalesce;
+pub mod config;
+pub mod devices;
+pub mod diagnostics;
+pub mod dialogs;
+pub mod engine_json;
+pub mod fx_ui;
 pub mod layout;
+pub mod menus;
+pub mod meters;
+pub mod midi;
 pub mod raster;
 pub mod theme;
+pub mod tray;
 pub mod views;
 pub mod widgets;
+
+#[cfg(feature = "engine-pw")]
+pub mod capture;
 
 pub use app::{render, AppState};
 
