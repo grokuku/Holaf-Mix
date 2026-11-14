@@ -1,0 +1,48 @@
+[package]
+name = "holaf-ui"
+description = "Holaf-Mix Rust/egui user interface (port of the PySide6 interface)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# `cargo run -p holaf-ui` must start the app, not the snapshot tool.
+default-run = "holaf-ui"
+
+# Two binaries:
+#   * `holaf-ui`           — the real desktop app (eframe + glow).
+#   * `holaf-ui-snapshot`  — headless renderer: builds the very same UI tree with
+#                            a plain `egui::Context`, rasterises the tessellated
+#                            meshes in software and writes a PNG.  It exists so
+#                            the layout can be reviewed/verified on a machine
+#                            with no display server (this container has none).
+[[bin]]
+name = "holaf-ui"
+path = "src/main.rs"
+
+[[bin]]
+name = "holaf-ui-snapshot"
+path = "src/bin/holaf-ui-snapshot.rs"
+
+[features]
+default = []
+# Off by default: the demo/skeleton UI must build on a machine WITHOUT
+# libpipewire.  Enabling it links the real engine (holaf-pw), see
+# `docs/ui-rust-design.md` §"EngineBridge".
+engine-pw = ["dep:holaf-pw"]
+
+[dependencies]
+# `default-features = false` everywhere: we do not want the wgpu/x11+wayland
+# double stack, nor accesskit/clipboard/persistence.  Only glow/x11/default_fonts.
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "x11",
+    "default_fonts",
+] }
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+holaf-core = { path = "../holaf-core" }
+holaf-pw = { path = "../holaf-pw", optional = true }

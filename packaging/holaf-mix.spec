@@ -62,6 +62,10 @@ _hiddenimports = [
     'mido',
     'mido.backends.rtmidi',
     'rtmidi',
+    # '_rtmidi' is NOT a top-level module: the extension lives inside the
+    # package (rtmidi/_rtmidi*.so, re-exported as sys.modules['_rtmidi']).
+    # PyInstaller collects it with 'rtmidi' above and warns "hidden import not
+    # found" for this entry; kept as documentation only.
     '_rtmidi',
     # Stdlib `email` and all its submodules (Python 3.12+ workaround)
     'email',
@@ -149,7 +153,35 @@ a = Analysis(
     # `email` parent package isn't created even though its submodules
     # are bundled.
     runtime_hooks=[str(SPEC_DIR / 'hooks-runtime' / 'hook-email.py')],
-    # Exclude unused stdlib to shrink the bundle
+    # Exclude unused stdlib to shrink the bundle.
+    #
+    # POLICY — an entry here MUST NOT be importable by main.py or src/**,
+    # directly or transitively.  `excludes` wins over both the static import
+    # analysis and `hiddenimports`: whatever the code says, the module is not
+    # shipped, and the failure only shows up in the *packaged* binary
+    # (ModuleNotFoundError at the call site, in production).  That is exactly
+    # how `html` used to go missing — src/ui/diagnostics_dialog.py did
+    # `import html` for html.escape() while this list dropped the package, so
+    # "Debug window" died on the frozen build only.  The code now escapes
+    # locally (escape_html()) and `html` is NO LONGER excluded, so anything
+    # that imports it later is collected by the static analysis instead of
+    # silently vanishing.  tests/test_imports_complete.py guards this list:
+    # it fails if an excluded name is reachable from main.py / src/**.
+    #
+    # `email` is the documented exception: it stays excluded (its submodules
+    # are pulled in dynamically by importlib.metadata and would drag in
+    # unrelated code) and is shipped as plain data files instead — see
+    # `datas=[(_EMAIL_PKG_PATH, 'email'), ...]` above plus hook-email.py.
+    #
+    # `xml` is NOT excluded for the same reason `html` is not: it is reachable
+    # without our code asking for it.  mido needs setuptools' vendored
+    # importlib_metadata (see hiddenimports), which makes PyInstaller collect
+    # `pkg_resources` and install its `pyi_rth_pkgres` runtime hook; that hook
+    # imports pkg_resources → plistlib → `xml.parsers.expat`, which runs
+    # BEFORE main.py.  With 'xml' excluded the frozen app died at startup
+    # (ModuleNotFoundError: No module named 'xml', in pyi_rth_pkgres) instead
+    # of opening at all.  Verified by building this spec and launching the
+    # binary.
     excludes=[
         'tkinter',
         'unittest',
@@ -158,9 +190,7 @@ a = Analysis(
         'lib2to3',
         'test',
         'email',
-        'html',
         'http',
-        'xml',
         'pydoc_data',
     ],
     win_no_prefer_redirects=False,

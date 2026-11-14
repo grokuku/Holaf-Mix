@@ -20,6 +20,7 @@ members = [
     "crates/holaf-ipc",
     "crates/holafd",
     "crates/holafctl",
+    "crates/holaf-ui",
 ]
 
 [workspace.package]

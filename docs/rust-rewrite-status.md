@@ -95,6 +95,7 @@ discovery dans le daemon est le reste du J5 (voir §4).
 | **J5** | **Partie sans PipeWire** : robustesse client (retry, timeouts, erreurs structurées), launcher anti-double-spawn/relance, packaging & doc, **bascule en mode par défaut + repli Python** | ✅ **fait** | 62 tests Python verts (dont 21 de sélection backend/résolution), E2E headless : daemon `--backend pipewire` par défaut, nœuds `Holaf_*` créés puis nettoyés |
 | **J5 (metering)** | VU-mètres avec le backend Rust : `meter.sources` (uid → nom de source), `IpcAudioEngine.get_meter_levels` sur `MeteringEngine` local, durcissement `metering.py` (staleness, backoff, re-probe PortAudio) | ✅ **fait** | `holafctl meter-sources`, E2E sine → niveaux 1.0/0.0 |
 | **J5 (suite)** | hotplug devices, metering natif optionnel, discovery devices/apps migrée dans le daemon | 🔴 reste à faire (dépend en partie de J1/J2) | — |
+| **J6** | **UI Rust/egui** (`crates/holaf-ui`) : modèle de thème sérialisable + résolution pure, widgets (fader+VU, boutons), fenêtre principale complète, `EngineBridge` à canaux, capture PNG headless | 🟡 **squelette fait** (non branché par défaut) | `cargo test -p holaf-ui` : **131 tests** verts ; capture `docs/ui-rust-snapshot.png` ; conception : [`ui-rust-design.md`](./ui-rust-design.md), valeurs : [`ui-inventory.md`](./ui-inventory.md) |
 
 Total workspace Rust : **151 tests** (`cargo test`), tous verts avec un daemon
 PipeWire headless (sans lui, les 2 tests live `backend_live` sont skippés).

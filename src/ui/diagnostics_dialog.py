@@ -35,7 +35,6 @@ context menu (**right click → Debug window**, see
 """
 
 import datetime
-import html
 import logging
 import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
@@ -62,6 +61,46 @@ from PySide6.QtWidgets import (
 from src.diagnostics import collector
 
 logger = logging.getLogger("DiagnosticsDialog")
+
+
+# --- HTML escaping -----------------------------------------------------------
+# The summary tab is the only rich-text view: untrusted strings (finding
+# messages, hints, timestamps) are interpolated into the small HTML document
+# handed to QTextBrowser.setHtml(), so they must be escaped.
+#
+# This is a local, dependency-free equivalent of ``html.escape(s, quote=True)``
+# and NOT an ``import html``.  The frozen bundle used to *exclude* the stdlib
+# ``html`` package (see ``Analysis(excludes=...)`` in packaging/holaf-mix.spec),
+# and importing it here is exactly what made the packaged "Debug window" die
+# with ``ModuleNotFoundError: No module named 'html'`` while the source checkout
+# worked fine.  The spec no longer drops ``html`` (that was a policy bug), but
+# this window also keeps its own escaping: escaping five characters is all
+# QTextBrowser needs, so the diagnostics window works in *any* bundle, even one
+# trimmed down to the bare minimum.
+# tests/test_imports_complete.py verifies this module imports with stdlib
+# ``html`` made unimportable.
+_HTML_ESCAPES = (
+    ("&", "&amp;"),
+    ("<", "&lt;"),
+    (">", "&gt;"),
+    ('"', "&quot;"),
+    ("'", "&#x27;"),
+)
+
+
+def escape_html(text: Any) -> str:
+    """Escape ``text`` for the summary tab, without importing stdlib ``html``.
+
+    Same output as ``html.escape(str(text), quote=True)`` for every character
+    that matters in a Qt rich-text document (``&`` first, so the replacement
+    entities themselves are never re-escaped).
+    """
+    escaped = str(text)
+    for raw, entity in _HTML_ESCAPES:
+        if raw in escaped:
+            escaped = escaped.replace(raw, entity)
+    return escaped
+
 
 #: Auto-refresh cadence for the live part (engine + metering).
 AUTO_REFRESH_INTERVAL_MS = 2000
@@ -383,21 +422,21 @@ class DiagnosticsDialog(QDialog):
                 "<span style='color:#e8eaed;'>%s</span>"
                 % (
                     color,
-                    html.escape(collector.severity_label(severity)),
-                    html.escape(str(finding.get("id") or "?")),
-                    html.escape(str(finding.get("message") or "")),
+                    escape_html(collector.severity_label(severity)),
+                    escape_html(finding.get("id") or "?"),
+                    escape_html(finding.get("message") or ""),
                 )
             )
             if finding.get("hint"):
                 parts.append(
                     "<br><span style='color:%s;'>→ %s</span>"
-                    % (color, html.escape(str(finding["hint"])))
+                    % (color, escape_html(finding["hint"]))
                 )
             parts.append("</p>")
         if report.get("generated_at"):
             parts.append(
                 "<p style='color:#5f6368;font-size:11px;'>generated %s</p>"
-                % html.escape(str(report["generated_at"]))
+                % escape_html(report["generated_at"])
             )
         parts.append("</body></html>")
         return "".join(parts)

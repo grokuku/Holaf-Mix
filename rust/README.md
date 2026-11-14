@@ -23,7 +23,18 @@ rust/
   crates/holafctl/           # J3 — client CLI de debug (transport pur)
   crates/holaf-pw/           # J1/J2 — couche pipewire-rs : PipeWireBackend réel
                             #        (reconcilieur de graphe) + FFI + spike
+  crates/holaf-ui/           # UI Rust/egui (port de l'interface PySide6) :
+                            #        thème sérialisable, widgets, vue principale,
+                            #        EngineBridge, capture PNG headless
 ```
+
+L'UI Rust est un squelette **complet pour la fenêtre principale** mais pas
+encore branchée par défaut : elle se lance avec
+`cargo run -p holaf-ui` (strips de démonstration) et se capture sans serveur X
+avec `cargo run -p holaf-ui --bin holaf-ui-snapshot -- --out /tmp/ui.png`.
+Architecture, modèle de thème et plan de migration (`HOLAF_UI=rust|python`) :
+[`docs/ui-rust-design.md`](../docs/ui-rust-design.md) ; valeurs mesurées de
+l'UI Qt : [`docs/ui-inventory.md`](../docs/ui-inventory.md).
 
 Seuls les jalons J0/J3/J4 sont **sans libpipewire obligatoire** ; `holaf-pw`
 lie `libpipewire-0.3` (installée ici).  La couche réelle `holaf-pw` (J1/J2)
