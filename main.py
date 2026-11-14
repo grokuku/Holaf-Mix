@@ -1,8 +1,21 @@
-"""Holaf-Mix entry point (UI + backend selection).
+"""Holaf-Mix entry point: **launcher of the Rust UI**, with the Qt UI as escape hatch.
 
-Backend selection (see :func:`create_audio_engine`)
----------------------------------------------------
-* **Default: Rust.**  The app talks to the Rust `holafd` daemon over a Unix
+UI selection (see :func:`main` and :mod:`src.launcher`)
+-------------------------------------------------------
+* **Default: the Rust UI** (`rust/crates/holaf-ui`).  This file locates the
+  `holaf-ui` executable — `$HOLAF_UI_BIN`, the frozen bundle, `rust/target/`,
+  `$PATH` — and runs it with the same arguments, pinning `--config` to the
+  `config.json` the Qt UI used so both interfaces share one file.
+* **Opt-out: the Qt UI.**  `HOLAF_UI=python` (or the compat
+  `HOLAF_USE_PYTHON=1` / `HOLAF_USE_RUST=0`) runs the PySide6 interface exactly
+  as before — the port is still being validated and that must stay possible.
+* **Fallback.**  When `holaf-ui` cannot be found or executed, the reason is
+  logged at WARNING level and the Qt UI is started instead: the user is never
+  left in front of a dead launcher.
+
+Backend selection of the **Qt path** (see :func:`create_audio_engine`)
+---------------------------------------------------------------------
+* **Default: Rust.**  The Qt app talks to the Rust `holafd` daemon over a Unix
   socket (`IpcAudioEngine`), spawned on demand with `--backend pipewire`.
 * **Opt-out: Python.**  `HOLAF_USE_PYTHON=1` (or the legacy `HOLAF_USE_RUST=0`)
   keeps the classic in-process `AudioEngine` that drives PipeWire directly via
@@ -12,12 +25,12 @@ Backend selection (see :func:`create_audio_engine`)
   Never silent: a WARNING is logged and a notice with the reason is shown in
   the window's status bar.
 
-Qt is imported lazily inside :func:`main` so the backend factory stays
-importable (and unit-testable) on machines without PySide6 / mido, e.g. a
-headless CI container.
+The Qt path is imported lazily inside :func:`run_python_ui` so the backend
+factory (and the Rust launcher) stay importable — and unit-testable — on
+machines without PySide6 / mido, e.g. a headless CI container.
 
-Shutdown (two entry points, one teardown)
------------------------------------------
+Shutdown of the **Qt path** (two entry points, one teardown)
+-----------------------------------------------------------
 ``shutdown_all()`` — engine stop, MIDI port closed, Rust daemon stopped when
 this process spawned it — is connected to ``QApplication.aboutToQuit`` *and*
 run by the POSIX signal handlers installed by
@@ -31,6 +44,8 @@ import logging
 import os
 import sys
 import threading
+
+from src import launcher
 
 # Centralized logging configuration. Done here (not at module level in
 # audio_engine.py) so the first-call-wins behavior of basicConfig doesn't
@@ -184,17 +199,36 @@ def _show_fallback_notice(window, reason: str) -> None:
     dismiss, no extra click before mixing.  Never raises: a UI failure here
     must not abort startup.
     """
-    message = (
+    _show_status_notice(
+        window,
         "Rust audio backend unavailable — running the classic Python engine. "
-        f"Reason: {reason}"
+        f"Reason: {reason}",
     )
+    # The degrading itself was already logged at WARNING by
+    # create_audio_engine(); this only records that the user was told.
+    logger.info("audio backend fallback notice shown: %s", reason)
+
+
+def _show_ui_fallback_notice(window, reason: str) -> None:
+    """Same idea, for the *interface*: `holaf-ui` was missing/unusable.
+
+    Needed because a packaged (PyInstaller) app discards Python's stderr, so the
+    launcher's WARNING never reaches the user — and the Qt window that appears
+    instead would otherwise look like the normal behaviour.
+    """
+    _show_status_notice(
+        window,
+        "Rust UI (holaf-ui) unavailable — running the classic Python "
+        f"interface instead. Reason: {reason}",
+    )
+
+
+def _show_status_notice(window, message: str) -> None:
+    """Show `message` in the window's status bar (best effort, never raises)."""
     try:
         window.statusBar().showMessage(message, FALLBACK_NOTICE_TIMEOUT_MS)
     except Exception:  # noqa: BLE001 - notice is best effort
-        logger.debug("could not show the fallback notice in the status bar")
-    # The degrading itself was already logged at WARNING by
-    # create_audio_engine(); this only records that the user was told.
-    logger.info("%s", message)
+        logger.debug("could not show the notice in the status bar")
 
 
 def make_shutdown_all(audio, midi):
@@ -254,6 +288,42 @@ def make_shutdown_all(audio, midi):
 
 
 def main():
+    """Entry point: run the Rust UI, or the Qt UI on demand / when it is missing.
+
+    * default — :func:`src.launcher.launch` resolves `holaf-ui` and runs it with
+      our own argument list (`--config`, `--midi`, …).  Its exit code is
+      propagated untouched: a Rust UI that starts is never second-guessed
+      (a headless run must print eframe's "no display server" message, not
+      silently open Qt, which needs a display just as much);
+    * `HOLAF_UI=python` (or `HOLAF_USE_PYTHON=1`) — straight to
+      :func:`run_python_ui`, no probing at all;
+    * `holaf-ui` missing/unusable — one WARNING with the reason, then
+      :func:`run_python_ui`, so the app always starts.
+    """
+    argv = sys.argv[1:]
+    ui_fallback_reason = ""
+    if launcher.python_ui_forced():
+        logger.info("classic Python UI selected (HOLAF_UI=python / HOLAF_USE_PYTHON=1)")
+    else:
+        result = launcher.launch(argv)
+        if result.launched:
+            sys.exit(result.exit_code)
+        ui_fallback_reason = result.reason
+        logger.warning(
+            "Rust UI unavailable (%s) — starting the classic Python UI instead. "
+            "Set HOLAF_UI=python to pick it explicitly.",
+            result.reason,
+        )
+    run_python_ui(ui_fallback_reason)
+
+
+def run_python_ui(ui_fallback_reason: str = ""):
+    """The classic PySide6 interface (unchanged behaviour, kept as escape hatch).
+
+    `ui_fallback_reason`, when given, is shown in the status bar: a packaged app
+    has no stderr, so this is the only way the user learns that the Rust UI was
+    expected and could not start.
+    """
     # Qt / mido are imported here (not at module level) so create_audio_engine()
     # stays importable without PySide6 (headless tests, CLI tools).
     from PySide6.QtWidgets import QApplication
@@ -276,6 +346,8 @@ def main():
         fallback_reason = getattr(audio, "_rust_fallback_reason", None)
         if fallback_reason:
             _show_fallback_notice(window, fallback_reason)
+        if ui_fallback_reason:
+            _show_ui_fallback_notice(window, ui_fallback_reason)
 
         # 3. Start Audio Engine with loaded configuration
         audio.start_engine(window.strips)

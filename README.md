@@ -13,7 +13,9 @@
 
 ## Overview
 
-Holaf-Mix is a Python-based audio mixer designed for Linux systems running **PipeWire**. It mimics the workflow of software like Voicemeeter, allowing you to route applications to virtual strips, mix them, and send them to physical outputs or communication apps (Discord, TeamSpeak, etc.).
+Holaf-Mix is an audio mixer for Linux systems running **PipeWire**, written in
+Rust (interface + audio core); the original Python/PySide6 interface is still
+shipped as an escape hatch (`HOLAF_UI=python`). It mimics the workflow of software like Voicemeeter, allowing you to route applications to virtual strips, mix them, and send them to physical outputs or communication apps (Discord, TeamSpeak, etc.).
 
 It features a persistent UI, robust routing logic, and full **MIDI Bidirectional Support** (specifically tested with Akai MIDImix).
 
@@ -36,42 +38,51 @@ It features a persistent UI, robust routing logic, and full **MIDI Bidirectional
 
 ## Tech Stack
 
-*   **Language**: Python 3.10+ (UI) + Rust (audio core daemon `holafd`)
-*   **GUI**: PySide6 (Qt)
-*   **Audio Backend**: Rust `holafd` daemon over a Unix-socket NDJSON protocol
-    (PipeWire via `pipewire-rs`).  Classic Python engine available as opt-out
-    (PipeWire via `pw-cli`/`pw-dump`) — `sounddevice` is used for VU meters in
-    both modes.
-*   **MIDI**: `mido` + `python-rtmidi`
+*   **Language**: Rust (UI + audio core) + Python 3.10+ (fallback UI only)
+*   **GUI**: **Rust/egui** (`rust/crates/holaf-ui`, binary `holaf-ui`) —
+    PySide6 (Qt) remains as the `HOLAF_UI=python` escape hatch
+*   **Audio Backend**: the Rust UI drives PipeWire **in-process** through
+    `holaf-pw` (`PipeWireBackend`) — no daemon, no IPC.  The Qt fallback talks
+    to the Rust `holafd` daemon over a Unix-socket NDJSON protocol, or uses the
+    classic Python engine (`HOLAF_USE_PYTHON=1`).
+*   **MIDI**: `midir` (Rust UI, LED feedback included) / `mido` + `python-rtmidi`
+    (Qt fallback)
 
-## Rust audio core (mode par défaut)
+## Interface Rust (mode par défaut)
 
-Le cœur audio est un daemon **`holafd`** écrit en Rust (`rust/`, workspace
-cargo).  **C'est le mode par défaut** : `main.py` le lance au démarrage
-(`holafd --backend pipewire`) et lui parle en NDJSON sur un socket Unix.
+Depuis la bascule **B1**, la fenêtre de Holaf-Mix est le binaire Rust
+**`holaf-ui`** (`rust/crates/holaf-ui`, egui/eframe).  `main.py` n'ouvre plus de
+fenêtre Qt : c'est un **lanceur** qui localise `holaf-ui` et l'exécute avec les
+mêmes arguments (`--config`, `--midi`, `--midi-list`, `--always-on-top`).
 
 ```bash
-# build de dev : publie dist/holafd (build.sh le fait aussi automatiquement)
+# build de dev : publie dist/{holaf-ui,holafd,holafctl}
 ./scripts/build_rust.sh
-python main.py                     # → daemon Rust (défaut)
+python main.py                     # → UI Rust (défaut)
 ```
 
-*   **Opt-out** — `HOLAF_USE_PYTHON=1 python main.py` : `AudioEngine` Python
-    classique (aucun daemon lancé).  `HOLAF_USE_RUST=0` reste accepté.
-*   **Repli** — si le daemon ne peut pas démarrer (binaire absent, socket
-    occupé, daemon mort au boot), l'app **logue un WARNING**, affiche la raison
-    dans la barre de statut et bascule sur le moteur Python : le repli n'est
-    jamais silencieux.
-*   **Debug sans audio** — `HOLAFD_BACKEND=fake python main.py` (moteur en
-    mémoire) ; `$HOLAFD_BIN` / `$HOLAF_SOCKET` surchargent binaire et socket.
-*   **Packagé** — les bundles PyInstaller embarquent `holafd` (résolu dans le
-    dossier de l'app ou dans `sys._MEIPASS`) : le tarball fonctionne sans Rust
-    installé.
+*   **Échappatoire** — `HOLAF_UI=python python main.py` (ou
+    `HOLAF_USE_PYTHON=1`) : ancienne UI PySide6, comportement inchangé.  Elle
+    reste dans le dépôt et testée tant que la bascule n'est pas validée.
+*   **Repli** — si `holaf-ui` est introuvable ou ne peut pas s'exécuter, le
+    lanceur **logue un WARNING** avec la raison et démarre l'UI Qt : jamais
+    d'échec silencieux.  Un binaire qui *démarre* n'est jamais doublé : son code
+    de sortie est propagé (c'est ce qui fait qu'un lancement sans écran affiche
+    le message d'eframe au lieu d'ouvrir Qt).
+*   **Un seul `config.json`** — le lanceur passe `--config` avec le fichier
+    qu'utilisait l'UI Qt (à côté de l'exécutable en build packagé), donc les deux
+    interfaces partagent la même configuration.
+*   **Moteur audio** — l'UI Rust parle à PipeWire **dans son propre processus**
+    (`holaf-pw::PipeWireBackend`) : ni `holafd`, ni socket, ni lanceur.
+*   **Packagé** — les bundles PyInstaller embarquent `holaf-ui`, `holafd` et
+    `holafctl` (résolus dans le dossier de l'app ou dans `sys._MEIPASS`) : le
+    tarball fonctionne sans Rust installé.
 
-Le MIDI, les VU-mètres et la découverte devices/apps (`pw-dump`/`pactl`) sont
-encore côté Python.  État détaillé des jalons (J0–J5), commandes de test et
-incertitudes API pipewire-rs : [`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md),
-spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
+Le cœur audio Rust (`holafd` + `holafctl`) reste le backend de l'UI Qt.  État
+détaillé des jalons et commandes de test :
+[`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md), spec dans
+[`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md), plan de suppression du
+Python dans [`docs/migration-to-pure-rust.md`](docs/migration-to-pure-rust.md).
 
 ## Installation
 
@@ -87,17 +98,18 @@ spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
     ```bash
     pip install -r requirements.txt
     ```
-    The Rust daemon also needs a Rust toolchain (and the PipeWire dev headers
-    for `bindgen`) — or use a packaged build, which embeds `holafd`:
+    The Rust UI and daemon also need a Rust toolchain (and the PipeWire dev
+    headers for `bindgen`) — or use a packaged build, which embeds all three
+    binaries:
     ```bash
-    ./build.sh --tarball        # builds holafd + the PyInstaller bundle
+    ./build.sh --tarball        # builds holaf-ui + holafd + the PyInstaller bundle
     ```
 
 3.  **Run the application**:
     ```bash
-    python main.py             # Rust backend by default
-    # or, without a Rust daemon:
-    HOLAF_USE_PYTHON=1 python main.py
+    python main.py             # Rust UI by default (launches holaf-ui)
+    # or the old Qt interface, unchanged:
+    HOLAF_UI=python python main.py
     ```
 
 ## Usage

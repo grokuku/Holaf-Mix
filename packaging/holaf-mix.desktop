@@ -23,21 +23,33 @@ Keywords=audio;mixer;pipewire;midi;ladspa;fader;volume;
 # Path to the binary. %k expands to the location of this .desktop file
 # so the launcher works whether installed system-wide or in the user's
 # home directory. Update Exec if you install the binary elsewhere.
-Exec=python3 -m PySide6.QtCore %k/../../holaf-mix
-# The Exec above is a fallback. The recommended way is:
+#
+# Since migration B1 the app's window is the Rust/egui binary `holaf-ui`:
+# it *is* the UI (the Qt interface only survives as the `HOLAF_UI=python`
+# escape hatch).  `__EXEC_PATH__` is replaced at install time by the
+# PKGBUILD / install script.
+Exec=__EXEC_PATH__/holaf-ui %U
+
+# Fallback (kept documented on purpose — uncomment ONE of them and comment the
+# Exec above if holaf-ui is not installed):
+#   # the holaf-mix launcher resolves holaf-ui itself and falls back to the Qt
+#   # UI when the Rust binary is missing or cannot start:
 #   Exec=__EXEC_PATH__/holaf-mix %U
-# (replaced at install time by the PKGBUILD / install script)
+#   # the Qt UI, explicitly (temporary escape hatch while the port is
+#   # validated; the Rust UI is the default):
+#   Exec=env HOLAF_UI=python __EXEC_PATH__/holaf-mix %U
 
 # Same substitution as Exec: lets the desktop environment grey the entry out
 # when the app is not installed at the expected place.
-TryExec=__EXEC_PATH__/holaf-mix
+TryExec=__EXEC_PATH__/holaf-ui
 
-# NOTE (Rust core): the app starts the Rust daemon `holafd` (default audio
-# backend) itself.  Packages install holafd/holafctl NEXT TO this executable
-# (e.g. /usr/bin/holafd); src/backend/rust_launcher.py probes the app directory
-# first, so no extra Exec/Path entry or env var is needed.  If the daemon is
-# missing the app logs a warning and keeps running with the classic Python
-# engine.
+# NOTE (Rust core): `holaf-ui` drives the PipeWire backend IN-PROCESS (no
+# daemon, no IPC), so nothing has to be started alongside it.  The Qt fallback
+# starts the `holafd` daemon itself; packages install holafd/holafctl NEXT TO
+# the executables (/usr/bin), which is the first path src/launcher.py and
+# src/backend/rust_launcher.py probe, so no extra Exec/Path entry or env var is
+# needed.  If holafd is missing the Qt UI logs a warning and keeps running with
+# the classic Python engine.
 
 # Icon — KDE will pick the largest size it finds; we ship 16-512
 Icon=__ICON_PATH__/holaf-mix

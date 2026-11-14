@@ -444,7 +444,7 @@ fn auto_select_midi_port(state: &mut AppState) {
 }
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    holaf_ui::logbuf::install("info");
 
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,

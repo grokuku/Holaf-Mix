@@ -94,18 +94,20 @@ xdg-open dist/icons/holaf-mix-256.png
 ```
 
 This runs:
-1. `scripts/build_rust.sh` → `dist/holafd` + `dist/holafctl` (Rust audio core).
+1. `scripts/build_rust.sh` → `dist/holaf-ui` (the app's window) +
+   `dist/holafd` + `dist/holafctl` (Rust audio core).
    **Best effort**: without a Rust toolchain (or if the build fails) the script
-   logs a warning and continues — you then get a Python-only bundle, and the
-   app falls back to the classic `AudioEngine` at startup.
+   logs a warning and continues — you then get a Python+Qt bundle, and `main.py`
+   starts the Qt UI instead of `holaf-ui`.
 2. `pyinstaller packaging/holaf-mix.spec` → `dist/holaf-mix` (onefile binary)
-   with `holafd`/`holafctl` embedded (extracted to `sys._MEIPASS` at launch)
+   with `holaf-ui`/`holafd`/`holafctl` embedded (extracted to `sys._MEIPASS` at
+   launch; the launcher restores their executable bit)
 3. Copies icons next to the binary
 
 To build only the Rust side (e.g. after a `git pull` in `rust/`):
 
 ```bash
-./scripts/build_rust.sh          # cargo build --release -p holafd -p holafctl
+./scripts/build_rust.sh          # cargo build --release -p holaf-ui -p holafd -p holafctl
 ```
 
 ### 4. Run it
@@ -114,11 +116,14 @@ To build only the Rust side (e.g. after a `git pull` in `rust/`):
 ./dist/holaf-mix
 ```
 
-The first launch creates `config.json` next to the binary.  `holafd` is started
-on demand with `--backend pipewire`; if it cannot start, the app logs a WARNING
-and runs the classic Python engine instead (`HOLAF_USE_PYTHON=1` forces that
-mode explicitly).  `./dist/holafctl --help` drives the daemon from a shell
-(`HOLAF_SOCKET` must match — default `/tmp/holaf-$USER.sock`).
+The first launch creates `config.json` next to the binary.  `holaf-mix` **is a
+launcher**: it resolves `holaf-ui` (next to itself, then in `sys._MEIPASS`, then
+`rust/target/`, then `$PATH`; `HOLAF_UI_BIN` overrides) and runs it with
+`--config <next to holaf-mix>`.  If `holaf-ui` is missing it logs a WARNING and
+starts the Qt UI (`HOLAF_UI=python` picks that explicitly), where `holafd` is
+started on demand with `--backend pipewire` (and the classic Python engine is the
+last resort, `HOLAF_USE_PYTHON=1`).  `./dist/holafctl --help` drives the daemon
+from a shell (`HOLAF_SOCKET` must match — default `/tmp/holaf-$USER.sock`).
 
 ---
 
@@ -139,8 +144,9 @@ makepkg -si
 ```
 
 This installs:
-- `/usr/bin/holaf-mix` (executable)
-- `/usr/bin/holafd` + `/usr/bin/holafctl` (Rust audio core, default backend)
+- `/usr/bin/holaf-mix` (launcher executable)
+- `/usr/bin/holaf-ui` (Rust/egui UI — the app's window)
+- `/usr/bin/holafd` + `/usr/bin/holafctl` (Rust audio core, Qt fallback backend)
 - `/usr/share/applications/holaf-mix.desktop` (KDE menu entry)
 - `/usr/share/icons/hicolor/{16,...,512}x{16,...,512}/apps/holaf-mix.png`
 - `/usr/share/icons/hicolor/scalable/apps/holaf-mix.svg`

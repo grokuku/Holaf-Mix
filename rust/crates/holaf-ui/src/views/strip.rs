@@ -46,9 +46,13 @@
 //!   the confirmation dialog decides (`Delete`).
 //! * **Device combo.** Qt fills it from `pipewire_utils.get_audio_nodes()`;
 //!   the device list arrives with the engine bridge, so the combo displays the
-//!   current device and emits [`UiAction::OpenDevicePicker`] on click.  When the
-//!   stored device is absent from the engine's list the combo shows
-//!   `<name> (Not Found)`, exactly like `set_device_list` in Qt.
+//!   current device and emits [`UiAction::OpenDevicePicker`] on click, which
+//!   unfolds the list **under the button** (`dialogs::draw_device_picker`, a
+//!   non-modal pop-up since migration B3 — it used to be a centred dialog).  The
+//!   button's rect is published to egui memory ([`device_combo_id`]) so the
+//!   pop-up can anchor to it.  When the stored device is absent from the engine's
+//!   list the combo shows `<name> (Not Found)`, exactly like `set_device_list` in
+//!   Qt.
 
 use egui::{Rect, Sense, Ui, UiBuilder, Vec2};
 
@@ -261,7 +265,14 @@ pub fn strip_ui(
             _ => "Virtual Sink (Bus)".to_string(),
         },
     };
-    if combo_display(&mut child, &device_text, theme).clicked() {
+    let combo = combo_display(&mut child, &device_text, theme);
+    // Where the button ended up, published for the device pop-up
+    // (`dialogs::draw_device_picker`): the list unfolds *under the button*, like
+    // the Qt `QComboBox` drop-down.  egui memory is the channel because views
+    // never mutate the model (see `views/mod.rs`).
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(device_combo_id(&strip.uid), combo.rect));
+    if combo.clicked() {
         actions.push(UiAction::OpenDevicePicker {
             uid: strip.uid.clone(),
         });
@@ -570,6 +581,15 @@ pub fn strip_ui(
     }
 
     actions
+}
+
+/// egui-memory key of a strip's device-combo rect.
+///
+/// The strip view writes it every frame (`strip_ui`) and the device pop-up reads
+/// it (`dialogs::draw_device_picker`) so the list opens exactly under the button
+/// that owns it, at any window size and for any strip count.
+pub fn device_combo_id(uid: &str) -> egui::Id {
+    egui::Id::unique(("holaf-device-combo", uid))
 }
 
 /// Shorten a PipeWire node name the way the Qt combo does (`desc[:15] +

@@ -21,22 +21,23 @@
 #
 #  Output: two INDEPENDENT artifact sets
 #
-#    Python build (the user-facing app — now WITH the Rust daemon inside):
+#    Python build (the launcher — WITH the Rust UI and daemon inside):
 #      holaf-mix-{sha}-{arch}
 #        holaf-mix-{version}-{arch}.tar.gz  (the distributable bundle; it
-#                                            embeds holafd/holafctl, see
-#                                            packaging/holaf-mix.spec)
+#                                            embeds holaf-ui/holafd/holafctl,
+#                                            see packaging/holaf-mix.spec)
 #        SHA256SUMS
 #
-#    Rust build (daemon + CLI, standalone):
+#    Rust build (UI + daemon + CLI, standalone):
 #      holaf-rust-{sha}-{arch}
-#        holafd, holafctl                    (release binaries, stripped)
-#        holaf-rust-{arch}.tar.gz            (both binaries in one tarball)
+#        holaf-ui, holafd, holafctl          (release binaries, stripped)
+#        holaf-rust-{arch}.tar.gz            (all three in one tarball)
 #
 #  Why the Rust build runs first (and before PyInstaller)
-#    The Rust daemon is Holaf-Mix's DEFAULT audio backend, so the packaged app
-#    must contain it: build.sh builds/publishes dist/holafd + dist/holafctl and
-#    the PyInstaller spec embeds them.  Independence is preserved differently:
+#    `holaf-ui` IS the app's window and `holafd` its audio backend (for the Qt
+#    fallback), so the packaged app must contain them: build.sh
+#    builds/publishes dist/{holaf-ui,holafd,holafctl} and the PyInstaller spec
+#    embeds them.  Independence is preserved differently:
 #    build.sh treats the Rust step as best-effort (log + continue), so a cargo
 #    failure yields a Python-only bundle that falls back to the classic engine
 #    at startup, and the two upload steps stay gated independently.
@@ -318,7 +319,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build Rust daemon + CLI (release)
+      - name: Build Rust UI + daemon + CLI (release)
         # PATH: `cargo` is /usr/bin/cargo (Arch `rust` package), so it
         # resolves in this fresh shell with no export and no $GITHUB_PATH
         # entry. Never prepend a custom PATH before this step: it could
@@ -331,25 +332,43 @@ jobs:
           # a lockfile out of sync with the manifests is a real repository
           # bug (non-reproducible builds). Let the step fail visibly and fix
           # Cargo.lock with `cargo update` locally — do not "repair" it here.
-          cargo build --release --locked -p holafd -p holafctl
+          # holaf-ui is the app's window (main.py launches it), holafd the
+          # audio backend of the Qt fallback, holafctl the CLI.  One invocation:
+          # they share every dependency (holaf-pw, egui…).
+          cargo build --release --locked -p holaf-ui -p holafd -p holafctl
           cd ..
           mkdir -p dist
-          cp rust/target/release/holafd rust/target/release/holafctl dist/
-          chmod +x dist/holafd dist/holafctl
-          strip dist/holafd dist/holafctl || true
-          file dist/holafd dist/holafctl
-          ls -lh dist/holafd dist/holafctl
+          cp rust/target/release/holaf-ui \
+             rust/target/release/holafd \
+             rust/target/release/holafctl dist/
+          chmod +x dist/holaf-ui dist/holafd dist/holafctl
+          strip dist/holaf-ui dist/holafd dist/holafctl || true
+          file dist/holaf-ui dist/holafd dist/holafctl
+          ls -lh dist/holaf-ui dist/holafd dist/holafctl
 
-          # Bundle both binaries for users who want a single download.
+          # Bundle the three binaries for users who want a single download.
           arch="$(uname -m)"
-          tar -czf "dist/holaf-rust-${arch}.tar.gz" -C dist holafd holafctl
+          tar -czf "dist/holaf-rust-${arch}.tar.gz" \
+            -C dist holaf-ui holafd holafctl
           ls -lh "dist/holaf-rust-${arch}.tar.gz"
+
+          # holaf-ui must at least start: `--help` is parsed before any window,
+          # so this proves the ELF loads and its libraries resolve, without an
+          # X server.
+          help_out="$(timeout 20 dist/holaf-ui --help 2>&1 || true)"
+          if grep -q "usage: holaf-ui" <<<"$help_out"; then
+            echo "  OK   holaf-ui runs (--help)"
+          else
+            echo "::error::dist/holaf-ui did not run:"
+            echo "$help_out"
+            exit 1
+          fi
 
           # Runtime linkage sanity: catches a binary linked against
           # libpipewire/libspa versions that are not actually installed.
           # Warning-level on purpose (the Rust core is still experimental and
           # must not block the Python artifact).
-          for bin in dist/holafd dist/holafctl; do
+          for bin in dist/holaf-ui dist/holafd dist/holafctl; do
             if ldd "$bin" 2>/dev/null | grep -q "not found"; then
               echo "::warning::missing shared libraries for $bin:"
               ldd "$bin" | grep "not found" || true
@@ -458,6 +477,29 @@ jobs:
           ls -lh dist/holaf-mix
           # Strip the binary to shave off ~30% on a real release
           strip dist/holaf-mix 2>/dev/null || true
+
+      - name: Smoke test — the bundled Rust UI is embedded and runs
+        # The point of migration B1: `holaf-mix` is a *launcher* whose job is to
+        # start `holaf-ui` from inside the bundle.  A bundle that silently lost
+        # it would still "work" (Qt fallback), so this is the only check that
+        # catches the regression.
+        #
+        # No X server here, which is exactly what makes it a good probe: the Rust
+        # UI parses its config, attaches the engine, then fails to open a window
+        # and says so on stderr — and the child inherits the real stderr (the
+        # windowed bootloader only silences *Python's* stdio).
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          out="$(timeout 90 ./dist/holaf-mix 2>&1 || true)"
+          echo "$out"
+          if grep -qE "holaf-ui: (no display server|cannot open a window)" <<<"$out"; then
+            echo "  OK   the bundled holaf-ui ran (headless: eframe reported no display)"
+          elif grep -qE "holaf-ui resolved from the PyInstaller bundle" <<<"$out"; then
+            echo "  OK   the launcher found holaf-ui inside the bundle"
+          else
+            echo "::warning::holaf-mix did not reach holaf-ui — the bundle fell back to the Qt UI"
+          fi
 
       - name: Smoke test — bundled modules present in binary
         # Best-effort sanity check. We can't actually RUN the binary
@@ -592,7 +634,7 @@ jobs:
           # purpose, so the -f test below can report them as missing instead
           # of letting sha256sum abort the step.
           shopt -s nullglob
-          files=(*.tar.gz holafd holafctl)
+          files=(*.tar.gz holaf-ui holafd holafctl)
           present=()
           for f in "${files[@]}"; do
             if [[ -f "$f" ]]; then
@@ -635,12 +677,13 @@ jobs:
         # Kept separate on purpose: if the Rust build breaks, the Python
         # bundle above is still published (and vice-versa: a PyInstaller
         # failure leaves the Rust artifact downloadable if cargo succeeded).
-        # Content: holafd + holafctl + a tarball of both + the checksums.
+        # Content: holaf-ui + holafd + holafctl + a tarball of them + checksums.
         if: ${{ !cancelled() && hashFiles('dist/holafd') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: holaf-rust-${{ github.sha }}-${{ runner.arch }}
           path: |
+            dist/holaf-ui
             dist/holafd
             dist/holafctl
             dist/holaf-rust-*.tar.gz

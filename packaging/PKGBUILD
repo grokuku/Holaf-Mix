@@ -34,18 +34,27 @@ depends=(
     'pulseaudio'
     'ladspa'
     'ladspa-plugins'      # for gate_1410, mbeq_1197, sc4_1882
+    # Rust UI (holaf-ui, the app's window since B1): hard-linked against
+    # libpipewire (engine) and libasound (ALSA sequencer for the MIDI Mix).
+    'alsa-lib'
 )
 makedepends=(
     'python-pyinstaller'
     'librsvg2'             # for icon rendering
     'imagemagick'
-    # Rust daemon (holafd) + CLI (holafctl): the daemon is the app's DEFAULT
-    # audio backend and is embedded in the PyInstaller bundle.
+    # Rust UI (holaf-ui) + daemon (holafd) + CLI (holafctl): the UI is the
+    # app's window and the daemon is the audio backend of the Qt fallback;
+    # all three are embedded in the PyInstaller bundle and installed to
+    # /usr/bin.
     'rust'
     'clang'                # bindgen needs libclang.so (libspa-sys)
 )
 optdepends=(
     'rnnoise: AI noise cancellation (librnnoise_ladspa)'
+    # holaf-ui dlopens these (winit/xkbcommon-dl/glutin), so pacman cannot see
+    # them as hard dependencies:
+    'libxkbcommon: X11/Wayland keyboard handling for the Rust UI'
+    'mesa: OpenGL driver for the Rust UI (eframe/glow)'
 )
 
 # Use the source directory or a git checkout
@@ -60,12 +69,20 @@ build() {
     # 1. Generate icons from the source SVG
     ./assets/icons/build_icons.sh
 
-    # 2. Build the Rust daemon + CLI and publish them to dist/ so that step 3
-    #    embeds them (packaging/holaf-mix.spec reads dist/holafd).
-    #    The daemon is the DEFAULT backend, so failing here would ship an app
-    #    that can only run the classic Python engine — make it a hard error
+    # 2. Build the Rust UI (holaf-ui) + daemon (holafd) + CLI (holafctl) and
+    #    publish them to dist/ so that step 3 embeds them (packaging/
+    #    holaf-mix.spec reads dist/holaf-ui, dist/holafd).  holaf-ui is the
+    #    app's window and holafd the audio backend, so failing here would ship
+    #    an app that can only run the Qt fallback — make it a hard error
     #    (cargo is in makedepends).
     ./scripts/build_rust.sh
+    for bin in holaf-ui holafd holafctl; do
+        if [[ ! -x "dist/$bin" ]]; then
+            error "scripts/build_rust.sh did not produce dist/$bin"
+            exit 1
+        fi
+    done
+    msg "Rust binaries: holaf-ui ($(du -h dist/holaf-ui | cut -f1)), holafd, holafctl"
 
     # 3. Build the standalone executable via PyInstaller
     pyinstaller \
@@ -96,11 +113,15 @@ package() {
         ln -sf /usr/lib/holaf-mix/holaf-mix "$pkgdir/usr/bin/holaf-mix"
     fi
 
-    # --- Rust daemon + CLI (default audio backend) ---
-    # Installed in /usr/bin, i.e. NEXT TO the holaf-mix executable: that is the
-    # first place src/backend/rust_launcher.py probes in a frozen app, so the
-    # packaged daemon is found without any env var.  (It is also embedded in
-    # the PyInstaller bundle; this copy is what holafctl users invoke.)
+    # --- Rust UI + daemon + CLI ---------------------------------------
+    # All three are ALSO installed in /usr/bin, i.e. NEXT TO the holaf-mix
+    # executable: that is the first place src/launcher.py (holaf-ui) and
+    # src/backend/rust_launcher.py (holafd) probe in a frozen app, so the
+    # packaged binaries are found without any env var.  (They are embedded in
+    # the PyInstaller bundle too; these copies are what the .desktop file and
+    # holafctl users invoke directly, and what an operator can rebuild/upgrade
+    # independently of the Python bundle.)
+    install -Dm755 "dist/holaf-ui"  "$pkgdir/usr/bin/holaf-ui"
     install -Dm755 "dist/holafd"   "$pkgdir/usr/bin/holafd"
     install -Dm755 "dist/holafctl" "$pkgdir/usr/bin/holafctl"
 
@@ -150,9 +171,13 @@ post_install() {
     if [[ -x /usr/bin/update-desktop-database ]]; then
         update-desktop-database -q /usr/share/applications 2>/dev/null || true
     fi
-    echo "==> Holaf-Mix installed. Launch with: holaf-mix"
-    echo "    Audio core: Rust daemon 'holafd' (installed at /usr/bin/holafd,"
-    echo "    started on demand by the app). CLI: holafctl status"
+    echo "==> Holaf-Mix installed. Launch with: holaf-mix (or holaf-ui)"
+    echo "    UI:    Rust/egui binary 'holaf-ui' (/usr/bin/holaf-ui), started by the"
+    echo "           holaf-mix launcher. The Qt UI stays available as an escape"
+    echo "           hatch: HOLAF_UI=python holaf-mix"
+    echo "    Audio core: Rust daemon 'holafd' (/usr/bin/holafd, started on demand"
+    echo "           by the Qt UI; the Rust UI drives PipeWire in-process)."
+    echo "           CLI: holafctl status"
     echo "    Config will be created at: ~/.config/holaf-mix/ on first run"
     # NOTE: the app currently saves config next to the binary.
     # If you want it in ~/.config/, patch src/config/settings.py to use

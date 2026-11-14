@@ -330,14 +330,18 @@ pub enum DiagTab {
     Engine,
     Graph,
     System,
+    /// The last [`crate::logbuf::MAX_LINES`] log lines (the Qt "Journal" tab).
+    /// Last on purpose: it is the tab a user opens *after* the others.
+    Log,
 }
 
 impl DiagTab {
-    pub const ALL: [DiagTab; 4] = [
+    pub const ALL: [DiagTab; 5] = [
         DiagTab::Summary,
         DiagTab::Engine,
         DiagTab::Graph,
         DiagTab::System,
+        DiagTab::Log,
     ];
 
     pub fn title(self) -> &'static str {
@@ -346,6 +350,7 @@ impl DiagTab {
             DiagTab::Engine => "Engine",
             DiagTab::Graph => "Graph",
             DiagTab::System => "System",
+            DiagTab::Log => "Journal",
         }
     }
 }

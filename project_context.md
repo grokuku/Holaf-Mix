@@ -24,7 +24,10 @@
     ## 3. Project File Structure
     ```text
     Holaf_Mix/
-    ├── main.py                     # [ENTRY POINT]
+    ├── main.py                     # [ENTRY POINT] lanceur : résout puis exécute
+    │                               #   le binaire Rust `holaf-ui` (l'UI est Rust
+    │                               #   depuis B1 ; `HOLAF_UI=python` = UI Qt)
+    ├── src/launcher.py             # [LAUNCHER] résolution de holaf-ui + repli Qt
     ├── config.json                 # [PERSISTENCE]
     ├── project_context.md          # [MEMORY]
     ├── requirements.txt            # [DEPENDENCIES]

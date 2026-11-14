@@ -179,7 +179,7 @@ pub enum UiAction {
     /// The always-on-top flag changed (`ui_rust.always_on_top`).
     SetAlwaysOnTop { value: bool },
     /// Device combo clicked: asks the engine for its device list and opens the
-    /// picker.
+    /// pop-up under the button (`dialogs::draw_device_picker`).
     OpenDevicePicker { uid: String },
 }
 
@@ -363,7 +363,7 @@ pub struct AppState {
     pub add_dialog: Option<AddStripDialog>,
     /// Delete confirmation state (`Some(uid)` while the dialog is open).
     pub delete_confirm: Option<DeleteConfirm>,
-    /// Device picker state.
+    /// Device pop-up state (non-modal, anchored under the strip's combo button).
     pub device_picker: Option<DevicePicker>,
     /// `uid → assigned application names` (the `assigned_apps` key of
     /// `config.json`, which the `Strip` model does not carry).
@@ -1152,8 +1152,13 @@ impl AppState {
                         uid: uid.clone(),
                         kind,
                         current: self.strips[index].device_name.clone(),
+                        // The pop-up opens under the combo button and is
+                        // dismissed by a click outside it: the opening click *is*
+                        // outside, so its frame must be exempted (same trick as
+                        // `menus::ContextMenu`).
+                        opened_at: self.time as f64,
                     });
-                    // Ask the engine for a fresh list; the dialog shows the cached
+                    // Ask the engine for a fresh list; the pop-up shows the cached
                     // one immediately and fills up when the answer arrives.
                     self.send_command(EngineCommand::DeviceList);
                 }

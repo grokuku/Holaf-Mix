@@ -12,12 +12,13 @@
 #                                               sys._MEIPASS at launch)
 #      onedir  : dist/holaf-mix/holaf-mix      (executable)
 #                dist/holaf-mix/_internal/     (Python + Qt + bundled libs
-#                                               + the Rust daemon)
+#                                               + the Rust UI and daemon)
 #
-#  The Rust audio daemon (holafd) and CLI (holafctl) are embedded when they
-#  exist in dist/ or rust/target/release/ — see the "Bundled Rust binaries"
-#  block.  Without them the bundle is Python-only and falls back to the
-#  classic engine at startup.
+#  The Rust UI (`holaf-ui`), the audio daemon (`holafd`) and the CLI
+#  (`holafctl`) are embedded when they exist in dist/ or
+#  rust/target/release/ — see the "Bundled Rust binaries" block.  Without
+#  `holaf-ui` the bundle is Python+Qt only and the launcher says so at startup
+#  (`main.py` then runs the Qt interface).
 # ============================================================================
 
 from pathlib import Path
@@ -83,35 +84,44 @@ _hiddenimports = [
 # the data files guarantee `import email.message` will succeed.
 _EMAIL_PKG_PATH = os.path.dirname(_stdlib_email.__file__)
 
-# --- Bundled Rust binaries (holafd + holafctl) -------------------------------
-# The Rust daemon is the DEFAULT audio backend (see main.create_audio_engine),
-# so the packaged app must ship it.  Candidates, first hit wins:
+# --- Bundled Rust binaries (holaf-ui + holafd + holafctl) --------------------
+# `holaf-ui` is the app's WINDOW now (main.py launches it), and `holafd` is the
+# audio backend the Qt fallback (`HOLAF_UI=python`) uses, so the packaged app
+# must ship both.  Candidates, first hit wins:
 #   dist/                      <- scripts/build_rust.sh / build.sh publish here
 #   rust/target/release/       <- plain `cargo build --release` (dev)
-# When neither exists (no cargo on the build host) the bundle is Python-only:
-# the app still runs and falls back to the classic engine at startup.
+# When neither exists (no cargo on the build host) the bundle is Python+Qt
+# only: the launcher logs that `holaf-ui` is missing and starts the Qt UI.
 #
-# Declared as `datas` (not `binaries`) on purpose: PyInstaller dependency-
-# analyses `binaries` entries and would then copy libpipewire/libspa/libpulse
-# into the bundle, where LD_LIBRARY_PATH would make the app load them instead
-# of the user's system libraries — a client library older than the running
-# PipeWire daemon breaks the audio graph.  The daemon must link against the
-# system PipeWire, so the ELFs travel as opaque payload.  They land in
-# sys._MEIPASS (onefile extraction dir, or onedir's _internal/) and
-# src/backend/rust_launcher.py restores the executable bit on first use.
+# Declared as `datas` and **not** `binaries`: the binaries must be shipped
+# as-is (no per-build rewriting).  PyInstaller still looks into them (an ELF in
+# `datas` is moved to `binaries` and its `ldd` dependencies are collected), which
+# is why the PipeWire/Pulse client libraries are removed again below — a frozen
+# client library older than the user's daemon breaks the audio graph.  They land
+# in sys._MEIPASS (onefile extraction dir, or onedir's _internal/) and
+# src/launcher.py / src/backend/rust_launcher.py restore the executable bit on
+# first use.
 _RUST_BIN_SOURCES = [ROOT / 'dist', ROOT / 'rust' / 'target' / 'release']
+# (name, role) — none of them may make the build fail: without `holaf-ui` the
+# bundle still runs (the launcher starts the Qt UI), and a build host without
+# cargo must keep producing a bundle.
+_RUST_BINS = (('holaf-ui', 'UI'), ('holafd', 'daemon'), ('holafctl', 'CLI'))
 _rust_data = []
-for _name in ('holafd', 'holafctl'):
+_missing = []
+for _name, _role in _RUST_BINS:
     for _dir in _RUST_BIN_SOURCES:
         _candidate = _dir / _name
         if _candidate.is_file():
             _rust_data.append((str(_candidate), '.'))
             break
-if not _rust_data:
-    print('[holaf-mix.spec] WARNING: no Rust binaries found in ' \
-          + ', '.join(str(d) for d in _RUST_BIN_SOURCES) \
-          + ' -> Python-only bundle (the app will run the classic engine)')
-else:
+    else:
+        _missing.append(_name)
+        print(f'[holaf-mix.spec] WARNING: {_name} ({_role}) not found in '
+              + ', '.join(str(d) for d in _RUST_BIN_SOURCES))
+if 'holaf-ui' in _missing:
+    print('[holaf-mix.spec] WARNING: no holaf-ui -> this bundle has NO Rust UI; '
+          'main.py will fall back to the Qt interface')
+if _rust_data:
     print('[holaf-mix.spec] bundling Rust binaries: '
           + ', '.join(Path(src).name for src, _ in _rust_data))
 
@@ -132,8 +142,8 @@ a = Analysis(
     # email.message` work for importlib.metadata. The runtime hook tries
     # first (smaller bundle), but the data files guarantee resolution.
     #
-    # `_rust_data` carries the Rust daemon/CLI (holafd, holafctl) — see the
-    # comment block above; empty on a machine without cargo.
+    # `_rust_data` carries the Rust UI (holaf-ui) plus the daemon/CLI (holafd,
+    # holafctl) — see the comment block above; empty on a machine without cargo.
     datas=[(_EMAIL_PKG_PATH, 'email'), *_rust_data],
     # sounddevice loads PortAudio via ctypes, which PyInstaller misses.
     # python-rtmidi has a dynamic backend. These hidden imports force
@@ -201,6 +211,40 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# --- Keep the SYSTEM PipeWire/Pulse client libraries -------------------------
+# PyInstaller cannot be told "do not analyse this data file": an ELF listed in
+# `datas` is moved to `binaries` and its `ldd` dependencies are collected.  That
+# is how `libpipewire-0.3.so.0` (and `libspa-0.2.so.0` when linked) ends up in
+# the bundle even though nothing asked for it — and why the comment block above
+# promises something the tool does not do.
+#
+# Why it must not stay: the bootloader prepends `sys._MEIPASS` to
+# `LD_LIBRARY_PATH`, so a frozen copy would win over the user's library.  A
+# PipeWire *client* older than the running PipeWire *daemon* can fail to
+# negotiate its nodes — a silent "no audio" that looks like a mixer bug.  The
+# Rust binaries are therefore compiled against the build host's headers but
+# **link the system library at run time** (that is what PKGBUILD's
+# `depends=('pipewire')` is for, and the same on any distro).
+_PIPEWIRE_CLIENT_LIBS = frozenset(
+    {
+        'libpipewire-0.3.so.0',
+        'libspa-0.2.so.0',
+        'libpulse.so.0',
+        'libpulse-simple.so.0',
+    }
+)
+_bundled_pipewire = [
+    entry[0] for entry in a.binaries if Path(entry[0]).name in _PIPEWIRE_CLIENT_LIBS
+]
+if _bundled_pipewire:
+    a.binaries = [
+        entry for entry in a.binaries if Path(entry[0]).name not in _PIPEWIRE_CLIENT_LIBS
+    ]
+    print(
+        '[holaf-mix.spec] keeping the system PipeWire/Pulse libraries '
+        '(dropped from the bundle: ' + ', '.join(sorted(_bundled_pipewire)) + ')'
+    )
+
 # --- Build mode --------------------------------------------------------------
 # Onefile (default, single binary) or onedir (multi-file, faster launch).
 # Selected by $HOLAF_BUILD_MODE, which build.sh sets from its --onedir flag.
@@ -247,8 +291,9 @@ if BUILD_MODE == 'onefile':
     )
 else:
     # onedir: the EXE carries no payload (exclude_binaries=True), COLLECT
-    # writes the executable + _internal/ next to it.  holafd/holafctl land in
-    # _internal/ (sys._MEIPASS) and are found there by rust_launcher.
+    # writes the executable + _internal/ next to it.  holaf-ui/holafd/holafctl
+    # land in _internal/ (sys._MEIPASS) and are found there by src/launcher.py
+    # and src/backend/rust_launcher.py (which also restore their +x bit).
     exe_onedir = EXE(
         pyz,
         a.scripts,

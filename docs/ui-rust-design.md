@@ -543,35 +543,53 @@ Pièges vérifiés sur egui 0.37 (ils coûtent une heure chacun) :
 
 ## 8. Stratégie de migration : `HOLAF_UI=rust|python`
 
+> **Étape 5 FAITE (bascule B1).**  `HOLAF_UI` vaut `rust` par défaut :
+> `main.py` est devenu un **lanceur** (`src/launcher.py`) qui exécute le binaire
+> `holaf-ui`, et l'UI Qt n'est plus qu'une échappatoire (`HOLAF_UI=python` ou
+> `HOLAF_USE_PYTHON=1`).  Le plan de suppression du Python est dans
+> [`migration-to-pure-rust.md`](migration-to-pure-rust.md).
+
 Le daemon `holafd` et son client Python sont déjà en place ; l'UI Rust vient
 **après**, et doit pouvoir être essayée sans renoncer à l'UI Qt.
 
-### 8.1 Le commutateur
+### 8.1 Le commutateur (implémenté)
 
 `main.py` reste le point d'entrée unique :
 
 ```python
-choice = os.environ.get("HOLAF_UI", "python").strip().lower()   # défaut : python
-if choice == "rust":
-    from src.backend import rust_ui_launcher           # à écrire (voir 8.3)
-    if not rust_ui_launcher.launch():                  # binaire absent / écran absent
-        logger.warning("HOLAF_UI=rust indisponible — repli sur l'UI Python")
-        choice = "python"
+# src/launcher.py — la règle réelle, défaut : rust
+if launcher.python_ui_forced():        # HOLAF_UI=python / HOLAF_USE_PYTHON=1
+    run_python_ui()
+else:
+    result = launcher.launch(sys.argv[1:])   # résout holaf-ui et l'exécute
+    if result.launched:
+        sys.exit(result.exit_code)           # code de sortie propagé
+    logger.warning("Rust UI unavailable (%s) — starting the classic Python UI", result.reason)
+    run_python_ui(result.reason)
 ```
+
+Ordre de résolution de `holaf-ui` (calqué sur celui de `holafd`) :
+`$HOLAF_UI_BIN` → bundle PyInstaller (à côté de l'exécutable, puis
+`sys._MEIPASS`, puis `_internal/`, avec restauration du bit exécutable) →
+`rust/target/{release,debug}` → `$PATH`.
 
 Règles, calquées sur celles déjà en place pour le moteur
 (`HOLAF_USE_PYTHON=1`, daemon Rust par défaut) :
 
-1. **défaut = python** tant que la parité n'est pas atteinte (aucune surprise
-   pour les utilisateurs) ;
-2. **repli automatique** : binaire manquant, pas de `DISPLAY`/`WAYLAND_DISPLAY`,
-   version de thème non supportée ⇒ UI Qt, avec une ligne de log ;
-3. **jamais deux UI en même temps** : le verrou d'instance unique existant
-   (`QLocalServer`/fichier pid) doit être partagé, sinon deux fenêtres pilotent
-   le même démon ;
+1. ~~défaut = python~~ → **défaut = rust** depuis B1 (l'échappatoire reste) ;
+2. **repli automatique** : binaire `holaf-ui` manquant ou non exécutable ⇒ UI
+   Qt, avec un WARNING qui porte la raison *et* un message dans la barre de
+   statut (un bundle packagé n'a pas de stderr).  Un binaire qui **démarre**
+   n'est jamais doublé : son code de sortie est propagé, donc « pas d'écran »
+   affiche le message d'eframe au lieu d'ouvrir Qt ;
+3. **jamais deux UI en même temps** : l'UI Rust pilote PipeWire **dans son
+   processus** (pas de démon, pas de socket) ; l'UI Qt est le seul cas où
+   `holafd` est lancé, et elle ne tourne que si `holaf-ui` n'a pas démarré ;
 4. **config.json reste la source de vérité** : l'UI Rust lit/écrit le même
-   fichier via `holaf_core::config` + `migration::strip_from_dict` (elle ne
-   réimplémente pas la migration).
+   fichier via `holaf_core::config` + `migration::strip_from_dict`.  Comme
+   `default_config_path()` côté Rust part du **répertoire courant** (alors que
+   l'UI Qt part de son propre chemin), le lanceur épingle `--config` sur le
+   fichier de l'UI Qt : c'est ce qui rend la bascule réversible.
 
 ### 8.2 Ce que l'UI Rust ne refait pas
 
@@ -594,7 +612,7 @@ reste la dernière brique non portée.
 | **2 (fait)** | parité d'**écriture** : `holaf-ui` pilote `PipeWireBackend` en direct (`default = ["engine-pw"]`), VU réels par capture `pw-cat`, rollback sur refus, mode déconnecté | volume/MUTE/MONO/FX/routage/device agissent sur le graphe ; `tests/engine_live.rs` vert |
 | **3 (fait)** | dialogues : renommer, ajout/suppression, paramètres FX, choix de device, **sélection d'applications**, **diagnostic** ; menus contextuels fenêtre/strip/FX ; always-on-top | aucune fonction Qt perdue (checklist de `ui-inventory.md` §9) |
 | **4 (fait)** | MIDI complet : mapping CC/note, **learn par propriété** (menu du bouton MIDI), feedback LED, **choix du port** + reconnexion automatique, `midi` dans les features par défaut ; l'**icône de tray** reste (GTK3 absent) | un AKAI MIDI Mix pilote le mixeur sans re-apprentissage (§10ter) |
-| **5** | bascule du défaut à `HOLAF_UI=rust`, `HOLAF_UI=python` en échappatoire | une release complète sans régression signalée |
+| **5 (fait, B1)** | bascule du défaut à `HOLAF_UI=rust`, `HOLAF_UI=python` en échappatoire ; `holaf-ui` packagé (spec, tarball, PKGBUILD, `.desktop`, CI) | une release complète sans régression signalée (en attente de validation utilisateur) |
 
 Chaque étape ajoute des tests **sans** toucher aux 177 tests Python
 (`python -m unittest discover -s tests` reste la référence) ; le workspace Rust

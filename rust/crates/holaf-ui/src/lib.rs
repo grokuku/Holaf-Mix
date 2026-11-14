@@ -12,6 +12,7 @@
 //! | [`views`]     | layout: the main window and one strip                        |
 //! | [`app`]       | [`app::AppState`] (strips, theme, engine, config) + `render`  |
 //! | [`layout`]    | window geometry: Qt width lock + strips filling the height    |
+//! | [`logbuf`]    | log ring buffer behind the diagnostics "Journal" tab         |
 //! | [`bridge`]    | `EngineBridge`: UI thread ↔ engine thread (mpsc)             |
 //! | [`config`]    | `config.json` load/save: migrations, unknown keys, debounce  |
 //! | [`meters`]    | RMS/peak maths, decay envelope, lock-free `MeterBoard`       |
@@ -47,6 +48,7 @@ pub mod dialogs;
 pub mod engine_json;
 pub mod fx_ui;
 pub mod layout;
+pub mod logbuf;
 pub mod menus;
 pub mod meters;
 pub mod midi;

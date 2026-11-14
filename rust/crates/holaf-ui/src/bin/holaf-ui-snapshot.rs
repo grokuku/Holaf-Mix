@@ -139,7 +139,7 @@ fn parse_args() -> Result<Args, String> {
                      [--scale 1..4] [--time SECONDS] [--theme FILE.json] \
                      [--config CONFIG.json] [--dialog diagnostics|apps|fx|device|add|delete|\
                      menu|midi-port|midi-port-none|midi-learn|midi-menu] \
-                     [--dialog-tab summary|engine|graph|system]"
+                     [--dialog-tab summary|engine|graph|system|journal]"
                         .to_string(),
                 )
             }
@@ -150,7 +150,9 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Same logger as the app: the diagnostics capture then shows a real
+    // "Journal" tab instead of an empty one.
+    holaf_ui::logbuf::install("warn");
 
     let args = match parse_args() {
         Ok(args) => args,
@@ -346,10 +348,28 @@ fn open_dialog(state: &mut AppState, kind: &str, tab: Option<&str>) -> Result<()
                     "engine" => holaf_ui::diagnostics::DiagTab::Engine,
                     "graph" => holaf_ui::diagnostics::DiagTab::Graph,
                     "system" => holaf_ui::diagnostics::DiagTab::System,
+                    "journal" | "log" => holaf_ui::diagnostics::DiagTab::Log,
                     other => return Err(format!("unknown --dialog-tab {other:?}")),
                 };
                 if let Some(diagnostics) = &mut state.diagnostics {
                     diagnostics.tab = tab;
+                }
+                if tab == holaf_ui::diagnostics::DiagTab::Log && holaf_ui::logbuf::len() == 0 {
+                    // A capture is a fresh process with nothing to report (the
+                    // engine is not attached, so no warning is ever logged): fill
+                    // the buffer with the lines a real start emits, exactly like
+                    // the MIDI port picker gets the names of a MIDI Mix.  Without
+                    // this the "Journal" tab captures as an empty box.
+                    for line in [
+                        "09:31:02 INFO  holaf_ui: config: /home/user/.config/holaf-mix/config.json",
+                        "09:31:02 INFO  holaf_ui::app: loaded 7 strips",
+                        "09:31:02 INFO  holaf_ui: engine: PipeWire backend attached",
+                        "09:31:03 WARN  holaf_ui::bridge::pw: engine: cannot connect to PipeWire: connect: Creation failed",
+                        "09:31:03 INFO  holaf_ui::midi: MIDI Mix:MIDI Mix MIDI 1 24:0 opened",
+                        "09:31:07 WARN  holaf_ui::devices: strip Mic: device alsa_input.gone not found",
+                    ] {
+                        holaf_ui::logbuf::push(line.to_string());
+                    }
                 }
             }
         }

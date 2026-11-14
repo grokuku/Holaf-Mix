@@ -6,25 +6,34 @@
 #
 #  Purpose
 #  -------
-#  Le backend Rust est le mode **par défaut** de Holaf-Mix : `main.py` lance
-#  `holafd` (backend PipeWire) au démarrage.  Ce script compile le daemon et la
-#  CLI en release et les copie à un emplacement prévu — `dist/` à la racine du
-#  dépôt, côte à côte avec la sortie de `build.sh` (dist/holaf-mix,
-#  dist/icons/, …).
+#  Le backend Rust est le mode **par défaut** de Holaf-Mix, et depuis la bascule
+#  B1 l'**interface** aussi : `main.py` lance le binaire `holaf-ui` (UI
+#  egui/eframe) et l'UI Qt n'est plus qu'une échappatoire (`HOLAF_UI=python`).
+#  Ce script compile donc trois binaires en release et les copie à un
+#  emplacement prévu — `dist/` à la racine du dépôt, côte à côte avec la sortie
+#  de `build.sh` (dist/holaf-mix, dist/icons/, …) :
+#
+#      holaf-ui   l'interface (fenêtre, strips, FX, MIDI, diagnostic)
+#      holafd     le daemon audio (backend PipeWire)
+#      holafctl   la CLI
 #
 #  `build.sh` appelle ce script (étape « Build Rust daemon + CLI ») **avant**
-#  PyInstaller, et `packaging/holaf-mix.spec` embarque ensuite les deux binaires
-#  dans le bundle.  L'appel est best-effort côté build.sh : sans cargo, ou si
-#  la compilation échoue, le build continue en Python seul (l'app se rabattra
-#  sur l'`AudioEngine` classique au démarrage).
+#  PyInstaller, et `packaging/holaf-mix.spec` embarque ensuite les trois
+#  binaires dans le bundle.  L'appel est best-effort côté build.sh : sans cargo,
+#  ou si la compilation échoue, le build continue en Python+Qt seul (le lanceur
+#  se rabat sur l'UI Qt au démarrage).
+#
+#  Si `holaf-ui` ne compile pas (libs X11/wayland absentes de la machine de
+#  build), le script retombe sur holafd+holafctl afin de ne pas perdre le
+#  daemon : c'est un warning, pas une erreur.
 #
 #  Usage
 #  -----
-#      ./scripts/build_rust.sh                 # cargo build --release → dist/{holafd,holafctl}
+#      ./scripts/build_rust.sh                 # cargo build --release → dist/{holaf-ui,holafd,holafctl}
 #      ./scripts/build_rust.sh /tmp/my-dist    # destination personnalisée
 #      HOLAFD_BIN_OUT=dist ./scripts/build_rust.sh
 #
-#  Sortie : exit 0 si les binaires ont été copiés, non-zéro sinon.
+#  Sortie : exit 0 si holafd/holafctl ont été copiés, non-zéro sinon.
 # ============================================================================
 
 set -euo pipefail
@@ -58,19 +67,32 @@ if [[ ! -f "$RUST_DIR/Cargo.toml" ]]; then
 fi
 
 # --- Build -------------------------------------------------------------------
-# holafd  : the daemon the app talks to (default backend: PipeWire)
-# holafctl: the CLI (status / apply-snapshot / volume / meter-sources …)
-log "Building holafd + holafctl (release) in $RUST_DIR ..."
-(
-    cd "$RUST_DIR"
-    cargo build --release -p holafd -p holafctl
-)
+# holaf-ui : l'interface (UI Rust — c'est elle que `main.py` lance)
+# holafd   : le daemon audio (backend par défaut : PipeWire)
+# holafctl : la CLI (status / apply-snapshot / volume / meter-sources …)
+#
+# Les trois en UNE invocation cargo : ils partagent toutes leurs dépendances
+# (holaf-pw, egui…), un second `cargo build` ne recompilerait rien mais
+# multiplierait les risques d'états intermédiaires incohérents.
+log "Building holaf-ui + holafd + holafctl (release) in $RUST_DIR ..."
+if ! ( cd "$RUST_DIR" && cargo build --release -p holaf-ui -p holafd -p holafctl ); then
+    warn "full build failed — retrying without holaf-ui (Qt UI kept as the app's UI)"
+    if ! ( cd "$RUST_DIR" && cargo build --release -p holafd -p holafctl ); then
+        err "cargo build failed for holafd/holafctl too — nothing to publish"
+        exit 1
+    fi
+fi
 
 # --- Publish ----------------------------------------------------------------
+# holafd/holafctl sont obligatoires ; holaf-ui est optionnel (bundle Qt seul).
 mkdir -p "$DEST_DIR"
-for bin in holafd holafctl; do
+for bin in holaf-ui holafd holafctl; do
     src="$RUST_DIR/target/release/$bin"
     if [[ ! -x "$src" ]]; then
+        if [[ "$bin" == "holaf-ui" ]]; then
+            warn "$src missing — the bundle will have NO Rust UI (Qt fallback)"
+            continue
+        fi
         err "expected binary not found after build: $src"
         exit 1
     fi
@@ -84,9 +106,14 @@ for bin in holafd holafctl; do
     cp "$src" "$tmp"
     chmod +x "$tmp"
     mv -f "$tmp" "$dest"
-    log "Published $src → $dest"
+    log "Published $src → $dest ($(du -h --apparent-size "$dest" | cut -f1))"
 done
 
-log "Done. The app's launcher finds holafd automatically: in a packaged build"
-log "it looks next to the executable / in the PyInstaller bundle first, then"
-log "rust/target/{release,debug}, then \$PATH (\$HOLAFD_BIN overrides all)."
+if [[ -x "$DEST_DIR/holaf-ui" ]]; then
+    log "Rust UI published: $DEST_DIR/holaf-ui (main.py launches it by default)"
+fi
+
+log "Done. The app's launcher finds holaf-ui / holafd automatically: in a"
+log "packaged build it looks next to the executable / in the PyInstaller bundle"
+log "first, then rust/target/{release,debug}, then \$PATH (\$HOLAF_UI_BIN and"
+log "\$HOLAFD_BIN override all)."

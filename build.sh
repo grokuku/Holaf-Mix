@@ -2,9 +2,9 @@
 # ============================================================================
 #  build.sh — End-to-end build script for Holaf-Mix
 # ============================================================================
-#  Renders the icon set, builds the Rust daemon (holafd/holafctl), builds the
-#  standalone executable (embedding the daemon), and (optionally) packages
-#  everything into a tarball for distribution.
+#  Renders the icon set, builds the Rust binaries (holaf-ui + holafd +
+#  holafctl), builds the standalone executable (embedding all three), and
+#  (optionally) packages everything into a tarball for distribution.
 #
 #  Usage:
 #    ./build.sh                          # icons + Rust daemon + executable
@@ -289,27 +289,28 @@ build_icons() {
 
 build_rust_binaries() {
     # ========================================================================
-    #  Rust daemon/CLI (holafd + holafctl) — MUST run BEFORE PyInstaller
+    #  Rust UI + daemon/CLI (holaf-ui, holafd, holafctl) — BEFORE PyInstaller
     # ========================================================================
-    #  The Rust backend is the app's DEFAULT audio engine, so packaging/
-    #  holaf-mix.spec embeds dist/holafd (+ holafctl) as data files.  If the
-    #  binaries don't exist yet, PyInstaller simply produces a Python-only
-    #  bundle — the app then falls back to the classic engine at startup.
+    #  Since migration B1 the app's window IS the Rust UI: `main.py` locates
+    #  `holaf-ui` and runs it (the Qt interface is only the `HOLAF_UI=python`
+    #  escape hatch).  packaging/holaf-mix.spec embeds all three binaries as
+    #  data files, so they must exist *before* PyInstaller runs.
     #
-    #  Therefore this step is strictly best-effort: a machine without a Rust
-    #  toolchain (or without the PipeWire dev headers bindgen needs) keeps
-    #  producing a working, Python-only build exactly like before.
+    #  Therefore this step stays strictly best-effort: a machine without a Rust
+    #  toolchain keeps producing a working Python+Qt build exactly like before
+    #  (the launcher then logs that holaf-ui is missing and starts Qt).
     # ========================================================================
-    hdr "Step 2/4 — Building Rust daemon + CLI"
+    hdr "Step 2/4 — Building Rust UI + daemon + CLI"
 
     local script="$ROOT_DIR/scripts/build_rust.sh"
     if [[ ! -x "$script" ]]; then
-        warn "scripts/build_rust.sh not found/executable — Python-only build"
+        warn "scripts/build_rust.sh not found/executable — Python+Qt build"
+        warn "  (main.py will fall back to the Qt UI: holaf-ui is not built)"
         return 0
     fi
     if ! has cargo; then
-        warn "cargo not found on PATH — Python-only build."
-        warn "  Install Rust (rustup or your distro's package) to embed holafd."
+        warn "cargo not found on PATH — Python+Qt build."
+        warn "  Install Rust (rustup or your distro's package) to embed holaf-ui."
         return 0
     fi
 
@@ -321,10 +322,23 @@ build_rust_binaries() {
     fi
 
     if "$script" "$DIST_DIR"; then
-        ok "Rust binaries published to $DIST_DIR (holafd, holafctl)"
+        ok "Rust binaries published to $DIST_DIR :"
+        # Say plainly what got embedded, with sizes: the UI is the binary a user
+        # notices (it is the window), and a missing one is the difference
+        # between the Rust UI and the Qt fallback.
+        local b
+        for b in holaf-ui holafd holafctl; do
+            if [[ -x "$DIST_DIR/$b" ]]; then
+                ok "  $b ($(du -h --apparent-size "$DIST_DIR/$b" | cut -f1))"
+            elif [[ "$b" == "holaf-ui" ]]; then
+                warn "  holaf-ui MISSING — the bundle will start the Qt UI instead"
+            else
+                warn "  $b missing"
+            fi
+        done
     else
-        warn "Rust build failed — continuing with a Python-only bundle"
-        warn "  (the app will fall back to the classic Python engine)"
+        warn "Rust build failed — continuing with a Python+Qt bundle"
+        warn "  (main.py will fall back to the Qt UI: see the log above)"
     fi
     return 0
 }
@@ -406,18 +420,19 @@ make_tarball() {
     [[ -f "$ROOT_DIR/packaging/holaf-mix.desktop" ]] && \
         cp "$ROOT_DIR/packaging/holaf-mix.desktop" "$staging/"
 
-    # --- Rust core (holafd + holafctl) -----------------------------------
-    # The Rust daemon is the DEFAULT backend, so build.sh builds it *before*
-    # PyInstaller and the spec embeds it inside the bundle (onefile →
-    # sys._MEIPASS, onedir → <bundle>/_internal/).  We ALSO ship the two
-    # binaries at the top level of the tarball: holafd next to holaf-mix is the
-    # first path the launcher probes in a frozen app (no extraction, no chmod
-    # needed), and holafctl is the CLI users invoke directly.
+    # --- Rust UI + core (holaf-ui, holafd, holafctl) ----------------------
+    # `main.py` launches the Rust UI (`holaf-ui`) and the Qt fallback uses the
+    # Rust daemon (`holafd`), so build.sh builds them *before* PyInstaller and
+    # the spec embeds them inside the bundle (onefile → sys._MEIPASS, onedir →
+    # <bundle>/_internal/).  We ALSO ship the binaries at the top level of the
+    # tarball: they sit next to holaf-mix, which is the first path the launchers
+    # probe in a frozen app (no extraction, no chmod needed), and holafctl is
+    # the CLI users invoke directly.
     # When absent (plain local build without cargo), we say so and continue:
-    # the Python-only bundle must keep working exactly as before.
+    # the Python+Qt bundle must keep working exactly as before.
     local rust_bins=()
     local b
-    for b in holafd holafctl; do
+    for b in holaf-ui holafd holafctl; do
         if [[ -x "$DIST_DIR/$b" ]]; then
             cp "$DIST_DIR/$b" "$staging/"
             chmod +x "$staging/$b"
@@ -425,9 +440,12 @@ make_tarball() {
         fi
     done
     if ((${#rust_bins[@]})); then
-        ok "Rust daemon included: ${rust_bins[*]}"
+        ok "Rust binaries included: ${rust_bins[*]}"
     else
-        warn "Rust daemon not built, skipping (run scripts/build_rust.sh first to include it)"
+        warn "Rust binaries not built, skipping (run scripts/build_rust.sh first)"
+    fi
+    if [[ ! -x "$staging/holaf-ui" ]]; then
+        warn "holaf-ui is NOT in this tarball: holaf-mix will start the Qt UI"
     fi
 
     tar -czf "$DIST_DIR/$tar_name" -C "$DIST_DIR" "${APP_NAME}-${APP_VERSION}"
