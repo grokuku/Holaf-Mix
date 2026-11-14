@@ -2,9 +2,11 @@ import sounddevice as sd
 import numpy as np
 import os
 import logging
+import re
+import subprocess
 import threading
 import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 logger = logging.getLogger("MeteringEngine")
 
@@ -34,6 +36,47 @@ STREAM_NO_DATA_TIMEOUT_S = 3.0
 # instead of falling back to zero.
 LEVEL_STALE_TIMEOUT_S = 0.25
 
+# Rate the metering streams ask for.  **Do not leave this to PortAudio**: its
+# PulseAudio backend defaults to 44 100 Hz while the graph runs at the device
+# rate (48 000 Hz in the reported session), so every VU stream became a
+# permanent resampler — a real report showed 7 of them (`ALSA plug-in
+# [holaf-mix]` at `quant=2048 rate=44100`) running against a 48 kHz device node
+# on the very USB interface that was already xrunning.  That is pure CPU and
+# buffer churn for a level meter.
+# Resolution order: the graph's `clock.rate` (what the driver really runs at),
+# then this fallback, then "let PortAudio decide" if the open is rejected.
+METER_RATE_FALLBACK = 48000
+
+# How long the graph-rate probe may take (one `pw-metadata` call, cached).
+GRAPH_RATE_TIMEOUT_S = 1.5
+
+
+def graph_sample_rate() -> Optional[int]:
+    """The PipeWire graph rate (`clock.rate`), or `None` when unknown.
+
+    Read from `pw-metadata -n settings`, the same source the diagnostics use: it
+    is the rate the driver runs at *now* (a forced rate via `clock.force-rate`
+    shows up there), so the metering never resamples needlessly.
+    """
+    try:
+        result = subprocess.run(
+            ["pw-metadata", "-n", "settings"],
+            capture_output=True, text=True, timeout=GRAPH_RATE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(f"graph sample rate unavailable: {exc}")
+        return None
+    for line in (result.stdout or "").splitlines():
+        # update: id:0 key:'clock.rate' value:'48000' type:''
+        if "key:'clock.rate'" not in line:
+            continue
+        match = re.search(r"value:'(\d+)'", line)
+        if match:
+            rate = int(match.group(1))
+            if 8000 <= rate <= 384000:
+                return rate
+    return None
+
 class MeteringEngine:
     def __init__(self):
         self.active_streams: Dict[str, sd.InputStream] = {}
@@ -57,6 +100,11 @@ class MeteringEngine:
         self.creation_lock = threading.Lock()
         
         self.pulse_device_index = self._find_pulse_device()
+
+        # Rate the capture streams ask for (see `graph_sample_rate`): resolved
+        # lazily, once per engine, so a graph that starts later is still honoured.
+        self._graph_rate: Optional[int] = None
+        self._graph_rate_resolved = False
 
     def _find_pulse_device(self) -> Optional[int]:
         """Index of the PortAudio input device that speaks the Pulse protocol.
@@ -166,13 +214,7 @@ class MeteringEngine:
             # 2. Initialize Stream (This reads the Env)
             # This might block for a short while, but since we are in a background thread
             # and NOT holding data_lock, the UI remains responsive.
-            stream = sd.InputStream(
-                device=self.pulse_device_index,
-                channels=2,
-                blocksize=2048,
-                latency='high', 
-                callback=callback
-            )
+            stream = self._open_stream(callback)
 
             # 3. Start Stream
             stream.start()
@@ -208,6 +250,51 @@ class MeteringEngine:
                 )
                 self._retry_state[strip_uid] = [failures, time.monotonic() + delay]
                 self.pending_retries[strip_uid] = source_name
+
+    def _open_stream(self, callback):
+        """Open one `InputStream` on the Pulse device, at the graph's rate.
+
+        A rate the stack rejects (or a PortAudio build without rate control)
+        must never cost us the stream: the open is retried without `samplerate`,
+        i.e. exactly the previous behaviour.
+        """
+        rate = self._meter_rate()
+        if rate:
+            try:
+                return sd.InputStream(
+                    device=self.pulse_device_index,
+                    channels=2,
+                    samplerate=rate,
+                    blocksize=2048,
+                    latency='high',
+                    callback=callback,
+                )
+            except Exception as exc:  # noqa: BLE001 - fall back to the default rate
+                logger.debug(
+                    f"stream open at {rate} Hz failed ({exc}), falling back to "
+                    f"the default rate"
+                )
+        return sd.InputStream(
+            device=self.pulse_device_index,
+            channels=2,
+            blocksize=2048,
+            latency='high',
+            callback=callback,
+        )
+
+    def _meter_rate(self) -> Optional[int]:
+        """Rate the capture streams should ask for (the graph's own rate).
+
+        Resolved once per engine: `clock.rate` when PipeWire answers, else
+        [`METER_RATE_FALLBACK`].  Never left unset, because PortAudio's default
+        (44 100 Hz on the Pulse backend) is what turned 7 VU streams into
+        permanent resamplers against a 48 kHz graph.
+        """
+        if not self._graph_rate_resolved:
+            self._graph_rate = graph_sample_rate() or METER_RATE_FALLBACK
+            self._graph_rate_resolved = True
+            logger.debug(f"metering streams will ask for {self._graph_rate} Hz")
+        return self._graph_rate
 
     def retry_pending(self):
         """

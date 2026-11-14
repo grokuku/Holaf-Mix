@@ -156,5 +156,71 @@ class DeviceProbeTest(unittest.TestCase):
         self.assertEqual(engine.pending_retries, {})  # not monitored, not queued
 
 
+class MeterRateTest(unittest.TestCase):
+    """The VU streams must ask for the *graph's* rate, not PortAudio's default.
+
+    Leaving it to PortAudio made every meter a permanent resampler (44 100 Hz
+    streams on a 48 000 Hz graph — 7 of them in a reported session), which is
+    pure CPU/buffer churn on the same USB interface that was already xrunning.
+    """
+
+    def test_clock_rate_is_parsed_from_pw_metadata(self):
+        output = "\n".join([
+            'update: id:0 key:\'log.level\' value:\'2\' type:\'\'',
+            'update: id:0 key:\'clock.rate\' value:\'48000\' type:\'\'',
+            'update: id:0 key:\'clock.quantum\' value:\'1024\' type:\'\'',
+        ])
+        done = mock.Mock(stdout=output, returncode=0)
+        with mock.patch.object(metering.subprocess, "run", return_value=done):
+            self.assertEqual(metering.graph_sample_rate(), 48000)
+
+    def test_a_missing_or_broken_probe_is_not_fatal(self):
+        with mock.patch.object(
+            metering.subprocess, "run", side_effect=OSError("pw-metadata not found")
+        ):
+            self.assertIsNone(metering.graph_sample_rate())
+        done = mock.Mock(stdout="no metadata here", returncode=0)
+        with mock.patch.object(metering.subprocess, "run", return_value=done):
+            self.assertIsNone(metering.graph_sample_rate())
+
+    def test_an_absurd_rate_is_rejected(self):
+        out = "update: id:0 key:'clock.rate' value:'7' type:''"
+        done = mock.Mock(stdout=out, returncode=0)
+        with mock.patch.object(metering.subprocess, "run", return_value=done):
+            self.assertIsNone(metering.graph_sample_rate())
+
+    def test_the_engine_asks_for_the_graph_rate(self):
+        engine = engine_without_probe()
+        with mock.patch.object(metering, "graph_sample_rate", return_value=48000) as probe:
+            self.assertEqual(engine._meter_rate(), 48000)
+            # Resolved once per engine, not on every strip.
+            self.assertEqual(engine._meter_rate(), 48000)
+        self.assertEqual(probe.call_count, 1)
+
+    def test_the_fallback_is_used_when_pipewire_does_not_answer(self):
+        engine = engine_without_probe()
+        with mock.patch.object(metering, "graph_sample_rate", return_value=None):
+            self.assertEqual(engine._meter_rate(), metering.METER_RATE_FALLBACK)
+
+    def test_opening_falls_back_to_the_portaudio_default(self):
+        """A rejected rate must never cost us the stream."""
+        engine = engine_without_probe()
+        calls = []
+
+        def fake_input_stream(**kwargs):
+            calls.append(kwargs)
+            if "samplerate" in kwargs:
+                raise RuntimeError("Invalid sample rate")
+            return mock.Mock(name="stream")
+
+        with mock.patch.object(metering, "graph_sample_rate", return_value=48000), \
+                mock.patch.object(metering.sd, "InputStream", side_effect=fake_input_stream):
+            stream = engine._open_stream(lambda *a: None)
+        self.assertIsNotNone(stream)
+        self.assertEqual(calls[0].get("samplerate"), 48000)
+        self.assertNotIn("samplerate", calls[1])
+        self.assertEqual(calls[1]["blocksize"], 2048)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

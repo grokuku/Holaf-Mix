@@ -27,11 +27,17 @@
 //!
 //! Implemented ids: `daemon_unreachable`, `engine_not_running`, `graph_degraded`,
 //! `graph_pending`, `fx_host_down`, `fx_host_respawns`, `fx_host_inprocess`,
-//! `mainloop_pumps_stalled`, `mainloop_pumps_zero`, `legacy_bus_names`,
-//! `strip_bus_unnamed`, `strip_bus_missing`, `device_missing`,
+//! `mainloop_pumps_stalled`, `mainloop_pumps_zero`, `mainloop_pumps_external`,
+//! `legacy_bus_names`, `strip_bus_unnamed`, `strip_bus_missing`, `device_missing`,
 //! `device_not_listed`, `metering_no_source`, `multiple_daemons`, and the
 //! clock/processing ones: `small_quantum`, `pwt_errors`, `pw_top_unavailable`
 //! (fed by `status.timing` — see [`TimingFacts`]).
+//!
+//! Two rules only fire where they mean something: `strip_bus_missing` skips
+//! **physical** strips (they have no null-sink bus — their master node is the
+//! device), and the `mainloop_pumps_*` family only judges the **in-process** FX
+//! mode (with `fx_host.mode=external` the daemon hosts no chain, so a 0 counter
+//! is normal).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -564,26 +570,62 @@ impl Report {
         }
 
         // --- mainloop service ----------------------------------------------
+        // The counter is only meaningful for the **in-process** FX path: the
+        // daemon bumps `mainloop_pumps` when it services its own PipeWire
+        // mainloop, which it only does to host filter-chain modules. With
+        // `fx_host.mode=external` (the default, and the only sane mode) the
+        // dedicated `--fx-host` child owns the chains and pumps its own
+        // mainloop, so `mainloop_pumps=0` is the *normal* state — reporting it
+        // as a stall was a false positive that hid the real findings.
         if engine.running && engine.mainloop_pumps == Some(0) {
-            if fx_host.chains.is_empty() {
-                findings.push(Finding::new(
-                    "mainloop_pumps_zero",
-                    Severity::Info,
-                    "mainloop_pumps=0 and no FX chain declared: the daemon has not serviced an \
-                     idle pass yet (or this build does not maintain the counter)",
-                ).with_hint("not fatal; if the FX chains crackle, treat it as a dead mainloop"));
-            } else {
+            if fx_host.mode.eq_ignore_ascii_case("inprocess") {
+                if fx_host.chains.is_empty() {
+                    findings.push(Finding::new(
+                        "mainloop_pumps_zero",
+                        Severity::Info,
+                        "mainloop_pumps=0 in the in-process FX mode and no FX chain hosted: \
+                         the daemon has not serviced an idle pass yet (or this build does not \
+                         maintain the counter)",
+                    ).with_hint(
+                        "not fatal; if in-process FX chains crackle, treat it as a dead \
+                         mainloop",
+                    ));
+                } else {
+                    findings.push(
+                        Finding::new(
+                            "mainloop_pumps_stalled",
+                            Severity::Warning,
+                            format!(
+                                "mainloop_pumps=0 while {} FX chain(s) are hosted in the \
+                                 daemon (mode=inprocess): the daemon is not servicing its \
+                                 PipeWire mainloop",
+                                fx_host.chains.len()
+                            ),
+                        )
+                        .with_hint("chains starve and the audio chops: restart the daemon"),
+                    );
+                }
+            } else if fx_host.mode.eq_ignore_ascii_case("external") && !fx_host.chains.is_empty()
+            {
+                // Explains a counter that looks alarming but is not.
                 findings.push(
                     Finding::new(
-                        "mainloop_pumps_stalled",
-                        Severity::Warning,
+                        "mainloop_pumps_external",
+                        Severity::Info,
                         format!(
-                            "mainloop_pumps=0 while {} FX chain(s) are declared: the daemon is \
-                             not servicing its PipeWire mainloop",
-                            fx_host.chains.len()
+                            "mainloop_pumps=0 is expected with fx_host.mode=external: the {} \
+                             FX chain(s) are pumped by the dedicated FX host process (pid {}), \
+                             not by the daemon",
+                            fx_host.chains.len(),
+                            fx_host
+                                .pid
+                                .map(|pid| pid.to_string())
+                                .unwrap_or_else(|| "?".to_string())
                         ),
                     )
-                    .with_hint("chains starve and the audio chops: restart the daemon"),
+                    .with_hint(
+                        "no action needed; this counter only tracks the in-process FX path",
+                    ),
                 );
             }
         }
@@ -633,6 +675,16 @@ impl Report {
         // --- strips vs the live graph ---------------------------------------
         if !engine.holaf_nodes.is_empty() {
             for strip in &engine.strips {
+                // A **physical** strip (bound to a device) has no null-sink bus:
+                // the engine publishes a `node_name` for every strip because it
+                // is the *public handle* (`Holaf_Bus_<Label>`), but a physical
+                // strip's master node is the DEVICE itself — no `Holaf_Bus_*`
+                // node is ever created for it. Checking that bus in the graph is
+                // a guaranteed false positive; what must exist for such a strip
+                // is the device, which `device_missing` below covers.
+                if is_physical(strip) {
+                    continue;
+                }
                 if let Some(node_name) = &strip.node_name {
                     if !engine.holaf_nodes.iter().any(|node| node == node_name) {
                         findings.push(
@@ -640,8 +692,8 @@ impl Report {
                                 "strip_bus_missing",
                                 Severity::Error,
                                 format!(
-                                    "strip '{}' declares bus '{}' but that node is absent from \
-                                     the graph",
+                                    "virtual strip '{}' declares bus '{}' but that node is \
+                                     absent from the graph",
                                     strip.label, node_name
                                 ),
                             )
@@ -1043,6 +1095,19 @@ fn unique_sorted(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+/// Whether the strip is bound to a physical device.
+///
+/// Mirrors [`holaf_core::graph::is_physical`], but on the engine's *facts* (a
+/// [`StripFacts`], not a persisted [`Strip`]): a physical strip's master node is
+/// the device, so it has **no** `Holaf_Bus_<Label>` node to look for.
+fn is_physical(strip: &StripFacts) -> bool {
+    strip
+        .device_name
+        .as_deref()
+        .map(|device| !device.is_empty())
+        .unwrap_or(false)
 }
 
 fn fmt_bool(value: bool) -> &'static str {
@@ -1759,18 +1824,18 @@ mod tests {
             Severity::Error
         );
 
-        // A dead mainloop with chains declared is a warning…
+        // A dead mainloop with chains hosted **in-process** is a warning…
         let mut status = healthy_status();
         status["mainloop_pumps"] = json!(0);
         status["fx_host"] =
-            json!({"mode": "external", "pid": 12, "respawns": 0, "chains": ["a", "b"]});
+            json!({"mode": "inprocess", "pid": 12, "respawns": 0, "chains": ["a", "b"]});
         let report = collect(Some(&status), None);
         assert!(report
             .findings
             .iter()
             .any(|f| f.id == "mainloop_pumps_stalled"));
-        // …and only an info when nothing is hosted.
-        status["fx_host"] = json!({"mode": "external", "pid": 12, "respawns": 0, "chains": []});
+        // …and only an info when nothing is hosted in-process.
+        status["fx_host"] = json!({"mode": "inprocess", "pid": 12, "respawns": 0, "chains": []});
         let report = collect(Some(&status), None);
         let finding = report
             .findings
@@ -1778,6 +1843,41 @@ mod tests {
             .find(|f| f.id == "mainloop_pumps_zero")
             .expect("mainloop_pumps_zero");
         assert_eq!(finding.severity, Severity::Info);
+    }
+
+    #[test]
+    fn a_zero_pump_count_is_normal_with_an_external_fx_host() {
+        // Regression: `fx host: mode=external` means the daemon hosts no chain —
+        // its mainloop counter legitimately stays at 0. Reporting a stall there
+        // was a false positive that buried the real findings (a real report had
+        // it while the only actual problem was pw-top errors).
+        let mut status = healthy_status();
+        status["mainloop_pumps"] = json!(0);
+        status["fx_host"] =
+            json!({"mode": "external", "pid": 12, "respawns": 0, "chains": ["a", "b"]});
+        let report = collect(Some(&status), None);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.id == "mainloop_pumps_stalled"),
+            "external FX host must not be reported as a stalled mainloop"
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.id == "mainloop_pumps_external")
+            .expect("mainloop_pumps_external");
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(finding.message.contains("external"), "{}", finding.message);
+
+        // No chain at all, still external: nothing to say (not even an info).
+        status["fx_host"] = json!({"mode": "external", "pid": 12, "respawns": 0, "chains": []});
+        let report = collect(Some(&status), None);
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.id).collect();
+        assert!(!ids.contains(&"mainloop_pumps_stalled"), "{ids:?}");
+        assert!(!ids.contains(&"mainloop_pumps_zero"), "{ids:?}");
+        assert!(!ids.contains(&"mainloop_pumps_external"), "{ids:?}");
     }
 
     #[test]
@@ -1818,6 +1918,62 @@ mod tests {
             .remove("node_name");
         let report = collect(Some(&status), None);
         assert!(report.findings.iter().any(|f| f.id == "strip_bus_unnamed"));
+    }
+
+    #[test]
+    fn a_physical_strip_has_no_bus_to_miss() {
+        // Regression: the engine publishes `node_name` for EVERY strip (it is
+        // the public handle), but a physical strip's master node is its DEVICE —
+        // no `Holaf_Bus_*` node is ever created for it. A real report flagged
+        // Casque/HP/Mic as "bus missing" for exactly that reason.
+        let mut status = healthy_status();
+        // Only the virtual strip's bus is in the graph: `Holaf_Bus_Casque`
+        // (physical strip `out-casque`) is legitimately absent.
+        status["holaf_nodes"] = json!(["Holaf_Bus_Mic"]);
+        let report = collect(Some(&status), None);
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.id).collect();
+        assert!(!ids.contains(&"strip_bus_missing"), "{ids:?}");
+        // The device it is bound to is listed, so no `device_missing` either.
+        assert!(!ids.contains(&"device_missing"), "{ids:?}");
+
+        // The same strip with its device gone IS an error — from
+        // `device_missing`, the rule that actually applies to it.
+        let strips = strips();
+        let devices = vec![DeviceInfo {
+            id: 1,
+            name: "alsa_output.pci.analog-stereo".to_string(),
+            media_class: "Audio/Sink".to_string(),
+            description: None,
+        }];
+        let missing = vec![(
+            "out-casque".to_string(),
+            "Casque".to_string(),
+            "alsa_output.usb.analog-stereo".to_string(),
+        )];
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            devices: &devices,
+            strips: &strips,
+            missing_devices: &missing,
+            meter_missing: &["in-mic".to_string()],
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.id).collect();
+        assert!(ids.contains(&"device_missing"), "{ids:?}");
+        assert!(!ids.contains(&"strip_bus_missing"), "{ids:?}");
+
+        // A *virtual* strip still gets the bus check.
+        let mut status = healthy_status();
+        status["holaf_nodes"] = json!(["Holaf_Bus_Casque"]);
+        let report = collect(Some(&status), None);
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.id == "strip_bus_missing")
+            .expect("strip_bus_missing");
+        assert!(finding.message.contains("Holaf_Bus_Mic"));
+        assert!(finding.message.contains("virtual"));
     }
 
     #[test]

@@ -1344,10 +1344,15 @@ def detect_findings(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
     pumps = engine.get("mainloop_pumps")
     chains = _as_list(fx_host.get("chains"))
-    # `idle_pumps` only stays at 0 when the daemon never ran an idle pass: a
-    # healthy daemon (with or without chains) bumps it immediately, so a 0 here
-    # means its PipeWire mainloop is not being serviced — the modules it hosts
-    # (filter-chains) then starve and the audio chops.
+    # `mainloop_pumps` only stays at 0 when the daemon never ran an idle pass: a
+    # healthy daemon bumps it immediately, so a 0 here means its PipeWire
+    # mainloop is not being serviced — the modules it hosts (filter-chains) then
+    # starve and the audio chops.
+    #
+    # It only means that in the **in-process** FX mode: with
+    # `fx_host.mode=external` the daemon hosts no chain at all (the dedicated
+    # `--fx-host` child owns them and pumps its own mainloop), so a 0 counter is
+    # the normal state and must not be reported as a stall.
     if (
         backend == "rust"
         and engine.get("available")
@@ -1355,12 +1360,27 @@ def detect_findings(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
         and pumps is not None
         and not pumps
     ):
-        if chains:
+        if mode != "inprocess":
+            if mode == "external" and chains:
+                # Informative only: it explains why the counter is 0 on a
+                # perfectly healthy setup (the FX host does the pumping).
+                findings.append(
+                    _finding(
+                        "mainloop_pumps_external", SEVERITY_INFO,
+                        "mainloop_pumps=0 is expected with fx_host.mode=external: the %d FX "
+                        "chain(s) are pumped by the dedicated FX host process (pid %s), not "
+                        "by the daemon"
+                        % (len(chains), fx_host.get("pid") or "?"),
+                        "no action needed; this counter only tracks the in-process FX path",
+                    )
+                )
+        elif chains:
             findings.append(
                 _finding(
                     "mainloop_pumps_stalled", SEVERITY_WARNING,
-                    "mainloop_pumps=0 while %d FX chain(s) are declared: the daemon is not "
-                    "servicing its PipeWire mainloop" % len(chains),
+                    "mainloop_pumps=0 while %d FX chain(s) are hosted in the daemon "
+                    "(mode=inprocess): the daemon is not servicing its PipeWire mainloop"
+                    % len(chains),
                     "chains starve and the audio chops; restart the daemon",
                 )
             )
@@ -1370,9 +1390,9 @@ def detect_findings(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
             findings.append(
                 _finding(
                     "mainloop_pumps_zero", SEVERITY_INFO,
-                    "mainloop_pumps=0 and no FX chain declared: the daemon has not serviced "
-                    "an idle pass yet (or this build does not maintain the counter)",
-                    "not fatal; if the FX chains crackle, treat it as a dead mainloop",
+                    "mainloop_pumps=0 and no FX chain hosted in the daemon: it has not "
+                    "serviced an idle pass yet (or this build does not maintain the counter)",
+                    "not fatal; if in-process FX chains crackle, treat it as a dead mainloop",
                 )
             )
 
@@ -1419,17 +1439,24 @@ def detect_findings(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
         for strip in strips:
             label = strip.get("label") or strip.get("uid") or "?"
             node_name = strip.get("node_name")
-            if node_name and node_name not in graph_names:
+            device = strip.get("device_name")
+            # A **physical** strip (device_name set) has NO null-sink bus: the
+            # daemon publishes a `node_name` for every strip (it is a public
+            # handle, `Holaf_Bus_<Label>`), but a physical strip's master node
+            # is the DEVICE itself — no `Holaf_Bus_*` node is ever created for
+            # it. Checking its bus in the graph is a guaranteed false positive;
+            # what must exist is the device, which `device_missing` below
+            # already covers.
+            if node_name and not device and node_name not in graph_names:
                 findings.append(
                     _finding(
                         "strip_bus_missing", SEVERITY_ERROR,
-                        "strip '%s' declares bus '%s' but that node is absent from the PipeWire graph"
-                        % (label, node_name),
+                        "virtual strip '%s' declares bus '%s' but that node is absent from "
+                        "the PipeWire graph" % (label, node_name),
                         "the bus was not created (daemon error, or the strip was removed from the "
                         "graph): re-apply the configuration",
                     )
                 )
-            device = strip.get("device_name")
             if device and device not in device_names:
                 findings.append(
                     _finding(

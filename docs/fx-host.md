@@ -266,6 +266,9 @@ remix, voire un hachage (le casque hache, les HP C-Media 2 canaux non).
   `audio.channel` (`FL`/`FR`, repli sur l'index 0/1) ; côté Python,
   `_auto_link_ports` matche `FL`/`left` en priorité puis `:output_0`.  Sur un
   device `FL FR RL RR`, `RL`/`RR` restent **non liés** dans les deux cas.
+  ⚠ Sur le device **réel** les canaux s'appellent `AUX0..AUX3` et non
+  `FL`/`FR` : les deux moteurs retombent alors sur l'index et câblent
+  `playback_AUX0`/`playback_AUX1` — vérifié et mesuré en §8 ter.
 * Aucun remix : la chaîne déclare `audio.channels = 2`,
   `audio.position = [ FL, FR ]` et `stream.dont-remix = true` (config SPA-JSON
   identique au caractère près, cf. `spa_config::build_filter_chain_config`).
@@ -320,6 +323,78 @@ Si `ERR` reste à 0 sur le nœud `pro-output-0` et que le monitor 4 canaux ne
 contient pas de trous alors que l'oreille entend le hachage, la cause est en
 aval du graphe (périodes ALSA/USB, `api.alsa.period-size`, ou l'interface
 elle-même) — et non dans la négociation stéréo → 4 canaux.
+
+## 8 ter. Reprise 2026-11-14 : le device **réel** n'a pas de canaux FL/FR
+
+Le §8 bis avait reproduit le device 4 canaux avec `audio.position = [ FL FR RL
+RR ]`.  Le vrai `pro-output-0` n'a **pas** ces noms : le profil *Pro Audio* de
+PipeWire expose un port par canal physique, nommés `AUX0..AUXn`
+(`audio.position = "AUX0,AUX1,AUX2,AUX3"`, cf. la doc archivée
+« pipewire-pro-audio »).  C'est cette différence de **nom de canal** qui change
+le chemin de code des deux moteurs — et non le nombre de canaux.
+
+### Les deux moteurs câblent exactement les mêmes ports (vérifié)
+
+| | règle | sur un device `AUX0..AUX3` |
+|---|---|---|
+| Python `_auto_link_ports` | `'FL' in port or 'left' … or ':output_0'` puis repli sur `ports[0]` / `ports[1]` (ordre de `pw-link -i`) | `playback_AUX0`, `playback_AUX1` |
+| Rust `LiveView::stereo_ports` | `audio.channel == "FL"/"FR"` puis repli sur l'index 0/1 (`port.id`) | `playback_AUX0`, `playback_AUX1` |
+
+Mesuré en headless sur un null-sink reproduit à l'identique
+(`audio.channels=4`, `audio.position=[ AUX0 AUX1 AUX2 AUX3 ]`, donc des ports
+`playback_AUX0..3` avec `audio.channel = AUX0..AUX3`) : `tools/audio_bench.py
+--device-positions "AUX0 AUX1 AUX2 AUX3"` rapporte, pour **les deux** moteurs,
+`linked_ports = playback_AUX0, playback_AUX1`, et le niveau par canal
+(`--capture-channels 4`) donne `0.486/0.486/0.000/0.000` : le signal n'arrive que
+sur AUX0/AUX1, AUX2/AUX3 restent à zéro.  Sur un Studio 26c en mode pro, AUX0 et
+AUX1 sont les canaux physiques 1/2 (sortie principale, celle qui alimente aussi
+le casque) ; AUX2/AUX3 sont les sorties ligne 3/4 — la paire visée est donc la
+bonne dans les deux moteurs.
+
+Autre résultat de la mesure : même en demandant explicitement `playback_FL/FR`
+(`--port-strategy fl-fr`), on obtient les mêmes liens — parce que c'est
+l'**auto-connexion du module** (`target.object` + `stream.dont-remix`) qui câble
+réellement, et que `audio.position = [ FL, FR ]` se rabat sur les deux premiers
+ports du device.  Le `pw-link` explicite des deux moteurs n'est qu'un filet.
+
+### Où est donc la différence ? `node.passive` met le sous-graphe en veille
+
+A/B mesuré (null-sink 4 canaux, chaîne EQ chargée en `pw-cli`, 40 échantillons de
+`pw-dump` pendant la lecture) :
+
+| `playback.props` | état rapporté des nœuds (device + `input/output.Holaf_FX_b`) |
+|---|---|
+| `node.passive = true` (ce que construit le démon aujourd'hui) | **`suspended`** pendant toute la lecture |
+| sans `node.passive` | **`running`** pendant toute la lecture |
+
+C'est exactement la signature du rapport utilisateur, où `pw-top` montre
+`pro-output-0` à `quant=0 rate=0` (donc non ordonnancé) alors que le son sort.
+Sur un null-sink, cela ne coupe pas l'audio (0 trou, THD −81.7 dB) — l'état
+rapporté n'est qu'un symptôme ; sur un nœud ALSA USB, un nœud « suspendu » qui
+porte du son est arrêté/redémarré, et chaque reprise coûte un `ERR` : c'est
+littéralement le hachage on/off.
+
+`tools/probe_node_state.py` (nouveau) sert à le vérifier sur la machine qui
+reproduit :
+
+```bash
+# le device flappe-t-il pendant la lecture ?
+tools/probe_node_state.py --match pro-output --seconds 20 --links
+#   transitions>0 + « quantum seen=[0] » = nœud non ordonnancé par intermittence
+```
+
+### Résultats du banc (quantum 1024, 7 s, device 4 canaux AUX)
+
+| cas | trous | steps | THD+N | rms | ports liés | rms/canal |
+|---|---|---|---|---|---|---|
+| `ref` (aucune chaîne) | 0 | 0 | −99.1 dB | 0.3535 | — | 0.353/0.353/0/0 |
+| `pwcli` (forme du moteur Python) | 0 | 0 | −81.7 dB | 0.4882 | `playback_AUX0/1` | 0.486/0.486/0/0 |
+| `fxhost` (forme du moteur Rust) | 0 | 0 | −81.7 dB | 0.4882 | `playback_AUX0/1` | 0.486/0.486/0/0 |
+
+**Conclusion : le choix des ports n'est pas la cause du hachage.**  Les deux
+moteurs câblent la même paire, avec le même DSP, au même niveau et sans trou.  La
+seule anomalie mesurable du montage est l'état `suspended` imposé par
+`node.passive` sur le sous-graphe de la chaîne.
 
 ## 9. À vérifier sur la machine de l'utilisateur (la seule qui reproduit)
 

@@ -385,6 +385,46 @@ mod tests {
         assert_eq!(view.port_fl(10, PortDir::In), None, "no in ports");
     }
 
+    /// A **pro-audio** device (the reported `alsa_output.…pro-output-0`, 4
+    /// channels) has no `FL`/`FR` channel at all: its ports are
+    /// `playback_AUX0..AUX3` with `audio.channel = AUX0..AUX3`.  The index
+    /// fallback then targets AUX0/AUX1 — the first two ports — which is
+    /// exactly what the classic Python engine's `_auto_link_ports` does too
+    /// (its `FL`/`left` matchers miss as well and it takes ports[0]/[1]).  So
+    /// both engines wire the *same* pair; this test pins that, because a
+    /// change here would silently move the audio to another physical output.
+    #[test]
+    fn a_pro_audio_device_resolves_to_its_first_two_channels() {
+        let globals = vec![
+            port(300, 10, "in", 0, "AUX0", "playback_AUX0"),
+            port(301, 10, "in", 1, "AUX1", "playback_AUX1"),
+            port(302, 10, "in", 2, "AUX2", "playback_AUX2"),
+            port(303, 10, "in", 3, "AUX3", "playback_AUX3"),
+        ];
+        let view = collect_view(&globals);
+        assert_eq!(view.port_fl(10, PortDir::In), Some(300));
+        assert_eq!(view.port_fr(10, PortDir::In), Some(301));
+        // AUX2/AUX3 exist but are not selected — exactly what the live report
+        // showed (`output_FL → playback_AUX0`, `output_FR → playback_AUX1`).
+        assert!(view.port_fl(10, PortDir::In) != Some(302));
+        assert!(view.port_fr(10, PortDir::In) != Some(303));
+        assert_eq!(view.ports(10, PortDir::In).len(), 4);
+    }
+
+    /// Ports whose channel **is** named FL/FR win over the index order, even
+    /// when the node lists them in another order (a device that publishes RL
+    /// first must not send the left channel to the right speaker).
+    #[test]
+    fn named_channels_win_over_the_port_order() {
+        let globals = vec![
+            port(400, 10, "in", 0, "FR", "playback_FR"),
+            port(401, 10, "in", 1, "FL", "playback_FL"),
+        ];
+        let view = collect_view(&globals);
+        assert_eq!(view.port_fl(10, PortDir::In), Some(401));
+        assert_eq!(view.port_fr(10, PortDir::In), Some(400));
+    }
+
     #[test]
     fn node_without_name_or_port_without_node_id_is_skipped() {
         let no_name = GlobalObject {

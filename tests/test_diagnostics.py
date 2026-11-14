@@ -621,6 +621,117 @@ class TestFindingsRules(unittest.TestCase):
         ids = {item["id"] for item in collector.detect_findings(self._report(logs=logs))}
         self.assertIn("log_errors", ids)
 
+    # -- regression: the two false positives of the real 2026-11-14 report --
+    @staticmethod
+    def _live_graph(nodes=()):
+        return {
+            "available": True,
+            "nodes": [{"name": name} for name in nodes],
+            "holaf_nodes": list(nodes),
+            "device_nodes": [],
+            "links": [],
+            "link_count": 0,
+            "pw_top": {"available": False, "reason": "pw-top has no batch mode",
+                       "rows": [], "errors": 0},
+        }
+
+    def test_a_physical_strip_has_no_bus_to_miss(self):
+        """Casque/HP/Mic are physical: no null-sink bus exists for them.
+
+        The daemon publishes a `node_name` for EVERY strip (it is the public
+        handle clients target), but a physical strip's master node is its
+        DEVICE — flagging `Holaf_Bus_Casque` as missing was a guaranteed false
+        positive that buried the real findings.
+        """
+        report = self._report(graph=self._live_graph([
+            "Holaf_Bus_Desktop", "alsa_output.usb-PreSonus.pro-output-0",
+        ]))
+        report["engine"]["strips"] = [
+            _strip("uid-desk", "Desktop", node_name="Holaf_Bus_Desktop"),
+            _strip("uid-casque", "Casque", kind="output", mode="physical",
+                   node_name="Holaf_Bus_Casque",
+                   device_name="alsa_output.usb-PreSonus.pro-output-0"),
+            _strip("uid-hp", "HP", kind="output", mode="physical",
+                   node_name="Holaf_Bus_HP", device_name="alsa_output.pci-C-Media",
+                   volume=0.4),
+        ]
+        findings = collector.detect_findings(report)
+        ids = {item["id"] for item in findings}
+        self.assertNotIn("strip_bus_missing", ids)
+        # The device that really is absent stays reported, by its own rule.
+        self.assertIn("device_missing", ids)
+        missing = next(item for item in findings if item["id"] == "device_missing")
+        self.assertIn("alsa_output.pci-C-Media", missing["message"])
+        self.assertIn("HP", missing["message"])
+
+    def test_a_virtual_strip_still_misses_its_bus(self):
+        report = self._report(graph=self._live_graph(["Holaf_Bus_Desktop"]))
+        report["engine"]["strips"] = [
+            _strip("uid-desk", "Desktop", node_name="Holaf_Bus_Desktop"),
+            _strip("uid-game", "Game", node_name="Holaf_Bus_Game"),
+        ]
+        finding = next(
+            item for item in collector.detect_findings(report)
+            if item["id"] == "strip_bus_missing"
+        )
+        self.assertEqual(finding["severity"], collector.SEVERITY_ERROR)
+        self.assertIn("Holaf_Bus_Game", finding["message"])
+        self.assertIn("virtual", finding["message"])
+
+    def test_zero_pumps_is_normal_with_an_external_fx_host(self):
+        """`mainloop_pumps=0` only means something in the in-process mode.
+
+        With `fx host: mode=external` the daemon hosts no chain at all (the
+        dedicated FX host pumps its own mainloop), so a 0 counter is the normal
+        state — the real report showed it while degraded=false.
+        """
+        report = self._report()
+        report["engine"]["mainloop_pumps"] = 0
+        report["engine"]["fx_host"] = {
+            "mode": "external", "pid": 4242, "respawns": 0,
+            "chains": ["uid-casque", "uid-mic"],
+        }
+        findings = collector.detect_findings(report)
+        ids = [item["id"] for item in findings]
+        self.assertNotIn("mainloop_pumps_stalled", ids)
+        # Explains the counter instead of alarming about it.
+        external = next(item for item in findings if item["id"] == "mainloop_pumps_external")
+        self.assertEqual(external["severity"], collector.SEVERITY_INFO)
+        self.assertIn("external", external["message"])
+
+    def test_zero_pumps_without_a_chain_and_an_external_host_is_silent(self):
+        report = self._report()
+        report["engine"]["mainloop_pumps"] = 0
+        report["engine"]["fx_host"] = {"mode": "external", "pid": 4242, "respawns": 0,
+                                       "chains": []}
+        ids = [item["id"] for item in collector.detect_findings(report)]
+        for ignored in ("mainloop_pumps_stalled", "mainloop_pumps_zero",
+                        "mainloop_pumps_external"):
+            self.assertNotIn(ignored, ids)
+
+    def test_zero_pumps_in_the_in_process_mode_is_still_a_warning(self):
+        report = self._report()
+        report["engine"]["mainloop_pumps"] = 0
+        report["engine"]["fx_host"] = {"mode": "inprocess", "pid": 4242, "respawns": 0,
+                                       "chains": ["uid-casque"]}
+        finding = next(
+            item for item in collector.detect_findings(report)
+            if item["id"] == "mainloop_pumps_stalled"
+        )
+        self.assertEqual(finding["severity"], collector.SEVERITY_WARNING)
+        self.assertIn("inprocess", finding["message"])
+
+    def test_zero_pumps_without_a_chain_in_the_in_process_mode_is_an_info(self):
+        report = self._report()
+        report["engine"]["mainloop_pumps"] = 0
+        report["engine"]["fx_host"] = {"mode": "inprocess", "pid": 4242, "respawns": 0,
+                                       "chains": []}
+        finding = next(
+            item for item in collector.detect_findings(report)
+            if item["id"] == "mainloop_pumps_zero"
+        )
+        self.assertEqual(finding["severity"], collector.SEVERITY_INFO)
+
 
 # =========================================================================
 # text report stability

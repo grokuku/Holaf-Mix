@@ -64,7 +64,6 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -83,6 +82,44 @@ FX_OUT = f"output.Holaf_FX_{UID}"
 
 # Number of channels of the node the chain feeds (see the "Variants" note).
 DEVICE_CHANNELS = 2
+
+# Channel **names** of that node (`audio.position`).  `--device-positions`
+# overrides them, which matters for the real-world shape this bench exists for:
+# a USB interface in the *pro-audio* profile publishes anonymous channels —
+# `alsa_output.usb-…pro-output-0` has ports `playback_AUX0..AUX3` with
+# `audio.channel = AUX0..AUX3`, and **no** FL/FR channel at all.  Both engines
+# then fall back to "the first two ports by index"; naming the bench device the
+# same way is what makes the measurement faithful (a device named FL/FR/RL/RR
+# takes a different code path in both engines *and* in PipeWire's channelmix).
+DEVICE_POSITIONS: list[str] = []
+
+# Which destination ports the *explicit* linking step targets (`pwcli` only: the
+# daemon picks for itself, and its choice is reported as `linked_ports`).
+#   index  first two input ports of the node as `pw-link -i` lists them — the
+#          Python `_auto_link_ports` fallback, and what `link_nodes` does when no
+#          port carries `audio.channel = FL/FR` (the pro-audio case);
+#   fl-fr  `playback_FL` / `playback_FR` (a device that names its channels);
+#   aux    `playback_AUX0` / `playback_AUX1` (explicit, the pro-audio pair).
+PORT_STRATEGY = "index"
+
+DEFAULT_POSITIONS = ["FL", "FR", "RL", "RR", "SL", "SR", "TFL", "TFR",
+                     "TC", "TBL", "TBR", "LFE"]
+
+
+# Channels the recorder captures from the downstream monitor.  Set it to the
+# device's channel count to prove *which* physical channels carry the audio
+# ("AUX0/AUX1 have the tone, AUX2/AUX3 are silent").
+CAPTURE_CHANNELS = 2
+
+
+def device_positions() -> list[str]:
+    """`audio.position` of the downstream device, one name per channel."""
+    wanted = DEVICE_POSITIONS or DEFAULT_POSITIONS
+    positions = list(wanted[:DEVICE_CHANNELS])
+    # Pad with generic aux names if fewer were given than channels requested.
+    while len(positions) < DEVICE_CHANNELS:
+        positions.append(f"AUX{len(positions)}")
+    return positions
 
 
 def downstream_node() -> str:
@@ -229,8 +266,7 @@ def wait_node(name, timeout=10.0):
 
 def create_null_sink(name, channels: int = 2):
     channels = max(channels, 2)
-    positions = " ".join(["FL", "FR", "RL", "RR", "SL", "SR", "TFL", "TFR",
-                          "TC", "TBL", "TBR", "LFE"][:channels])
+    positions = " ".join(device_positions()[:channels])
     spec = (
         "{{ factory.name=support.null-audio-sink "
         "node.name={name} node.description={name} media.class=Audio/Sink "
@@ -246,17 +282,70 @@ def link(src, dst):
     return run(["pw-link", src, dst])
 
 
+def downstream_input_ports() -> list[str]:
+    """Input ports of the downstream node, in `pw-link -i` order.
+
+    That order is exactly what the Python engine parses (`_get_ports_by_name`),
+    so "strategy=index" reproduces it rather than approximating it.
+    """
+    out = run(["pw-link", "-i", "-l"]).stdout
+    node = downstream_node()
+    prefix = f"{node}:"
+    ports = []
+    for line in out.splitlines():
+        match = re.search(rf"({re.escape(prefix)}\S+)", line)
+        if match and match.group(1) not in ports:
+            ports.append(match.group(1))
+    return ports
+
+
+def destination_ports() -> list[str]:
+    """The two destination ports to link, per [`PORT_STRATEGY`]."""
+    node = downstream_node()
+    if PORT_STRATEGY == "aux":
+        return [f"{node}:playback_AUX0", f"{node}:playback_AUX1"]
+    if PORT_STRATEGY == "fl-fr":
+        return [f"{node}:playback_FL", f"{node}:playback_FR"]
+    ports = downstream_input_ports()
+    return ports[:2]
+
+
+def linked_downstream_ports() -> list[str]:
+    """Downstream ports actually fed by the chain — the daemon's own choice.
+
+    Recorded for every scenario: it is the direct evidence of *which* channels
+    of a multi-channel device the engine wired (a report showed
+    `output_FL → playback_AUX0`, `output_FR → playback_AUX1`).
+    """
+    out = run(["pw-link", "-l"]).stdout
+    prefix = f"{downstream_node()}:"
+    seen: list[str] = []
+    current: str | None = None
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(("|<-", "|->")):
+            # A port header line (`BenchDev4ch:playback_AUX0`), or a blank one.
+            current = stripped if stripped.startswith(prefix) else None
+            continue
+        # `  |<- output.Holaf_FX_b:output_FL` — the chain feeds `current`.
+        if current and FX_OUT in stripped and current not in seen:
+            seen.append(current)
+    return seen
+
+
 def ensure_chain_downstream_links():
     """Chain playback → strip input, exactly as the Python engine does it
     explicitly (WirePlumber may or may not have used `target.object`)."""
     listed = run(["pw-link", "-l"]).stdout
-    sink = downstream_node()
     made = 0
-    for port in ("output_FL", "output_FR"):
-        if f"{FX_OUT}:{port}" not in listed:
-            target = f"{sink}:playback_{port.split('_')[1]}"
-            r = link(f"{FX_OUT}:{port}", target)
-            made += r.returncode == 0
+    srcs = [f"{FX_OUT}:output_FL", f"{FX_OUT}:output_FR"]
+    for src, target in zip(srcs, destination_ports()):
+        if f"{src} {target}" in listed or target.rsplit(":", 1)[-1] in listed:
+            continue
+        r = link(src, target)
+        if r.returncode != 0:
+            log(f"link {src} → {target} failed: {r.stderr.strip()}")
+        made += r.returncode == 0
     return made
 
 
@@ -459,7 +548,15 @@ def monitor_name() -> str:
 
 def read_wav_f32(path: str):
     """Minimal RIFF/WAVE reader for the float32 file `pw-cat -r` writes
-    (Python's `wave` module refuses IEEE float)."""
+    (Python's `wave` module refuses IEEE float).
+
+    `pw-cat` writes **WAVEFORMATEXTENSIBLE** (`wFormatTag = 0xFFFE`) as soon as
+    the stream is more than plain stereo — the real sample format then lives in
+    the extension's sub-format GUID, not in `wFormatTag`.  Reading such a file
+    as int16 turns a float capture into noise (measured: `steps` 475470 on a
+    perfectly clean 4-channel reference capture), so the extension is decoded
+    here: sub-format 3 = IEEE float, 1 = PCM (16/32-bit by container size).
+    """
     import numpy as np
     with open(path, "rb") as f:
         raw = f.read()
@@ -480,8 +577,18 @@ def read_wav_f32(path: str):
         pos += 8 + size + (size & 1)
     if data is None:
         raise SystemExit(f"{path}: no data chunk")
-    if fmt is not None and int.from_bytes(fmt[0:2], "little") == 3:
+    tag = int.from_bytes(fmt[0:2], "little") if fmt else 1
+    bits = int.from_bytes(fmt[14:16], "little") if fmt and len(fmt) >= 16 else 16
+    if tag == 0xFFFE and len(fmt) >= 26:
+        # cbSize(2) validBits(2) channelMask(4) then the sub-format GUID, whose
+        # first 2 bytes are the classic format tag.
+        tag = int.from_bytes(fmt[24:26], "little")
+    if tag == 3:
         return np.frombuffer(data, dtype="<f4")
+    if bits == 32:
+        return np.frombuffer(data, dtype="<i4").astype("<f4") / 2147483648.0
+    if bits == 8:
+        return (np.frombuffer(data, dtype="u1").astype("<f4") - 128.0) / 128.0
     return np.frombuffer(data, dtype="<i2").astype("<f4") / 32768.0
 
 
@@ -596,10 +703,12 @@ def measure(scenario: str, seconds: float = 5.0, latency: str = "500ms"):
     cpu_before = (cpu_ticks(daemon_pids), cpu_ticks(child_pids))
     rec = subprocess.Popen(["pw-cat", "-r", "--latency", latency,
                             "--target", monitor_name(), "--format", "f32",
-                            "--rate", "48000", "--channels", "2", wav],
+                            "--rate", "48000", "--channels", str(CAPTURE_CHANNELS),
+                            wav],
                            env=bench_env(), stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL)
     time.sleep(seconds)
+    linked = linked_downstream_ports()
     rec.send_signal(signal.SIGINT)
     try:
         rec.wait(timeout=10)
@@ -614,12 +723,13 @@ def measure(scenario: str, seconds: float = 5.0, latency: str = "500ms"):
         topter.wait(timeout=15)
     except subprocess.TimeoutExpired:
         topter.kill()
+    linked = linked_downstream_ports()
     cpu_after = (cpu_ticks(daemon_pids), cpu_ticks(child_pids))
     time.sleep(0.1)
     return wav, top, (
         (cpu_after[0] - cpu_before[0], cpu_after[1] - cpu_before[1]),
         seconds,
-    )
+    ), linked
 
 
 def _runs(mask):
@@ -640,8 +750,14 @@ def _runs(mask):
     return out
 
 
+# Seconds of capture discarded at the start before measuring (stream warm-up).
+# See `analyse()`: the first second after playback starts is a transient that is
+# not part of the steady state being compared.
+WARMUP_S = 1.0
+
+
 def analyse(wav: str, label: str, sr: int = 48000) -> dict:
-    """Level / distortion / *holes* / *steps* of a stereo capture.
+    """Level / distortion / *holes* / *steps* of a capture.
 
     The two metrics that matter for the reported bug are computed **per
     sample**, not per 1 ms frame (a 1 ms hole was invisible to the old
@@ -653,20 +769,40 @@ def analyse(wav: str, label: str, sr: int = 48000) -> dict:
     * `steps` — sample-to-sample jumps larger than 1.5x the maximum slope the
       1 kHz test tone can physically have.  A discontinuity is an audible
       click, and it is what an xrun/underrun looks like at the splice point.
+
+    With `--capture-channels > 2` the level of **every** channel is reported
+    (`channel_rms`) and the metrics are computed on the loudest pair: on a
+    4-port interface that is what proves which ports were actually fed.
     """
     import numpy as np
     d = read_wav_f32(wav)
-    if d.size < 2:
+    nch = max(1, CAPTURE_CHANNELS)
+    if d.size < nch:
         return {"label": label, "error": "empty capture"}
-    d = d[: d.size // 2 * 2].reshape(-1, 2)
+    d = d[: d.size // nch * nch].reshape(-1, nch)
+    channel_rms = [float(np.sqrt((d[:, c].astype("float64") ** 2).mean()))
+                   for c in range(nch)]
+    if nch > 2:
+        order = sorted(range(nch), key=lambda c: channel_rms[c], reverse=True)
+        keep = order[:2] if channel_rms[order[1]] > 1e-4 else order[:1]
+        d = d[:, sorted(keep)]
     mono = d.mean(axis=1)
     nz = np.nonzero(np.abs(mono) > 1e-3)[0]
     if nz.size:
         a, b = nz[0], nz[-1] + 1
         mono = mono[a:b]
+    # Drop the stream **warm-up**: the first ~1 s of a capture has a transient
+    # (the player filling its buffer, the graph settling).  Measuring through it
+    # drags the least-squares fit and reports −28 dB on a chain whose steady
+    # state is −53 dB, i.e. it hides/exaggerates differences that are not in the
+    # audio.  Measured: THD −20 dB over 0–1 s, −53.4 dB for every later second,
+    # so one full second is what gets dropped.
+    warmup = int(WARMUP_S * sr)
+    if mono.size > warmup + sr // 2:
+        mono = mono[warmup:]
     if mono.size < sr // 2:
         return {"label": label, "error": "no sustained signal",
-                "samples": int(mono.size)}
+                "samples": int(mono.size), "channel_rms": channel_rms}
 
     rms = float(np.sqrt((mono ** 2).mean()))
     peak = float(np.abs(mono).max())
@@ -711,7 +847,7 @@ def analyse(wav: str, label: str, sr: int = 48000) -> dict:
         "fund": fund, "thd": thd,
         "holes": len(holes), "hole_ms": hole_ms,
         "max_hole_ms": (max(holes) / sr * 1000.0) if holes else 0.0,
-        "steps": steps,
+        "steps": steps, "channel_rms": channel_rms,
     }
 
 
@@ -726,20 +862,25 @@ def one_run(scenario: str, quantum: int, load: int = 0, seconds: float = 5.0,
     try:
         cleanup = SETUPS[scenario](poll_hz)
         try:
-            wav, top, cpu = measure(scenario, seconds, latency)
+            wav, top, cpu, linked = measure(scenario, seconds, latency)
         finally:
             cleanup()
     finally:
         stop_procs(load_procs)
 
     res = analyse(wav, scenario)
+    res["linked_ports"] = linked
+    res["device_positions"] = device_positions()
+    res["port_strategy"] = PORT_STRATEGY
     tops = parse_pwtop(top)
     holaf = {k: v for k, v in tops.items()
              if k.startswith(("Holaf_", "input.Holaf", "output.Holaf"))}
     res.update({
         "scenario": scenario, "quantum": quantum, "load": load,
         "poll_hz": poll_hz, "pwtop": holaf,
-        "err_total": sum(v["err"] for v in holaf.values()),
+        # `None` when pw-top produced nothing (no batch mode on 0.3.65 and no
+        # terminal): a printed 0 would look like "no xruns" and lie.
+        "err_total": sum(v["err"] for v in holaf.values()) if holaf else None,
         # CPU burned by the *hosting process tree* (daemon + FX host child)
         # while the tone plays: the machine-independent cost of co-hosting the
         # chain with IPC/reconciliation (in-process) versus delegating it.
@@ -773,11 +914,18 @@ def stress_label(res: dict) -> str:
 def fmt(res: dict) -> str:
     if "error" in res:
         return f"{res['scenario']:7s} {res.get('quantum', 0):5d} ERROR {res['error']}"
-    return (f"{res['scenario']:7s} {res['quantum']:5d} {stress_label(res):>8s} "
+    line = (f"{res['scenario']:7s} {res['quantum']:5d} {stress_label(res):>8s} "
             f"{res['holes']:5d} {res['hole_ms']:7.2f} {res['max_hole_ms']:6.2f} "
             f"{res['steps']:5d} {res['thd']:+7.1f} {res['rms']:.4f} "
-            f"{res['err_total']:4d} {res.get('host_cpu_pct', 0.0):5.1f} "
+            f"{(res['err_total'] if res.get('err_total') is not None else 'n/a'):>4} "
+            f"{res.get('host_cpu_pct', 0.0):5.1f} "
             f"{res.get('daemon_cpu_pct', 0.0):7.2f}")
+    # The channel wiring is the evidence: say it in the table, not only in JSON.
+    if res.get("linked_ports"):
+        line += "  " + ",".join(p.split(":", 1)[-1] for p in res["linked_ports"])
+    if len(res.get("channel_rms") or []) > 2:
+        line += "  rms/ch " + "/".join(f"{v:.3f}" for v in res["channel_rms"])
+    return line
 
 
 def matrix(scenarios, quantums, load: int, poll_hz: float, seconds: float,
@@ -822,15 +970,37 @@ def main():
         p.add_argument("--device-channels", type=int, default=2, metavar="N",
                        help="feed the chain into an N-channel null-sink (4 = a "
                             "4-output USB interface) instead of the stereo bus")
+        p.add_argument("--device-positions", default=None, metavar="'A B C D'",
+                       help="channel names of that sink (audio.position). Use "
+                            "'AUX0 AUX1 AUX2 AUX3' to reproduce a pro-audio USB "
+                            "interface, whose ports are playback_AUX0..3 with no "
+                            "FL/FR channel at all")
+        p.add_argument("--port-strategy", default="index",
+                       choices=("index", "fl-fr", "aux"),
+                       help="which destination ports the explicit linking step "
+                            "targets (pwcli scenario): index = first two ports, "
+                            "the fallback both engines use on AUX devices")
+        p.add_argument("--capture-channels", type=int, default=2, metavar="N",
+                       help="record N channels of the monitor (N > 2 reports the "
+                            "level of every channel: which ports really got fed)")
         p.add_argument("--json", default=None)
     args = ap.parse_args()
-    global DEVICE_CHANNELS
+    global DEVICE_CHANNELS, DEVICE_POSITIONS, PORT_STRATEGY, CAPTURE_CHANNELS
     DEVICE_CHANNELS = max(2, args.device_channels)
+    if args.device_positions:
+        DEVICE_POSITIONS = args.device_positions.replace(",", " ").split()
+        DEVICE_CHANNELS = max(2, len(DEVICE_POSITIONS))
+    PORT_STRATEGY = args.port_strategy
+    CAPTURE_CHANNELS = max(1, args.capture_channels)
     if args.cmd == "run":
         r = one_run(args.scenario, args.quantum, args.load, args.seconds,
                     args.poll, args.latency)
         print(HEADER)
         print(fmt(r))
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(r, f, indent=1)
+            log("wrote", args.json)
     else:
         qs = [int(x) for x in args.quantums.split(",") if x.strip()]
         sc = [x for x in args.scenarios.split(",") if x.strip()]
