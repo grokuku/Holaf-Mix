@@ -38,6 +38,9 @@ use holaf_ui::app::AppState;
 struct HolafApp {
     state: AppState,
     frames: u64,
+    /// Whether the window is currently shown.  The tray's Show/Hide entry toggles
+    /// it; egui hides/shows the viewport with `ViewportCommand::Visible`.
+    window_visible: bool,
     /// The MIDI controller this window drives (`--features midi` only).
     #[cfg(feature = "midi")]
     midi: MidiDevice,
@@ -135,6 +138,7 @@ impl HolafApp {
         Self {
             state,
             frames: 0,
+            window_visible: true,
             #[cfg(feature = "midi")]
             midi,
         }
@@ -162,14 +166,72 @@ impl eframe::App for HolafApp {
                 self.state.theme.name
             );
         }
+        // The close button: hide (and stay alive in the tray) only when a tray
+        // icon is actually there; otherwise let the window close and the app exit
+        // (`on_exit` → `shutdown`).  This is the Qt `closeEvent` rule.
+        self.intercept_close(ui.ctx());
         self.pump_midi(ui.ctx());
+        self.pump_tray(ui.ctx());
         holaf_ui::render(&mut self.state, ui);
     }
 }
 
 impl HolafApp {
-    /// Move messages between the controller and the model (`--features midi`).
+    /// Turn a WM close request into the [`holaf_ui::tray::CloseAction`]: with a
+    /// tray + the preference, the window is hidden (`CancelClose` + `Visible`
+    /// false) and the app keeps running; otherwise the close is allowed and
+    /// eframe runs `on_exit`/`shutdown`.
+    fn intercept_close(&mut self, ctx: &egui::Context) {
+        let requested = ctx.input(|input| input.viewport().close_requested());
+        if !requested {
+            return;
+        }
+        match self.state.close_action() {
+            holaf_ui::tray::CloseAction::Hide => {
+                log::info!("ui: close requested - hiding to the tray");
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.window_visible = false;
+            }
+            holaf_ui::tray::CloseAction::Quit => {
+                log::info!("ui: close requested - quitting (no tray)");
+            }
+        }
+    }
+
+    /// Dispatch the system tray's events (feature `tray`; a no-op otherwise).
     ///
+    /// Polled once per frame from the UI thread — `muda`'s channel is `Send`, so
+    /// this reads the menu clicks without touching GTK.  Each [`TrayEvent`] maps
+    /// onto exactly what the equivalent window control does (context-menu
+    /// "Restart audio engine", the close button, show/hide).
+    fn pump_tray(&mut self, ctx: &egui::Context) {
+        for event in holaf_ui::tray::poll() {
+            match event {
+                holaf_ui::tray::TrayEvent::ToggleWindow => {
+                    self.window_visible = !self.window_visible;
+                    log::info!(
+                        "tray: {}",
+                        if self.window_visible { "show window" } else { "hide window" }
+                    );
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
+                }
+                holaf_ui::tray::TrayEvent::RestartEngine => {
+                    log::info!("tray: restart audio engine");
+                    self.state.restart_engine(std::time::Instant::now());
+                }
+                holaf_ui::tray::TrayEvent::Quit => {
+                    log::info!("tray: quit");
+                    // `ViewportCommand::Close` runs the normal exit path
+                    // (`on_exit` → `AppState::shutdown`): no PipeWire object or
+                    // capture child survives.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Move messages between the controller and the model (`--features midi`).
     /// The port lives in [`MidiDevice`], not in `AppState`: the UI library stays
     /// free of ALSA (its MIDI policy is pure), and the shell is the only place
     /// that touches a device.  A closed/disappeared port is a status line, never
@@ -510,20 +572,28 @@ fn main() -> ExitCode {
     // Tray policy: with no tray icon the close button must quit (it does), and
     // the "always on top" flag is a *stored preference* here instead of the
     // unconditional `WindowStaysOnTopHint` the Qt build set.
+    //
+    // The tray itself is behind the `tray` feature (GTK3 + libappindicator).
+    // `install()` never panics: a missing GTK/host logs a warning and
+    // `available()` stays `false`, so closing the window quits — the safe
+    // fallback on a bare Wayland session with no appindicator host.
+    holaf_ui::tray::install();
     log::info!(
         "ui: always_on_top={}, tray={}",
         state.always_on_top,
         if holaf_ui::tray::available() {
             "available"
         } else {
-            "unavailable (see src/tray.rs)"
+            "unavailable"
         }
     );
-    debug_assert_eq!(
-        holaf_ui::tray::close_action(holaf_ui::tray::available(), true),
-        holaf_ui::tray::CloseAction::Quit,
-        "without a tray, closing the window must quit"
-    );
+    // The invariant `close_action` encodes: hide only when a tray exists.  A
+    // build/time without a tray must quit, never hide an unreachable window.
+    if holaf_ui::tray::available() {
+        log::info!("ui: closing the window hides it (the tray keeps the app alive)");
+    } else {
+        log::info!("ui: closing the window quits (no tray icon compiled/available)");
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

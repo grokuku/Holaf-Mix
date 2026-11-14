@@ -32,6 +32,17 @@
 #      ./scripts/build_rust.sh                 # cargo build --release → dist/{holaf-ui,holafd,holafctl}
 #      ./scripts/build_rust.sh /tmp/my-dist    # destination personnalisée
 #      HOLAFD_BIN_OUT=dist ./scripts/build_rust.sh
+#      HOLAF_NO_TRAY=1 ./scripts/build_rust.sh # SANS l'icône de tray
+#
+#  L'icône de zone de notification (feature cargo `tray`) est **activée par
+#  défaut** : c'est ce que le paquet distribué doit contenir (décision du
+#  2026-11-14).  Elle réclame GTK3 dev au build et libayatana-appindicator + un
+#  hôte appindicator au runtime — d'où l'échappatoire `HOLAF_NO_TRAY=1` (et
+#  `HOLAF_TRAY=0`, historique) pour une machine de build sans GTK3.
+#
+#  Dans TOUS les cas, si la compilation avec `--features tray` échoue, le script
+#  réessaie **sans** la feature (on garde holaf-ui, on perd juste l'icône) et
+#  affiche un WARNING ; si même là ça échoue, il retombe sur holafd+holafctl.
 #
 #  Sortie : exit 0 si holafd/holafctl ont été copiés, non-zéro sinon.
 # ============================================================================
@@ -74,12 +85,51 @@ fi
 # Les trois en UNE invocation cargo : ils partagent toutes leurs dépendances
 # (holaf-pw, egui…), un second `cargo build` ne recompilerait rien mais
 # multiplierait les risques d'états intermédiaires incohérents.
+#
+# La feature `tray` (icône de zone de notification) est ACTIVÉE PAR DÉFAUT :
+# c'est la parité Qt, et c'est ce que le paquet distribué contient.
+#
+# Échappatoires, dans cet ordre :
+#   HOLAF_NO_TRAY=1        -> pas de tray (la façon recommandée)
+#   HOLAF_TRAY=0           -> idem (l'ancienne variable, conservée pour les
+#                             scripts/CI existants qui la mettaient à 0)
+# Elle exige GTK3 dev (`gtk3`, ou `libgtk-3-dev`) au build et l'appindicator au
+# runtime ; si la compilation avec la feature échoue, on réessaie sans (voir
+# plus bas) pour ne jamais perdre holaf-ui.
+UI_FEATURES=(--features tray)
+if [[ "${HOLAF_NO_TRAY:-0}" == "1" || "${HOLAF_TRAY:-1}" == "0" ]]; then
+    UI_FEATURES=()
+fi
+
+build_all() {
+    if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
+        ( cd "$RUST_DIR" && cargo build --release -p holaf-ui -p holafd -p holafctl "${UI_FEATURES[@]}" )
+    else
+        ( cd "$RUST_DIR" && cargo build --release -p holaf-ui -p holafd -p holafctl )
+    fi
+}
+
 log "Building holaf-ui + holafd + holafctl (release) in $RUST_DIR ..."
-if ! ( cd "$RUST_DIR" && cargo build --release -p holaf-ui -p holafd -p holafctl ); then
-    warn "full build failed — retrying without holaf-ui (Qt UI kept as the app's UI)"
-    if ! ( cd "$RUST_DIR" && cargo build --release -p holafd -p holafctl ); then
-        err "cargo build failed for holafd/holafctl too — nothing to publish"
-        exit 1
+if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
+    log "  + cargo feature: tray (needs gtk3 + libayatana-appindicator)"
+else
+    log "  tray feature DISABLED (HOLAF_NO_TRAY/HOLAF_TRAY=0) - no notification icon"
+fi
+if ! build_all; then
+    if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
+        warn "WARNING: build with --features tray FAILED (GTK3/appindicator missing?)"
+        warn "         retrying WITHOUT the tray icon - holaf-ui is kept, but the"
+        warn "         packaged app will have NO notification icon."
+        warn "         Install gtk3 (+ libayatana-appindicator) or set HOLAF_NO_TRAY=1"
+        warn "         to make this explicit and silence this warning."
+        UI_FEATURES=()
+    fi
+    if ! build_all; then
+        warn "full build failed — retrying without holaf-ui (Qt UI kept as the app's UI)"
+        if ! ( cd "$RUST_DIR" && cargo build --release -p holafd -p holafctl ); then
+            err "cargo build failed for holafd/holafctl too — nothing to publish"
+            exit 1
+        fi
     fi
 fi
 

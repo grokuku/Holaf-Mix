@@ -20,41 +20,127 @@ pkgdesc="Voicemeeter-like audio mixer for PipeWire with MIDI control"
 arch=('x86_64' 'aarch64')
 url="https://github.com/your-username/holaf-mix"
 license=('MIT')
+# ----------------------------------------------------------------------------
+#  Runtime dependencies — every entry below was checked against the package
+#  that actually ships the file the code opens (archlinux.org file lists),
+#  not guessed:
+#
+#    ldd rust/target/release/holaf-ui | holafd   →  libpipewire-0.3.so.0,
+#        libasound.so.2, libgtk-3.so.0/libgdk-3/libgio/libglib/libpango/
+#        libcairo (GTK3 stack)
+#    ldd + dlopen strings                        →  libayatana-appindicator3
+#        (`libappindicator-sys`), libGL (glow/glutin), libxkbcommon (winit)
+#    exec'ed binaries (Rust + Python code)       →  pactl, pw-cat, pw-cli,
+#        pw-dump, pw-link, pw-metadata, pw-top
+# ----------------------------------------------------------------------------
 depends=(
+    # --- Python side -------------------------------------------------------
+    # The PyInstaller bundle is built with the SYSTEM python, so these must be
+    # installed before `makepkg`.  Three of the previous names did not exist in
+    # any official Arch repo:
+    #   python-pyside6        -> pyside6        ([extra])
+    #   python-python-rtmidi  -> python-rtmidi  ([extra])
+    #   python-sounddevice    -> AUR only (see the comment below)
     'python>=3.10'
-    'python-pyside6'
-    'python-sounddevice'
+    'pyside6'
     'python-numpy'
     'python-mido'
-    'python-python-rtmidi'
-    # System-level runtime deps (PySide6 wheel bundles Qt, but PipeWire
-    # integration still needs the system daemons + LADSPA plugins):
-    'pipewire'
-    'pipewire-pulse'
-    'pulseaudio'
-    'ladspa'
-    'ladspa-plugins'      # for gate_1410, mbeq_1197, sc4_1882
-    # Rust UI (holaf-ui, the app's window since B1): hard-linked against
-    # libpipewire (engine) and libasound (ALSA sequencer for the MIDI Mix).
-    'alsa-lib'
+    'python-rtmidi'
+    # `python-sounddevice` has NO official-repo counterpart (AUR: 0.5.6).  It
+    # feeds only the *Python* metering fallback (src/backend/metering.py —
+    # PortAudio capture); the Rust UI records with `pw-cat`.  Declaring an AUR
+    # package in `depends` would make `makepkg -si` unresolvable, so install it
+    # separately when the Qt escape hatch must keep its meters:
+    #   python-sounddevice        [AUR]
+
+    # --- PipeWire stack ---------------------------------------------------
+    'pipewire'            # libpipewire-0.3.so.0 (ldd holaf-ui, holafd) and the
+                          # tools pw-cli / pw-dump / pw-link / pw-metadata /
+                          # pw-top (Python engine, Rust diagnostics)
+    'pipewire-audio'      # pw-cat — one child process per VU-meter source
+                          # (rust/crates/holaf-ui/src/capture.rs)
+    'pipewire-pulse'      # the PulseAudio-compatible SERVER: `pactl` is a
+                          # client and has nothing to talk to without it.
+                          # It provides `pulse-native-provider`, which
+                          # `pulseaudio` also provides → installing both is a
+                          # hard pacman conflict.  PulseAudio is gone from
+                          # depends on purpose: the app is PipeWire-only.
+    'libpulse'            # /usr/bin/pactl itself — used to list and move app
+                          # streams (rust/crates/holaf-pw/src/sink_inputs.rs,
+                          # src/backend/pipewire_utils.py).  `pipewire-pulse`
+                          # pulls it in, but holaf-ui EXECs the binary, so it
+                          # is declared explicitly.
+    'wireplumber'         # satisfies pipewire-pulse's `pipewire-session-manager`
+                          # dependency and builds the graph Holaf-Mix renames,
+                          # links and meters
+
+    # --- Audio / MIDI plumbing --------------------------------------------
+    'alsa-lib'            # libasound.so.2 — hard-linked: midir talks to the
+                          # ALSA sequencer for the AKAI MIDI Mix
+    'swh-plugins'         # /usr/lib/ladspa/{gate_1410,mbeq_1197,sc4_1882}.so —
+                          # the exact files of FX_PLUGIN_MAP in
+                          # src/backend/audio_engine.py.  NOTE: `ladspa-plugins`
+                          # does not exist on Arch (nor on Debian), it was a
+                          # phantom dependency.
+
+    # Tray icon: `holaf-ui` is built with `--features tray` by
+    # scripts/build_rust.sh (the default), so these are RUNTIME dependencies,
+    # not makedepends:
+    #   gtk3                    NEARLY hard-linked (libgtk-3.so.0, libgdk-3,
+    #                           libpango, libcairo, libatk…): the ELF loader
+    #                           refuses to start holaf-ui without it.
+    #   libayatana-appindicator dlopen()é par libappindicator-sys : sans lui le
+    #                           binaire démarre mais l'icône n'apparaît pas.
+    # Both are the SYSTEM copies on purpose — packaging/holaf-mix.spec strips
+    # them from the PyInstaller bundle so a frozen GTK3 cannot shadow the
+    # user's (theming, appindicator host, plugins).
+    'gtk3'
+    'libayatana-appindicator'
 )
 makedepends=(
-    'python-pyinstaller'
-    'librsvg2'             # for icon rendering
-    'imagemagick'
+    'librsvg'              # rsvg-convert — `librsvg2` does not exist on Arch
+                           # (that is the Debian/makedeb name)
+    'imagemagick'          # magick, for the ICO/PNG bundling
     # Rust UI (holaf-ui) + daemon (holafd) + CLI (holafctl): the UI is the
     # app's window and the daemon is the audio backend of the Qt fallback;
     # all three are embedded in the PyInstaller bundle and installed to
     # /usr/bin.
     'rust'
-    'clang'                # bindgen needs libclang.so (libspa-sys)
+    'clang'                # bindgen needs libclang.so (libspa-sys / pipewire-sys)
+    'pkgconf'              # the -sys crates (libspa-sys, pipewire-sys, alsa-sys,
+                          # gtk-sys) probe the .pc files at build time
+    # NOTE: no `git` — the workspace has no git-sourced crate (Cargo.lock is
+    # registry-only), so cargo never shells out to it.
+    #
+    # NOTE: PyInstaller is NOT a makedep here.  There is no `python-pyinstaller`
+    # package in any official Arch repo (nor in the AUR under that name: the AUR
+    # package is `pyinstaller`), and it is a pure build-time tool, so it is
+    # installed with pip exactly like build.sh does.  build() fails with an
+    # explicit message when it is missing.
 )
 optdepends=(
-    'rnnoise: AI noise cancellation (librnnoise_ladspa)'
+    # `rnnoise` ([extra]) is the DENOISER LIBRARY, it ships NO LADSPA plugin:
+    # the `noise_cancel` strip needs `librnnoise_ladspa.so`
+    # (label `noise_suppressor_stereo`), which is not packaged for Arch at all.
+    # Build github.com/werman/noise-suppression-for-voice and install the .so
+    # into /usr/lib/ladspa/ to enable that strip — the other three FX
+    # (gate/mbeq/sc4) come from `swh-plugins`, a hard dependency.
+    'rnnoise: noise_cancel strip — needs librnnoise_ladspa.so, built from source (not packaged)'
+    # An appindicator HOST is what actually draws the tray icon; without one
+    # libappindicator "succeeds" and nothing is visible (GNOME needs the
+    # extension, KDE ships its own StatusNotifier host):
+    'gnome-shell-extension-appindicator: tray icon in the GNOME panel'
     # holaf-ui dlopens these (winit/xkbcommon-dl/glutin), so pacman cannot see
-    # them as hard dependencies:
+    # them as hard dependencies.  `libxkbcommon` also arrives transitively with
+    # gtk3; `mesa` is the actual GL driver (gtk3 only pulls libglvnd).
     'libxkbcommon: X11/Wayland keyboard handling for the Rust UI'
     'mesa: OpenGL driver for the Rust UI (eframe/glow)'
+    # `rust/crates/holaf-ui/src/menus.rs` tries xdg-open, then `gio open`
+    # (glib2, already installed with gtk3), then sensible-browser:
+    'xdg-utils: open the project page / config folder from the context menus'
+    # LADSPA SDK + `analyseplugin`/`applyplugin`: handy to inspect the plugins
+    # by hand (docs/j1-spike-recon.md).  Nothing is linked or dlopen()ed from it.
+    'ladspa: analyseplugin/applyplugin, to inspect the LADSPA plugins by hand'
 )
 
 # Use the source directory or a git checkout
@@ -85,6 +171,15 @@ build() {
     msg "Rust binaries: holaf-ui ($(du -h dist/holaf-ui | cut -f1)), holafd, holafctl"
 
     # 3. Build the standalone executable via PyInstaller
+    #    PyInstaller has no Arch package (official repos or AUR under that
+    #    name): it is a build-only tool installed with pip, like build.sh does.
+    #    Fail with a legible message instead of "pyinstaller: command not found".
+    if ! command -v pyinstaller >/dev/null 2>&1; then
+        error "pyinstaller not found."
+        error "  Arch has no pyinstaller package: pip install --user pyinstaller"
+        error "  (see BUILD.md §1 'Install build dependencies')"
+        exit 1
+    fi
     pyinstaller \
         --noconfirm \
         --clean \

@@ -18,8 +18,9 @@ l'**architecture** et le **plan de migration**, pas les constantes.
 > suppression, choix de device, **sélection d'applications**, **diagnostic** et
 > **choix du contrôleur MIDI**
 > (`--dialog` du binaire de capture), menus contextuels fenêtre / strip / FX,
-> always-on-top, MIDI (contrôleur, learn, LED, reconnexion).  Restent hors périmètre : l'icône de tray
-> (voir §9).
+> always-on-top, MIDI (contrôleur, learn, LED, reconnexion).  L'**icône de tray**
+> est **activée par défaut au build** (feature `tray`, GTK3 + libappindicator ;
+> `HOLAF_NO_TRAY=1` pour l'enlever) — voir §10quater.
 
 ![Capture de l'UI Rust — fenêtre courte 800 × 600](ui-rust-snapshot.png)
 
@@ -96,7 +97,7 @@ rust/crates/holaf-ui/
 │   ├── menus.rs          menus contextuels (fenêtre/strip/FX) + « Open project page »
 │   ├── diagnostics.rs    rapport depuis status() + constats automatiques + texte
 │   ├── midi.rs           mapping CC/note → action, learn, feedback LED, port/reconnexion
-│   ├── tray.rs           politique du tray + always-on-top (icône : TODO documenté)
+│   ├── tray.rs           politique du tray + always-on-top + icône générée   [tray]
 │   ├── fx_ui.rs          plages/ordre des ports de contrôle (table Qt)
 │   ├── engine_json.rs    parsing `meter_sources` / `device_list` / `app_list`
 │   ├── raster.rs         rasteriseur logiciel (meshes epaint → pixels → PNG)
@@ -600,8 +601,10 @@ Règles, calquées sur celles déjà en place pour le moteur
 | Diagnostic | Python (`src/diagnostics/`) | collecte pure, déjà testée |
 | Packaging | PyInstaller existant | l'UI Rust sera un binaire séparé embarqué dans le bundle |
 
-Le MIDI n'est plus dans cette liste : le port est fait (§10ter), l'**icône de tray**
-reste la dernière brique non portée.
+Le MIDI n'est plus dans cette liste : le port est fait (§10ter), et l'**icône de
+tray** l'est aussi (§10quater) — **activée par défaut au build** (elle ajoute
+GTK3 + libappindicator, que le script de build sait contourner en réessayant
+sans la feature).
 
 ### 8.3 Plan par étapes
 
@@ -611,14 +614,16 @@ reste la dernière brique non portée.
 | **1 (fait)** | parité de **lecture** : `AppState::from_config` charge `config.json` (migrations, clés inconnues), la géométrie et le thème ; `Backend::device_list` alimente le choix de device | `holaf-ui-snapshot --config ../config.json` rend les 7 vraies strips |
 | **2 (fait)** | parité d'**écriture** : `holaf-ui` pilote `PipeWireBackend` en direct (`default = ["engine-pw"]`), VU réels par capture `pw-cat`, rollback sur refus, mode déconnecté | volume/MUTE/MONO/FX/routage/device agissent sur le graphe ; `tests/engine_live.rs` vert |
 | **3 (fait)** | dialogues : renommer, ajout/suppression, paramètres FX, choix de device, **sélection d'applications**, **diagnostic** ; menus contextuels fenêtre/strip/FX ; always-on-top | aucune fonction Qt perdue (checklist de `ui-inventory.md` §9) |
-| **4 (fait)** | MIDI complet : mapping CC/note, **learn par propriété** (menu du bouton MIDI), feedback LED, **choix du port** + reconnexion automatique, `midi` dans les features par défaut ; l'**icône de tray** reste (GTK3 absent) | un AKAI MIDI Mix pilote le mixeur sans re-apprentissage (§10ter) |
+| **4 (fait)** | MIDI complet : mapping CC/note, **learn par propriété** (menu du bouton MIDI), feedback LED, **choix du port** + reconnexion automatique, `midi` dans les features par défaut | un AKAI MIDI Mix pilote le mixeur sans re-apprentissage (§10ter) |
 | **5 (fait, B1)** | bascule du défaut à `HOLAF_UI=rust`, `HOLAF_UI=python` en échappatoire ; `holaf-ui` packagé (spec, tarball, PKGBUILD, `.desktop`, CI) | une release complète sans régression signalée (en attente de validation utilisateur) |
+| **6 (fait, B2)** | **icône de tray** (feature `tray`, **activée par défaut au build** depuis le 2026-11-14) : menu Qt, « fermer = cacher » seulement si un tray existe, icône **générée** en RGBA (aucune dépendance fichier), repli sans display testé, pile GTK3/GLib **retirée du bundle PyInstaller** (le système fournit la sienne) | `cargo test -p holaf-ui --features tray` vert + `cargo build --features tray` en CI (§10quater) |
 
-Chaque étape ajoute des tests **sans** toucher aux 177 tests Python
+Chaque étape ajoute des tests **sans** toucher aux 207 tests Python
 (`python -m unittest discover -s tests` reste la référence) ; le workspace Rust
-est passé de 349 à **550** tests, dont **325** pour `holaf-ui` (305 unitaires +
-20 d'intégration : `midi_config` pour la compatibilité `config.json`, `midi_live`
-pour le port, `engine_live` pour le moteur).
+est passé de 349 à **569** tests, dont **342** pour `holaf-ui` (322 unitaires +
+19 d'intégration — `midi_config` pour la compatibilité `config.json`, `midi_live`
+pour le port, `engine_live` pour le moteur — + 1 doctest), et **343** avec
+`--features tray` (le test de repli sans display ne se compile que là).
 
 ---
 
@@ -626,7 +631,7 @@ pour le port, `engine_live` pour le moteur).
 
 | Manque | Effet visible | Étape |
 |---|---|---|
-| **tray icon** | pas d'icône de zone de notification, donc pas de « fermer = cacher » : fermer la fenêtre quitte (choix sûr : sans tray, cacher rendrait l'app inatteignable). `src/tray.rs` porte la politique (entrées du menu, règle de fermeture) et un `TODO(tray)` : la crate `tray-icon` exige GTK3 + libappindicator, absents de l'environnement de build | reste |
+| **tray icon** | **fait** (2026-11-14), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte appindicator, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Avec un tray réel, `close_action()` cache la fenêtre (préférence `ui_rust.tray_hide_on_close`, défaut `true`). Sous GNOME/Wayland les **clics** ne sont pas livrés : le **menu** reste la voie d'interaction. Voir §10quater | fait |
 | `pw-dump` dans le diagnostic | le port Rust ne lit pas `pw-dump` : le **démon** publie déjà son propre graphe (`status().holaf_nodes`, `strips[].node_name`, `pending`), ce qui couvre les constats utiles. En revanche le **quantum** est publié (`status.timing`, depuis `pw-metadata -n settings` : `rate`, `quantum`, `force-quantum`, min/max) et `small_quantum` (< 256) est actif ; les compteurs **ERR** ne sont disponibles que si `pw-top -b` existe (PipeWire ≥ 0.3.66) — en 0.3.65 le binaire n'a pas de mode batch, donc `pwt_errors` reste muet et `pw_top_unavailable` (info) affiche la raison exacte. Rien n'est inventé | assumé |
 | routage applicatif côté démon | **fait** : `Backend::app_list` liste les flux de sortie audio (`pactl -f json list sink-inputs` + `list sinks` pour résoudre le `node.name` du bus) en excluant les flux du démon (son pid, ses enfants — les `pw-cat` de métrage —, ses nœuds `Holaf_*` et l'app Qt), et `app_move` déplace le flux via le gestionnaire de session (`pactl move-sink-input`) **puis relit** la liste pour vérifier que le flux est bien sur le bus ; `stub: true` n'est plus renvoyé | fait |
 | apprentissage MIDI par propriété | **fait** : le bouton MIDI d'un strip ouvre le menu Qt (`Learn Volume` / `Learn Mute` / `Learn Mono`, `Clear Mappings`, plus `Cancel learn` quand un learn est armé) ; voir §10ter | fait |
@@ -646,8 +651,10 @@ cd rust
 cargo build -p holaf-ui                          # défaut : moteur PipeWire + MIDI
 cargo build -p holaf-ui --no-default-features    # UI seule (ni libpipewire ni libasound)
 cargo build -p holaf-ui --features midi --no-default-features   # MIDI sans moteur
-cargo test  -p holaf-ui                          # 305 unitaires + 20 d'intégration
-cargo test  --workspace                          # 550 tests
+cargo build -p holaf-ui --features tray          # l'icône de tray (ce que le script de build ajoute)
+cargo test  -p holaf-ui                          # 342 (322 unitaires + 19 d'intégration + 1 doctest)
+cargo test  -p holaf-ui --features tray          # idem + le repli sans display
+cargo test  --workspace                          # 569 tests
 cargo clippy -p holaf-ui --all-targets           # 0 warning (idem toutes les combinaisons)
 cargo run   -p holaf-ui -- --midi-list           # les noms de ports que --midi accepte
 cargo run   -p holaf-ui --bin holaf-ui-snapshot -- --out /tmp/holaf-ui.png
@@ -731,7 +738,7 @@ fenêtre et sans matériel) et son câblage dans `AppState` :
 | `diagnostics.rs` | rapport structuré depuis `status()` + constats automatiques (`daemon_unreachable`, `engine_not_running`, `graph_degraded`, `graph_pending`, `fx_host_down`, `fx_host_respawns`, `fx_host_inprocess`, `mainloop_pumps_stalled/zero/external`, `legacy_bus_names`, `strip_bus_unnamed`, `strip_bus_missing`, `device_missing`, `device_not_listed`, `metering_no_source`, `multiple_daemons`) | `Report::collect(&Inputs)` + `detect()` ; texte copiable, constats en tête. `strip_bus_missing` ne juge que les strips **virtuels** et `mainloop_pumps_*` que le mode FX **inprocess** (cf. `src/diagnostics/collector.py`, mêmes règles) |
 | `apps.rs` | « SELECT APPS » + enforcement : `running ∪ assigned`, `enforces()` (entrée virtuelle non-default), `plan()` (idempotent, une app assignée deux fois n'est déplacée qu'une fois), bus = `status.strips[].node_name` sinon `Holaf_Bus_<Label>` | `AppList::parse`, `plan()`, `AppSelection` |
 | `midi.rs` | CC → volume (`value/127`), note → bascule mute/mono sur **press** seulement, learn par propriété, feedback LED, choix/reconnexion du port (`midir`, feature `midi` **par défaut**) — voir §10ter | `MidiMessage::parse`, `decode()`, `feedback()`, `MidiMap`, `choose_port()`, `MidiRuntime` |
-| `tray.rs` | politique du tray (entrées, « fermer = cacher seulement si un tray existe ») + always-on-top | `close_action()` ; l'icône elle-même : TODO documenté |
+| `tray.rs` | politique du tray (entrées, « fermer = cacher seulement si un tray existe »), always-on-top, **icône générée en RGBA** — feature `tray` **activée par défaut au build** (`HOLAF_NO_TRAY=1` pour l'enlever) — voir §10quater | `close_action()`, `menu_action()`, `icon_rgba(size)` (pixels déterministes, testés sans GTK) |
 
 Côté `AppState` : `SelectAppsDone` (persiste `assigned_apps` puis déplace),
 `tick_app_enforcement()` (une question `app_list` toutes les 5 s, seulement si un
@@ -906,6 +913,124 @@ cargo run -p holaf-ui -- --midi "MIDI Mix:MIDI Mix MIDI 1 24:0"
 
 Les mappings déjà présents dans `config.json` sont utilisés **sans
 re-apprentissage** : c'est ce que verrouille `tests/midi_config.rs`.
+
+---
+
+## 10quater. Tray : icône de zone de notification (feature `tray`)
+
+Le tray est la dernière brique Qt portée.  Il vit dans `src/tray.rs` et se
+découpe en deux : une **politique** toujours compilée (pure, testée en toutes
+configurations) et une **I/O GTK** derrière la feature `tray`.
+
+### 10quater.1 Activation et dépendances
+
+**Activée par défaut au build** (décision du 2026-11-14) :
+`scripts/build_rust.sh` ajoute `--features tray` à `holaf-ui` sauf
+`HOLAF_NO_TRAY=1` (ou l'ancienne `HOLAF_TRAY=0`).  `build.sh`, le PKGBUILD, le
+tarball et le workflow CI passent donc tous par ce script : ce qui est livré
+contient l'icône.  Si la compilation avec la feature échoue (GTK3 dev absent),
+le script **réessaie sans** : on garde `holaf-ui`, on perd l'icône, et un
+WARNING le dit.
+
+```bash
+./scripts/build_rust.sh                   # défaut : AVEC l'icône
+HOLAF_NO_TRAY=1 ./scripts/build_rust.sh   # sans l'icône
+
+cargo build -p holaf-ui --features tray     # équivalent manuel
+cargo build -p holaf-ui                      # défaut : pas d'icône, tout le reste identique
+```
+
+La feature n'est **pas** dans les `default` de la crate (`default = ["engine-pw",
+"midi"]`) : un `cargo build` brut ne l'inclut pas, c'est le script de build qui
+l'ajoute.  Ça garde `cargo test --workspace` (et les 569 tests) hermitique sur
+une machine sans GTK3, sans renoncer à livrer l'icône.
+
+| Dépendance | Rôle | Particularité |
+|---|---|---|
+| `tray-icon 0.19` (`default-features = false`) | icône + menu (`muda` ré-exporté) | `default-features = false` **retire `libxdo`** : cette feature ne sert qu'aux items prédéfinis Copy/Paste, que l'app n'utilise pas.  Aucune dépendance de build ni `dlopen` de `libxdo` au runtime |
+| `gtk 0.18` | boucle GTK sur le thread du tray | version alignée sur celle qu'exige `tray-icon 0.19` |
+
+Paquets système : **`gtk3`** (build + link : `libgtk-3.pc`, `libgdk-3.pc`,
+`pango`, `cairo`) et **`libayatana-appindicator`** (runtime :
+`libappindicator-sys` `dlopen()` `libayatana-appindicator3.so.1` ; Arch n'a pas
+de `libappindicator-gtk3`, c'est AUR-only).  Un hôte appindicator est nécessaire
+pour que l'icône **s'affiche** : `gnome-shell-extension-appindicator`,
+`kstatusnotifieritem` (KDE), ou le `tray` de `swaybar`.  Les deux premiers sont
+en `depends` du PKGBUILD, l'hôte en `optdepends`.
+
+**Ces bibliothèques ne sont jamais embarquées dans le bundle** :
+`packaging/holaf-mix.spec` retire de `a.binaries` la pile GTK3/GLib
+(`libgtk-3`, `libgdk-3`, `libgdk_pixbuf`, `libpango*`, `libcairo*`, `libatk*`,
+`libatspi`, `libepoxy`, `libharfbuzz`, `libglib/gobject/gio/gmodule/gthread`,
+les `libX*` que seule GTK tirait et l'équivalent `libayatana` s'il apparaît),
+exactement comme il le fait déjà pour `libpipewire`/`libspa`/`libpulse`.
+Mesuré sur ce conteneur (bundle onedir, `--features tray`) : **37 bibliothèques**
+retirées, 117 → 80.  Raison : `holaf-ui` **lie** `libgtk-3.so.0`, et PySide6
+fournit en plus `plugins/platformthemes/libqgtk3.so` (donc la pile GTK était
+déjà figée avant le tray) ; le bootloader préfixe `LD_LIBRARY_PATH` avec
+`_MEIPASS`, donc une GTK3/GLib figée s'impose à celle du système → thème,
+plugins, schémas GSettings et hôte appindicator incohérents (le bug
+libpipewire, en pire).
+
+### 10quater.2 Threading
+
+libappindicator exige une **boucle GTK qui tourne**, et eframe possède le thread
+principal.  `install()` lance donc un thread `holaf-tray` qui fait
+`gtk::init()` → construit l'icône + le menu → `gtk::main()`, et rend son verdict
+sur un canal (timeout 5 s).  Seuls deux objets traversent les threads : le canal
+global `muda::MenuEvent` (`Send`) et le drapeau `available()` (un atome).
+`poll()` — appelé **une fois par frame** par le shell, comme la pompe MIDI — vide
+ce canal, donc **l'UI thread ne touche jamais GTK**.
+
+### 10quater.3 Menu, fermeture, événements
+
+| Entrée | Id stable | Action |
+|---|---|---|
+| `Show/Hide` | `holaf.tray.show_hide` | `ViewportCommand::Visible(!window_visible)` |
+| `Restart audio engine` | `holaf.tray.restart_engine` | `AppState::restart_engine` (même action que le menu contextuel) |
+| `Quit` | `holaf.tray.quit` | `ViewportCommand::Close` → `on_exit` → `AppState::shutdown()` |
+
+`close_action(available, hide_on_close)` encode la règle de `closeEvent` de Qt :
+**cacher** seulement si `available()` **et** la préférence
+`ui_rust.tray_hide_on_close` (défaut `true`) ; sinon **quitter**.  Cacher sans
+moyen de revenir laisserait un processus inatteignable — c'est précisément ce que
+le code Qt évitait avec `isSystemTrayAvailable()`.
+
+`menu_action(id)` est une fonction pure : un id inconnu (menu d'une autre app,
+entrée future) est **ignoré**, jamais mal routé.
+
+### 10quater.4 L'icône est générée, pas chargée
+
+`tray::icon_rgba(size) -> (Vec<u8>, u32, u32)` dessine l'icône **pixel par
+pixel** : tuile ardoise à coins arrondis + trois faders verticaux avec un
+capuchon menthe à des hauteurs différentes, lisible à 22 × 22.  Aucune
+dépendance fichier, aucun décodeur d'image, aucun appel à `assets/icons/` :
+
+* les PNG du dépôt vivent sous **`dist/`**, qui est **gitignoré** — un checkout
+  CI propre n'en a aucun, donc un `include_bytes!("…/dist/icons/holaf-mix-32.png")`
+  ferait échouer `--features tray` en CI tout en passant en local ;
+* le glyphe est **déterministe** et testé sans GTK (dimensions, marges
+transparentes, présence des trois capuchons, clamp `8..=256`) : ces tests
+  tournent dans **les trois** configurations de build.
+
+### 10quater.5 Ce qui n'est pas vérifiable ici (Wayland)
+
+Sous Wayland sans hôte appindicator, libappindicator « réussit » mais rien ne
+s'affiche ; et `tray-icon` ne livre **aucun** événement de clic hors X11 (côté
+GNOME/Wayland, les clics sur l'icône sont ignorés).  C'est pourquoi
+l'interaction fiable est le **menu** (pas un toggle au clic) et pourquoi
+`with_menu_on_left_click(true)` ouvre le menu au clic gauche — le menu
+`Show/Hide` / `Restart audio engine` / `Quit` reste donc utilisable sous
+Wayland, même si l'utilisateur est sous GNOME/Wayland (le cas de l'auteur).
+Le conteneur de dev n'ayant **ni X11 ni Wayland**, seul le **repli** est
+vérifié ici : `install()` journalise un avertissement
+(`tray: unavailable (gtk::init failed: Failed to initialize GTK) - closing the
+window will quit, not hide`), ne panique pas, `available()` reste `false` et
+`close_action()` renvoie `Quit`.  Vérifié aussi **depuis le bundle PyInstaller**
+(onedir) : le `holaf-ui` embarqué résout la GTK3/GLib **du système** (retirées du
+bundle), démarre, et échoue proprement sur « no display server ».  Le rendu réel
+de l'icône dans un panneau (GNOME + extension, KDE, sway/swaybar) et la
+réception des clics sous X11 restent à confirmer sur une session graphique.
 
 ---
 

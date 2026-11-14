@@ -18,7 +18,7 @@ production.
 | # | Prérequis | Pourquoi | Comment le vérifier |
 |---|---|---|---|
 | 1 | **B1 validé par l'utilisateur sur sa machine** (pas seulement en CI) | une régression de layout, de routage ou de MIDI ne se voit pas dans un conteneur sans écran ni carte son | une session complète : 7 strips, faders, FX, routage, apps, MIDI Mix, diagnostic, config conservée |
-| 2 | **Le tray est tranché** (B2) | c'est la seule fonction Qt encore sans équivalent ; supprimer `src/ui/**` supprime aussi la seule implémentation de tray existante | décision explicite : tray Rust (GTK3/libappindicator) **ou** abandon documenté |
+| 2 | **Le tray est tranché** (B2) | c'était la seule fonction Qt encore sans équivalent ; supprimer `src/ui/**` supprime aussi la seule implémentation de tray existante | **fait (2026-11-14)** : tray Rust (GTK3 + libappindicator, icône générée en RGBA donc **sans dépendance fichier**), politique (menu, « fermer = cacher seulement si un tray existe ») toujours compilée et testée ; **activé par défaut au build** (`scripts/build_rust.sh` ; `HOLAF_NO_TRAY=1` pour l'enlever, repli automatique sans la feature si GTK3 manque), la pile GTK3/GLib restant celle du système (retirée du bundle PyInstaller).  Le repli (pas de display, pas d'hôte appindicator) est testé : `available() == false` ⇒ fermer quitte | `cargo test -p holaf-ui --features tray` (dont `install_without_a_display_degrades_to_no_tray_instead_of_panicking`) + `cargo build --features tray` en CI |
 | 3 | **Le bundle packagé démarre l'UI Rust** | le lanceur se rabat sur Qt quand `holaf-ui` manque, donc un bundle cassé *fonctionne* — en Qt | `dist/holaf-mix` sans `HOLAF_UI=python` doit afficher la fenêtre Rust (`smoke test` CI + un lancement réel) |
 | 4 | **`config.json` partagé vérifié** | le lanceur passe `--config` avec le fichier de l'UI Qt ; si ce chemin change, l'utilisateur perd ses réglages | lancer l'UI Rust puis l'UI Qt : même fichier, mêmes valeurs |
 | 5 | **Le MIDI réel validé** | `midir` (Rust) remplace `mido`/`rtmidi` ; en conteneur il n'y a pas de séquenceur ALSA | AKAI MIDI Mix : learn volume/mute/mono, LEDs, reconnexion |
@@ -42,7 +42,7 @@ confiance de l'utilisateur.
 | `src/backend/signal_shutdown.py` | 374 | inutile : l'UI Rust fait `AppState::shutdown()` dans `on_exit` | il n'y a plus de démon enfant à récolter |
 | `src/backend/metering.py` | 399 | `holaf-ui/src/capture.rs` + `meters.rs` (capture `pw-cat`, RMS/peak) | `sounddevice`/PortAudio disparaît des dépendances |
 | `src/backend/midi_engine.py` | 159 | `holaf-ui/src/midi.rs` + feature `midi` (`midir`) | learn, LED, reconnexion déjà portés |
-| `src/backend/pipewire_utils.py` | 169 | `holaf-pw` (`device_list`, `sink_inputs`, `app_move`) | ⚠ `app_list`/`app_move` sont des **stubs documentés** côté Rust : vérifier le routage applicatif avant de supprimer (prérequis 1) |
+| `src/backend/pipewire_utils.py` | 169 | `holaf-pw/src/sink_inputs.rs` (`app_list`/`app_move`) + `device_list` | **fait** : `app_list` lit `pactl -f json list sink-inputs` (+ `list sinks` pour le `node.name`), exclut les flux du démon (pid, enfants = `pw-cat` de métrage, nœuds `Holaf_*`, `application.name == "Holaf-Mix"`) ; `app_move` déplace via `pactl move-sink-input` **puis relit** (read-back). Preuve live : `holaf-pw/tests/app_routing_live.rs` |
 
 ### 1.2 Interface et modèles Python — bloc **B11** (~2 300 lignes)
 
@@ -110,7 +110,7 @@ Chaque étape est indépendante et laisse le dépôt vert.
 
 Conséquence : `python3 -m unittest discover -s tests` passerait de ~200 tests à
 ~19 (ceux de `test_launcher.py`).  **La couverture ne s'effondre pas** : elle
-est dans `cargo test --workspace` (554+ tests), mais il faut le dire dans le
+est dans `cargo test --workspace` (569 tests), mais il faut le dire dans le
 rapport de migration, sinon la baisse du nombre de tests ressemble à une
 régression.
 
@@ -118,8 +118,8 @@ régression.
 
 | Rupture | Déclencheur | Effet | Parade |
 |---|---|---|---|
-| **Tray** | suppression de `src/ui/main_window.py` | plus aucune icône de tray dans *aucune* UI | prérequis 2 (B2) |
-| **Routage applicatif** | `holaf-pw::app_list`/`app_move` encore en **stub** | « SELECT APPS » liste des apps mais ne déplace rien (l'UI Rust l'affiche comme stub) | à finir (J2) — sinon l'utilisateur perd le routage par application en passant à 100 % Rust |
+| **Tray** | ~~suppression de `src/ui/main_window.py`~~ | **résolu** (2026-11-14) : l'icône Rust existe derrière la feature `tray` (`holaf-ui/src/tray.rs`, GTK3 + libappindicator, icône **générée** en code) ; menu `Show/Hide`/`Restart audio engine`/`Quit`, et « fermer = cacher » uniquement quand un tray est réellement là.  Sans la feature (défaut) ou sans hôte appindicator, fermer quitte | — (reste à activer la feature dans le packaging si on veut l'icône par défaut) |
+| **Routage applicatif** | ~~`holaf-pw::app_list`/`app_move` encore en **stub**~~ | **résolu** (2026-11-14) : `app_list` liste les flux externes, `app_move` les déplace sur le bus du strip avec read-back ; l'UI Rust (`apps.rs` plan + `enforce_applications` 5 s) fonctionne de bout en bout | — |
 | **Diagnostic : collecte** | `src/diagnostics/collector.py` est la seule collecte « live » testée (`pw-dump`, `pactl`, `holafctl`) | onglets vides/partiels côté Rust si un constat n'a pas été porté | comparer les deux rapports sur la même machine avant suppression |
 | **Résolution du `config.json`** | `holaf_core::config::default_config_path()` part du **répertoire courant**, l'UI Qt de son propre chemin | lancé depuis un `.desktop` (cwd = `$HOME`), le Rust créerait `$HOME/config.json` et paraîtrait « avoir perdu » les réglages | déjà réglé par le lanceur (`--config`) : **ne pas** supprimer `src/launcher.py` avant d'avoir porté cette règle dans `main.rs` |
 | **Raccourcis / comportements Qt** | suppression de `src/ui/**` | plus de référence pour comparer (thème, géométrie) | garder `docs/ui-inventory.md` + les captures (`docs/ui-rust-snapshot*.png`) et `holaf-ui-snapshot` |
@@ -149,6 +149,24 @@ vérifier avant de le sortir de `requirements.txt`.
 * **B7 — journal dans le diagnostic** : ring buffer de 500 lignes
   (`holaf-ui/src/logbuf.rs`) alimenté par un `log::Log` qui relaie vers
   `env_logger`, et 5ᵉ onglet « Journal » (monospace, auto-scroll) ;
+* **B2 — tray** : `holaf-ui/src/tray.rs` porte désormais la vraie icône
+  (`tray-icon 0.19` + `gtk 0.18`, donc GTK3 + libappindicator au build).  Elle
+  est **activée par défaut au build** (`scripts/build_rust.sh` passe
+  `--features tray` ; `HOLAF_NO_TRAY=1` pour l'enlever, et le script retombe
+  sans la feature si GTK3 manque), donc le PKGBUILD, le tarball et la CI
+  livrent l'icône ; la feature reste hors des `default` de la crate pour que
+  `cargo test --workspace` reste hermitique.  Le menu est celui de Qt
+  (`Show/Hide`, `Restart audio engine`, `Quit`) ; l'icône est **générée en RGBA
+  dans le code** (`tray::icon_rgba(size)`), jamais lue depuis `dist/icons/` qui
+  est gitignoré — sinon un checkout CI propre n'aurait pas le PNG.  `install()`
+  ne panique jamais : sans display ou sans hôte appindicator il journalise un
+  avertissement et `available()` reste `false`, donc fermer la fenêtre
+  **quitte** au lieu de cacher une fenêtre inatteignable.  La pile GTK3/GLib
+  n'est **pas** embarquée par PyInstaller (le spec la retire de `a.binaries`) :
+  l'app utilise celle du système, comme pour libpipewire ;
+* **Routage applicatif** : `holaf-pw::app_list`/`app_move` ne sont plus des
+  stubs (déplacement réel + read-back, prouvé par
+  `holaf-pw/tests/app_routing_live.rs`) ;
 * **B0 — nettoyage** : suppression de 7 scripts de manipulation jetables
   (`check_silent_load.py`, `debug_fx.py`, `debug_routing.py`, `debug_verbose.py`,
   `test_keepalive.py`, `test_interactive_keepalive.py`, `run_holaf_mix.sh`),

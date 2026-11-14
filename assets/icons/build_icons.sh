@@ -63,7 +63,7 @@ check_tools() {
     if [[ $missing -ne 0 ]]; then
         err ""
         err "Install the missing tools:"
-        err "  CachyOS / Arch:  sudo pacman -S librsvg2 imagemagick"
+        err "  CachyOS / Arch:  sudo pacman -S librsvg imagemagick"
         err "  Debian / Ubuntu: sudo apt install librsvg2-bin imagemagick"
         err "  Fedora:          sudo dnf install librsvg2-tools ImageMagick"
         exit 1

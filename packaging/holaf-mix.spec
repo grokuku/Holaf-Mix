@@ -245,6 +245,96 @@ if _bundled_pipewire:
         '(dropped from the bundle: ' + ', '.join(sorted(_bundled_pipewire)) + ')'
     )
 
+# --- Keep the SYSTEM GTK3 stack (tray icon + Qt's GTK platform theme) -------
+# Same rule as the PipeWire block below, and the same *reason*: the bootloader
+# prepends `sys._MEIPASS` to `LD_LIBRARY_PATH`, so anything frozen wins over the
+# user's copy.  For a toolkit that is much worse than for a client library.
+#
+# **Measured, not assumed** (onedir bundle, holaf-ui built with `--features tray`,
+# Debian 12): PyInstaller put the whole GTK3 stack in `_internal/` —
+# libgtk-3.so.0, libgdk-3.so.0, libgdk_pixbuf-2.0.so.0, libpango*, libcairo*,
+# libatk*, libatspi, libepoxy, libharfbuzz, plus GLib.  Two entry points pull it:
+#   1. `holaf-ui` with the `tray` feature NEEDs libgtk-3.so.0 (tray-icon/gtk);
+#   2. PySide6 ships `plugins/platformthemes/libqgtk3.so`, which NEEDs it too
+#      (so the stack was already frozen *before* the tray — pre-existing bug for
+#      the Qt fallback, now also fatal for holaf-ui).
+#
+# Why a frozen GTK3 breaks the app:
+#   * a GTK3 older than the user's GLib/GDK cannot load: its dlopened theme
+#     engine (`libadwaita`, `libpxbuf`…), input methods and GSettings schemas
+#     are looked up from the *system* and version-checked against the *frozen*
+#     library → "cannot open shared object", "undefined symbol", or a silent
+#     theme fallback with mismatched CSS;
+#   * an appindicator that talks to the host panel through a frozen GTK/GDK
+#     cannot own a StatusNotifier item that the panel's libayatana accepts.
+# GLib is included on purpose: a frozen GLib + a system GTK3 is exactly the
+# mismatch above (GType system, GSettings, gio modules are shared state).  Qt6's
+# Core/Gui also NEED libglib (QEventDispatcherGlib), so letting *both* use the
+# system copy is the coherent choice — that is what `PKGBUILD depends=('glib2'
+# via gtk3)` is for.
+#
+# Deliberately NOT dropped (needed by Qt itself, whose frozen copy is the
+# pre-existing status quo and whose ABI is far narrower than GTK's):
+# libX11, libxkbcommon, libdbus-1, libfontconfig, libfreetype, libpng16, libz.
+#
+# `libayatana-appindicator3.so.1` never appears here: `libappindicator-sys`
+# dlopen()s it at run time, so it is a PKGBUILD runtime dep, not a bundle entry.
+_GTK_SYSTEM_LIBS = frozenset(
+    {
+        # GTK toolkit + its rendering/text stack
+        'libgtk-3.so.0',
+        'libgdk-3.so.0',
+        'libgdk_pixbuf-2.0.so.0',
+        'libpango-1.0.so.0',
+        'libpangocairo-1.0.so.0',
+        'libpangoft2-1.0.so.0',
+        'libcairo.so.2',
+        'libcairo-gobject.so.2',
+        'libatk-1.0.so.0',
+        'libatk-bridge-2.0.so.0',
+        'libatspi.so.0',
+        'libepoxy.so.0',
+        'libharfbuzz.so.0',
+        # support libraries only those pull in (orphaned once GTK leaves)
+        'libthai.so.0',
+        'libdatrie.so.1',
+        'libfribidi.so.0',
+        'libgraphite2.so.3',
+        'libpixman-1.so.0',
+        'libjpeg.so.62',
+        'libXcomposite.so.1',
+        'libXcursor.so.1',
+        'libXdamage.so.1',
+        'libXext.so.6',
+        'libXfixes.so.3',
+        'libXi.so.6',
+        'libXinerama.so.1',
+        'libXrandr.so.2',
+        'libXrender.so.1',
+        # GLib family (+ its private deps): must match the system GTK3
+        'libglib-2.0.so.0',
+        'libgobject-2.0.so.0',
+        'libgio-2.0.so.0',
+        'libgmodule-2.0.so.0',
+        'libgthread-2.0.so.0',
+        'libpcre2-8.so.0',
+        'libmount.so.1',
+        'libblkid.so.1',
+        'libselinux.so.1',
+    }
+)
+_bundled_gtk = [
+    entry[0] for entry in a.binaries if Path(entry[0]).name in _GTK_SYSTEM_LIBS
+]
+if _bundled_gtk:
+    a.binaries = [
+        entry for entry in a.binaries if Path(entry[0]).name not in _GTK_SYSTEM_LIBS
+    ]
+    print(
+        '[holaf-mix.spec] keeping the system GTK3/GLib libraries '
+        '(dropped from the bundle: ' + ', '.join(sorted(_bundled_gtk)) + ')'
+    )
+
 # --- Build mode --------------------------------------------------------------
 # Onefile (default, single binary) or onedir (multi-file, faster launch).
 # Selected by $HOLAF_BUILD_MODE, which build.sh sets from its --onedir flag.

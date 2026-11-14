@@ -392,6 +392,11 @@ pub struct AppState {
     /// `ui_rust.always_on_top` — the Rust-only window flag (Qt used
     /// `WindowStaysOnTopHint` unconditionally).
     pub always_on_top: bool,
+    /// `ui_rust.tray_hide_on_close` — the Qt `closeEvent` preference: **hide** the
+    /// window instead of quitting, *when a tray icon is actually there* (see
+    /// [`crate::tray::close_action`]).  Defaults to `true` (Qt parity); ignored
+    /// when no tray is available, so it can never strand the app.
+    pub tray_hide_on_close: bool,
     /// The open context menu, if any ([`crate::menus`]).
     pub context_menu: Option<crate::menus::ContextMenu>,
     /// The `WindowLevel` last sent to the viewport (`None` = never sent).
@@ -600,6 +605,7 @@ impl AppState {
             restarting: false,
             diagnostics: None,
             always_on_top: true,
+            tray_hide_on_close: true,
             context_menu: None,
             applied_window_level: None,
             midi_bindings: HashMap::new(),
@@ -667,6 +673,8 @@ impl AppState {
                 state.midi_bindings = config.midi_bindings();
                 state.midi_map = MidiMap::from_strips(&state.strips, &state.midi_bindings);
                 state.always_on_top = config.ui_rust_bool("always_on_top").unwrap_or(true);
+                state.tray_hide_on_close =
+                    config.ui_rust_bool("tray_hide_on_close").unwrap_or(true);
                 // The controller the user picked last time (`ui_rust.midi_port`).
                 // Python has no such key — it auto-opened the first port whose
                 // name contained "mix" at every start — so this is a Rust-only
@@ -2185,6 +2193,16 @@ impl AppState {
             .as_ref()
             .filter(|flash| flash.uid == uid)
             .map(|flash| flash.text.clone())
+    }
+
+    /// What the window's close button (or the tray's Quit, or the WM close) must
+    /// do: **hide** when a tray icon exists and the user asked for it, otherwise
+    /// **quit** (Qt's `closeEvent` rule, see [`crate::tray::close_action`]).
+    ///
+    /// The shell calls this on `close_requested`; `Quit` lets the close proceed
+    /// (`on_exit` → [`Self::shutdown`]), `Hide` cancels it and hides the window.
+    pub fn close_action(&self) -> crate::tray::CloseAction {
+        crate::tray::close_action(crate::tray::available(), self.tray_hide_on_close)
     }
 
     /// Stop the engine and flush what must not be lost.

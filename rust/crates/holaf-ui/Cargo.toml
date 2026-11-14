@@ -38,6 +38,23 @@ engine-pw = ["dep:holaf-pw"]
 # always tested (`src/midi.rs`); only the `midir` device I/O lives behind this
 # feature.
 midi = ["dep:midir"]
+# The real system-tray icon (Show/Hide, Restart, Quit) — Qt's
+# `QSystemTrayIcon`.  NOT part of `default` here: `tray-icon` links **GTK3 +
+# libappindicator** on Linux, which are not installed on every build machine (the
+# dev container started without GTK3 at all), and `cargo test --workspace` must
+# stay hermetic.  The SHIPPED build enables it: `scripts/build_rust.sh` adds
+# `--features tray` by default (`HOLAF_NO_TRAY=1` opts out), so build.sh, the
+# PKGBUILD, the tarball and the CI all produce a UI with the icon.
+# The *policy* (menu entries, close rule, menu-id → action mapping) is always
+# compiled and tested (`src/tray.rs`); only the GTK/libappindicator I/O lives
+# behind this feature.
+#
+# Arch build deps: `gtk3` (build/link) + `libayatana-appindicator` (the runtime
+# appindicator library `libappindicator-sys` dlopen()s; Arch has no
+# `libappindicator-gtk3`, that name is AUR-only).  No libxdo: `tray-icon` is used
+# with `default-features = false` (see below).  Runtime: an appindicator host
+# (`gnome-shell-extension-appindicator`, `kstatusnotifieritem`, `swaybar`'s tray).
+tray = ["dep:tray-icon", "dep:gtk"]
 
 [dependencies]
 # `default-features = false` everywhere: we do not want the wgpu/x11+wayland
@@ -57,3 +74,13 @@ env_logger = { workspace = true }
 holaf-core = { path = "../holaf-core" }
 holaf-pw = { path = "../holaf-pw", optional = true }
 midir = { version = "0.11", optional = true }
+# System tray (feature `tray`, enabled by the build script — see above):
+# `tray-icon` re-exports `muda`
+# for the menu, so only these two are needed.  `gtk` drives the main loop on the
+# tray thread (libappindicator needs a running GTK loop).
+#
+# `default-features = false` on `tray-icon` drops its `libxdo` feature: that
+# only powers the predefined Copy/Paste/SelectAll items, which this app never
+# uses, and it spares both a build dependency and a runtime `libxdo` dlopen.
+tray-icon = { version = "0.19", default-features = false, optional = true }
+gtk = { version = "0.18", optional = true }

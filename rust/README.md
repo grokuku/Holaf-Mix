@@ -42,10 +42,52 @@ quand même et l'explique.  Sans libpipewire :
 `cargo build -p holaf-ui --no-default-features --features engine-pw` ; lister les
 contrôleurs : `cargo run -p holaf-ui -- --midi-list` ; capture sans serveur X :
 `cargo run -p holaf-ui --bin holaf-ui-snapshot -- --config ../config.json --out /tmp/ui.png`.
-Architecture, modèle de thème, MIDI (§10ter) et plan de migration
-(`HOLAF_UI=rust|python`) :
+Architecture, modèle de thème, MIDI (§10ter), tray (§10quater) et plan de
+migration (`HOLAF_UI=rust|python`) :
 [`docs/ui-rust-design.md`](../docs/ui-rust-design.md) ; valeurs mesurées de
 l'UI Qt : [`docs/ui-inventory.md`](../docs/ui-inventory.md).
+
+### Tray (icône de zone de notification) — activée par défaut au build
+
+**Le paquet distribué contient l'icône de tray** : `scripts/build_rust.sh`
+passe `--features tray` à `holaf-ui` **par défaut** (donc `build.sh`, le
+PKGBUILD, le tarball et la CI aussi).  Décision assumée du 2026-11-14.
+
+```bash
+./scripts/build_rust.sh                   # défaut : AVEC l'icône
+HOLAF_NO_TRAY=1 ./scripts/build_rust.sh   # sans l'icône (HOLAF_TRAY=0 : idem, historique)
+
+cd rust
+cargo build -p holaf-ui --features tray   # idem, à la main
+cargo test  -p holaf-ui --features tray   # + le test de repli sans display
+```
+
+Comme la feature cargo n'est pas dans `default = ["engine-pw", "midi"]`, un
+`cargo build -p holaf-ui` **brut** ne l'inclut pas : c'est le *script* de build
+(et le PKGBUILD/CI) qui ajoute `--features tray`.  Si la compilation avec la
+feature échoue (GTK3 dev absent), le script **réessaie sans** : on garde
+`holaf-ui` et on perd seulement l'icône (WARNING explicite).
+
+| | |
+|---|---|
+| Paquets (Arch, **runtime**) | **`gtk3`** (lié : `libgtk-3.so.0`, `libgdk-3`, `pango`, `cairo`, `atk`…) + **`libayatana-appindicator`** (`dlopen`é par `libappindicator-sys`) |
+| Paquets (Debian/Ubuntu) | `libgtk-3-dev` + `libayatana-appindicator3-dev` (build) ; `libgtk-3-0` + `libayatana-appindicator3-1` (runtime) |
+| Hôte appindicator | sinon l'icône ne **s'affiche** pas : `gnome-shell-extension-appindicator`, `kstatusnotifieritem` (KDE), `tray` de `swaybar` |
+| `libxdo` | **inutile** : `tray-icon` est déclaré `default-features = false` (cette feature ne sert qu'aux items prédéfinis Copy/Paste) |
+| Bundle PyInstaller | ces bibliothèques **ne sont PAS embarquées** : `packaging/holaf-mix.spec` les retire de `a.binaries` (même règle que libpipewire) pour que l'app utilise la GTK3 **du système** |
+
+Sans display ou sans hôte appindicator au lancement, `tray::available()` vaut
+`false` et **fermer la fenêtre quitte** (cacher sans moyen de revenir
+laisserait un processus inatteignable) ; le log dit
+`tray: unavailable (…) - closing the window will quit, not hide`.  L'icône est
+**générée en RGBA dans le code** (`tray::icon_rgba`) : aucun fichier, donc pas
+de dépendance aux PNG gitignorés de `dist/icons/`.
+
+**Wayland** : `tray-icon` ne livre les **clics** que sous X11. Sous
+GNOME/Wayland les clics sur l'icône sont donc ignorés — c'est le **menu** qui
+pilote l'app (`with_menu_on_left_click(true)` : le clic gauche ouvre le menu,
+qui contient `Show/Hide`, `Restart audio engine`, `Quit`).  Détails et
+limites : §10quater de [`docs/ui-rust-design.md`](../docs/ui-rust-design.md).
 
 Seuls les jalons J0/J3/J4 sont **sans libpipewire obligatoire** ; `holaf-pw`
 lie `libpipewire-0.3` (installée ici).  La couche réelle `holaf-pw` (J1/J2)
@@ -59,6 +101,27 @@ dépend) lie `libpipewire-0.3`/`libspa-0.2` + `pkg-config`/`clang` pour le
 build (installés sur ce conteneur).
 * Python 3.10+ uniquement pour le côté client (`ipc_audio_engine.py`,
   `rust_launcher.py`) et les tests d'intégration.
+* **Pour l'icône de tray** (feature `tray`, **activée par défaut par
+  `scripts/build_rust.sh`**) : GTK3 dev + libappindicator — Arch `gtk3` +
+  `libayatana-appindicator`, Debian/Ubuntu `libgtk-3-dev` +
+  `libayatana-appindicator3-dev`.  Sans elles, le script réessaie sans la
+  feature (build sans icône) ; `HOLAF_NO_TRAY=1` rend ce choix explicite.
+
+### Dépendances RUNTIME des binaires livrés
+
+Vérifiées sur le binaire (`ldd rust/target/release/holaf-ui`, plus la liste des
+commandes externes que le code lance) — ce sont les `depends` du PKGBUILD :
+
+| | Arch | Debian / Ubuntu | Ce que ça fournit |
+|---|---|---|---|
+| moteur audio | `pipewire` | `pipewire` + `libpipewire-0.3-0` | `libpipewire-0.3.so.0` **liée** par `holaf-ui` et `holafd` ; `pw-cli`, `pw-dump`, `pw-link`, `pw-metadata`, `pw-top` |
+| serveur Pulse | `pipewire-pulse` | `pipewire-pulse` | le socket auquel `pactl` parle (remplace `pulseaudio`, qui **entre en conflit** avec lui : même `pulse-native-provider`) |
+| `pactl` | `libpulse` | `pulseaudio-utils` | liste / déplace les flux applicatifs (`holaf-pw/src/sink_inputs.rs`) |
+| `pw-cat` | `pipewire-audio` | `pipewire-bin` | une capture enfant par source pour les vumètres (`holaf-ui/src/capture.rs`) |
+| session | `wireplumber` | `wireplumber` | construit le graphe (nœuds physiques, `.monitor`) que le mixeur pilote |
+| MIDI | `alsa-lib` | `libasound2` | `libasound.so.2` **liée** : séquenceur ALSA via `midir` |
+| FX | `swh-plugins` | `swh-plugins` | `gate_1410`, `mbeq_1197`, `sc4_1882` dans `/usr/lib/ladspa/` (⚠ `ladspa-plugins` n'existe sur aucune des deux distros ; `rnnoise` ne contient **pas** le plugin LADSPA `librnnoise_ladspa`) |
+| tray | `gtk3` + `libayatana-appindicator` | `libgtk-3-0` + `libayatana-appindicator3-1` | GTK3 **liée**, appindicator `dlopen`é |
 
 ## Builder
 

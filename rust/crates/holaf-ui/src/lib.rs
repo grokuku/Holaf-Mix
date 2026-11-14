@@ -23,7 +23,7 @@
 //! | [`menus`]     | window/strip/FX context menus + their actions                |
 //! | [`diagnostics`] | the pure diagnostic report (collector + findings + text)   |
 //! | [`midi`]      | MIDI CC mapping / learn / LED feedback (I/O behind `midi`)   |
-//! | [`tray`]      | tray menu policy + always-on-top (the icon itself: TODO)     |
+//! | [`tray`]      | tray policy + always-on-top + generated icon (feature `tray`) |
 //! | [`fx_ui`]     | FX control-port ranges/order (the Qt keyword table)          |
 //! | [`coalesce`]  | the 25 Hz fader throttle                                     |
 //! | [`raster`]    | software rasteriser used by the headless PNG snapshot        |

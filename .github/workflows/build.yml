@@ -154,6 +154,16 @@ jobs:
           #                   1.98; Arch ships 1.99.x), otherwise cargo
           #                   refuses the whole workspace.
           # pkgconf is already in the list and is what -sys crates call.
+          #
+          # Runtime helpers the binaries EXEC (`pw-cat` for the VU meters,
+          # `pactl` for app list/move) are deliberately NOT installed here:
+          # they live in `pipewire-audio` / `libpulse`(+`pipewire-pulse`), and
+          # only the *live* tests use them.  Those tests self-skip precisely
+          # because this job has no PipeWire daemon (`SKIP app_routing_live: no
+          # pactl (pipewire-pulse) on this machine`) — see the `cargo test` step.
+          # Enabling them later means adding, in one go:
+          #   pipewire-audio pipewire-pulse libpulse wireplumber
+          # plus a `scripts/start-pipewire-headless.sh` call before the tests.
           pacman -S --noconfirm --needed \
             base-devel \
             pkgconf \
@@ -167,7 +177,26 @@ jobs:
             portaudio \
             pipewire \
             clang \
-            rust
+            rust \
+            gtk3 \
+            libayatana-appindicator
+
+          # Tray (cargo feature `tray`, ON BY DEFAULT — it is what the packaged
+          # app ships) — GTK3 + an appindicator:
+          #   gtk3                      -> libgtk-3.pc / libgdk-3.pc / pango / cairo
+          #                                (the `gtk` crate builds against these).
+          #   libayatana-appindicator   -> ships libayatana-appindicator3.so.1,
+          #                                which `libappindicator-sys` dlopen()s at
+          #                                RUNTIME (no build-time pkg-config).
+          #
+          # NOTE on the package name: Arch has NO `libappindicator-gtk3`
+          # (that is AUR-only); the distro package is `libayatana-appindicator`
+          # (which replaces the original libappindicator). If it ever moves, the
+          # only thing to change is this pacman list — `libappindicator-sys`
+          # accepts either `libappindicator3.so.1` or `libayatana-appindicator3.so.1`.
+          # libxdo is NOT needed: `tray-icon` is declared with default-features =
+          # false, dropping its `libxdo` feature (only the predefined
+          # Copy/Paste items use it, and this app builds its own menu items).
 
           # Arch's `python` package provides /usr/bin/python3; verify
           # before continuing, otherwise the next step fails with a
@@ -335,7 +364,16 @@ jobs:
           # holaf-ui is the app's window (main.py launches it), holafd the
           # audio backend of the Qt fallback, holafctl the CLI.  One invocation:
           # they share every dependency (holaf-pw, egui…).
-          cargo build --release --locked -p holaf-ui -p holafd -p holafctl
+          #
+          # --features tray: THE SHIPPED BINARY HAS THE TRAY ICON. It is the
+          # default of scripts/build_rust.sh (and therefore of build.sh), and
+          # this step must match, otherwise the artifact the CI uploads (and
+          # the bundle embedded by the PyInstaller steps below) would silently
+          # differ from a local release. `gtk3` + `libayatana-appindicator` are
+          # installed in the dependency step above; the `cargo check` step
+          # further down re-proves the feature compiles on its own.
+          cargo build --release --locked --features tray \
+            -p holaf-ui -p holafd -p holafctl
           cd ..
           mkdir -p dist
           cp rust/target/release/holaf-ui \
@@ -380,6 +418,47 @@ jobs:
             # being a pure parse-and-exit (e.g. it starts a backend).
             timeout 10 "$bin" --help >/dev/null 2>&1 || true
           done
+
+      - name: Build Rust UI with the tray feature (GTK3 + appindicator)
+        # Redundant on purpose with the release build above (which already
+        # compiles `--features tray`): this step is the FOCUSED proof that the
+        # tray feature alone compiles — the release build could be "fixed" by
+        # dropping the feature and still pass.  It prints the pkg-config/ldconfig
+        # versions the -sys crates actually resolved, which the release step does
+        # not.
+        #
+        # This is `cargo check`, not `build`: it type-checks and links the -sys
+        # crates (gtk/pango/cairo) against the system libraries without paying for
+        # a second release codegen of the whole egui stack.
+        #
+        # continue-on-error: false on purpose — if the tray stops compiling we
+        # WANT the job red so it gets fixed. This is also what keeps the CI
+        # honest now that the tray ships by default in the packaged app.
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH="/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          # Fail fast and legibly when the GTK/appindicator packages are missing,
+          # instead of letting the -sys crate emit an opaque pkg-config error.
+          for pc in gtk+-3.0 gdk-3.0 pango cairo; do
+            pkg-config --exists "$pc" \
+              && echo "  OK   pkg-config: $pc $(pkg-config --modversion "$pc")" \
+              || { echo "::error::pkg-config cannot find $pc (pacman: gtk3)"; exit 1; }
+          done
+          if ldconfig -p | grep -Eq 'lib(appindicator|ayatana-appindicator)3\.so'; then
+            echo "  OK   appindicator shared library present"
+          else
+            # Not fatal: libappindicator-sys dlopen()s it at runtime and the
+            # feature still *compiles* without it. Warn so a missing runtime
+            # dependency is visible in the log.
+            echo "::warning::no libayatana-appindicator3/libappindicator3 in ldconfig (pacman: libayatana-appindicator); the tray will compile but may not show at runtime"
+          fi
+
+          cd rust
+          # --locked: same reproducibility rule as the release build above.
+          cargo check --locked -p holaf-ui --features tray
+          echo "  OK   holaf-ui compiles with --features tray"
 
       - name: Verify generated SPA bindings (bindgen sanity)
         # Regression guard for upstream pipewire-rs issue #112: with an
@@ -608,6 +687,63 @@ jobs:
           else
             echo "::warning::$PUBLISHED missing — nothing published to dist/."
           fi
+          echo "::endgroup::"
+
+      - name: Verify the bundle does NOT embed the GTK3/GLib stack
+        # Regression guard for the bug packaging/holaf-mix.spec fixes: `holaf-ui`
+        # with the `tray` feature NEEDs libgtk-3.so.0, and PySide6 ships
+        # plugins/platformthemes/libqgtk3.so, so PyInstaller happily freezes the
+        # whole GTK3 + GLib stack.  The bootloader prepends sys._MEIPASS to
+        # LD_LIBRARY_PATH, so a frozen GTK3 wins over the user's: mismatched
+        # themes, GSettings schemas, dlopened theme engines and an appindicator
+        # the panel's libayatana may reject (same class of bug as the frozen
+        # libpipewire client).  The spec drops those libs from `a.binaries`;
+        # this step fails the job if they ever come back.
+        #
+        # Authoritative source: PyInstaller's own TOC (onefile) or the on-disk
+        # _internal/ (onedir).  Nothing to check when no build ran → notice.
+        continue-on-error: false
+        run: |
+          set -uo pipefail
+          echo "::group::GTK3/GLib frozen in the bundle?"
+
+          forbidden='libgtk-3\.so|libgdk-3\.so|libgdk_pixbuf-2\.0\.so|libpango|libcairo|libatk|libepoxy|libharfbuzz|libglib-2\.0\.so|libgobject-2\.0\.so|libgio-2\.0\.so|libgmodule-2\.0\.so|libgthread-2\.0\.so'
+
+          hits=0
+          shopt -s nullglob
+          # Only the FINAL trees: Analysis-00.toc keeps what the analysis
+          # collected *before* the spec dropped the GTK/GLib entries from
+          # a.binaries, so it would always "find" them.
+          tocs=(build/pyinstaller/*/EXE-*.toc build/pyinstaller/*/COLLECT-*.toc)
+          if ((${#tocs[@]})); then
+            for f in "${tocs[@]}"; do
+              # No trailing quote in the pattern: TOC entries are
+              #   ('libgtk-3.so.0', '/lib/x86_64-linux-gnu/libgtk-3.so.0', 'BINARY')
+              # so the soname carries a version suffix.
+              if grep -qE "$forbidden" "$f"; then
+                echo "  FROZEN in $f:"
+                grep -oE "($forbidden)[^',]*" "$f" | sort -u | sed 's/^/    /'
+                hits=$((hits + 1))
+              fi
+            done
+            echo "  checked ${#tocs[@]} TOC file(s)"
+          else
+            echo "::notice::no PyInstaller TOC under build/pyinstaller — build skipped?"
+          fi
+
+          for d in dist/holaf-mix/_internal build/dist/holaf-mix/_internal; do
+            if [[ -d "$d" ]]; then
+              found=$(ls "$d" 2>/dev/null | grep -cE "^($forbidden)" || true)
+              echo "  $d: $found forbidden librar(y|ies) on disk"
+              ((found == 0)) || hits=$((hits + 1))
+            fi
+          done
+
+          if ((hits > 0)); then
+            echo "::error::the bundle contains the GTK3/GLib stack — holaf-ui would use a FROZEN GTK3 instead of the system one. Fix packaging/holaf-mix.spec (_GTK_SYSTEM_LIBS)."
+            exit 1
+          fi
+          echo "  OK   no GTK3/GLib library in the bundle (the system provides them)"
           echo "::endgroup::"
 
       # ------------------------------------------------------------------

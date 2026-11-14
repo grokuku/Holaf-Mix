@@ -15,6 +15,10 @@
 #    ./build.sh --clean                  # remove all build artifacts
 #    ./build.sh --onedir                 # onedir build instead of onefile
 #
+#  Env:
+#    HOLAF_NO_TRAY=1                     # build without the tray icon
+#                                        # (default: tray ON, needs GTK3 dev)
+#
 #  Quick start on CachyOS:
 #    ./build.sh --install-deps           # one-time setup
 #    ./build.sh --run                    # build + launch
@@ -82,40 +86,100 @@ detect_distro() {
 # --- Dependency lists --------------------------------------------------------
 # Note on CachyOS / Arch:
 #   - "librsvg2" is wrong — the package is just "librsvg" (it ships rsvg-convert)
-#   - "python-pyinstaller" is wrong — pyinstaller is in AUR, not in [extra].
-#     The official upstream recommendation is to `pip install pyinstaller`
-#     (it's a build-time tool, not a runtime dep, so pip is fine).
-#   - "python-pyside6" exists in [extra] but is frequently out of date; pip
-#     gives you the version pinned in requirements.txt.
-# On Arch/CachyOS, `pipewire-pulse` REPLACES `pulseaudio` (it provides
-# the PulseAudio client API on top of PipeWire). Installing both at once
-# triggers a hard pacman conflict. The vast majority of modern CachyOS
-# installs only have pipewire-pulse; legacy pulseaudio-only systems are
-# rare and would be incompatible with the rest of Holaf-Mix's PipeWire
-# routing anyway. If you're on such a system, run the install manually.
+#   - "python-pyinstaller" is wrong — pyinstaller is not packaged for Arch at
+#     all (neither [extra] nor the AUR under that name). The official upstream
+#     recommendation is to `pip install pyinstaller` (it's a build-time tool,
+#     not a runtime dep, so pip is fine).
+#   - "python-pyside6" is the Debian name; on Arch it is "pyside6" (it is
+#     frequently out of date; pip gives you the version pinned in
+#     requirements.txt).
+#   - "ladspa-plugins" does NOT exist on Arch (it is not a Debian package
+#     either): the four LADSPA files the mixer loads come from
+#     "swh-plugins" -> /usr/lib/ladspa/{gate_1410,mbeq_1197,sc4_1882}.so
+#   - PipeWire is the ONLY audio server supported: `pipewire-pulse` provides
+#     `pulse-native-provider`, exactly like `pulseaudio`, so installing both
+#     triggers a hard pacman conflict and installs a server nothing talks to.
+#     The `pactl` binary the app EXECs comes from `libpulse`, not from either
+#     of them.
 SYSTEM_DEPS_ARCH=(
+    # --- build toolchain -------------------------------------------------
+    "base-devel"         # gcc/make (Rust link step, pip wheel builds)
+    "pkgconf"            # the -sys crates probe their .pc files at build time
+    "clang"              # libclang.so for bindgen (libspa-sys, pipewire-sys)
+    "rust"               # rustc/cargo >= MSRV (rust/Cargo.toml)
+    # --- packaging tools --------------------------------------------------
     "librsvg"            # provides rsvg-convert
     "imagemagick"        # provides `magick` for ICO bundling
-    "pipewire"
-    "pipewire-pulse"     # provides the PulseAudio client API
-    "ladspa"
-    "ladspa-plugins"
+    # --- runtime: PipeWire stack -----------------------------------------
+    "pipewire"           # libpipewire-0.3 + pw-cli/pw-dump/pw-link/pw-metadata
+    "pipewire-audio"     # pw-cat — the VU meters record through it
+    "pipewire-pulse"     # the Pulse server `pactl` talks to (replaces pulseaudio)
+    "libpulse"           # /usr/bin/pactl itself (app list / move)
+    "wireplumber"        # session manager: builds the nodes the mixer manages
+    "alsa-lib"           # alsa-sys: the MIDI Mix through the ALSA sequencer
+    "swh-plugins"        # gate_1410 / mbeq_1197 / sc4_1882 LADSPA plugins
+    # --- runtime: tray + plugins -----------------------------------------
+    # Tray icon (cargo feature `tray`, ON BY DEFAULT in scripts/build_rust.sh):
+    #   gtk3                    -> libgtk-3.pc / libgdk-3.pc / pango / cairo
+    #   libayatana-appindicator -> libayatana-appindicator3.so.1, dlopen()é au
+    #                              runtime par libappindicator-sys (Arch n'a pas
+    #                              de libappindicator-gtk3 : c'est AUR-only).
+    # Sans elles le build continue SANS l'icône (warning) : HOLAF_NO_TRAY=1 rend
+    # ce choix explicite.
+    "gtk3"
+    "libayatana-appindicator"
+    "ladspa"             # optional: analyseplugin/applyplugin (debug only)
 )
 SYSTEM_DEPS_DEBIAN=(
+    # --- build toolchain -------------------------------------------------
+    "build-essential"
+    "pkg-config"
+    "clang"              # libclang.so for bindgen
+    # NOTE: Debian 12's `rustc` is 1.63, far below the workspace MSRV (1.98):
+    #       install the toolchain with rustup, not with apt.
+    # --- packaging tools --------------------------------------------------
     "librsvg2-bin"       # provides rsvg-convert on Debian/Ubuntu
     "imagemagick"
+    # --- runtime: PipeWire stack -----------------------------------------
     "libpipewire-0.3-dev"
+    "libspa-0.2-dev"
     "libpulse-dev"
-    "ladspa-sdk"
-    "ladspa-plugins"
+    "pipewire-bin"       # pw-cat / pw-cli / pw-dump / pw-link / pw-metadata
+    "pipewire-pulse"     # the Pulse server `pactl` talks to
+    "wireplumber"        # session manager
+    "pulseaudio-utils"   # /usr/bin/pactl (NOT in libpulse0)
+    "libasound2-dev"     # alsa-sys (MIDI)
+    "swh-plugins"        # gate_1410 / mbeq_1197 / sc4_1882 LADSPA plugins
+    # --- runtime: tray + plugins -----------------------------------------
+    # Tray icon (feature `tray`, active par défaut) : GTK3 dev au build +
+    # l'appindicator au runtime.
+    "libgtk-3-dev"
+    "libayatana-appindicator3-dev"
+    "ladspa-sdk"         # optional: analyseplugin/applyplugin (debug only)
 )
 SYSTEM_DEPS_FEDORA=(
+    # --- build toolchain -------------------------------------------------
+    "gcc"
+    "gcc-c++"
+    "make"
+    "pkgconf-pkg-config"
+    "clang"              # libclang.so for bindgen
+    # --- packaging tools --------------------------------------------------
     "librsvg2-tools"     # provides rsvg-convert on Fedora
     "ImageMagick"
+    # --- runtime: PipeWire stack -----------------------------------------
     "pipewire-devel"
+    "pipewire-utils"     # pw-cat / pw-cli / pw-dump / pw-link / pw-metadata
+    "pipewire-pulseaudio"
+    "pulseaudio-utils"   # /usr/bin/pactl
+    "wireplumber"        # session manager
+    "alsa-lib-devel"     # alsa-sys (MIDI)
+    "ladspa-swh-plugins" # gate_1410 / mbeq_1197 / sc4_1882 (Fedora name)
     "pulseaudio-libs-devel"
-    "ladspa"
-    "ladspa-plugins"
+    # --- runtime: tray ---------------------------------------------------
+    # Tray icon (feature `tray`, active par défaut)
+    "gtk3-devel"
+    "libayatana-appindicator-gtk3"
 )
 # Python deps installed via pip (NOT pacman) so versions match
 # requirements.txt and stay reproducible.
@@ -132,9 +196,11 @@ PYTHON_DEPS=(
 has() { command -v "$1" >/dev/null 2>&1; }
 
 print_help() {
-    # Print the header docblock (lines 2..22 in this file), stripping the
-    # leading "# " comment marker that bash sees in the script body.
-    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the leading docblock: every "#" comment line at the top of this
+    # file, from line 2 until the first real statement.  Computed rather than
+    # hardcoded as a line range — the header grows (HOLAF_NO_TRAY env, …) and a
+    # fixed range silently truncates the help text.
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 # --- Step implementations ----------------------------------------------------
@@ -204,7 +270,11 @@ install_deps() {
     if [[ "$DISTRO_FAMILY" == "unknown" ]]; then
         err "Unsupported distro. Please install manually:"
         err "  System:  rsvg-convert (Arch: librsvg | Debian: librsvg2-bin), imagemagick"
-        err "           libpipewire dev headers, pulseaudio dev headers, ladspa-plugins"
+        err "           libpipewire/libspa dev headers + pkgconf + clang (bindgen),"
+        err "           libasound dev headers (MIDI), libpulse dev headers,"
+        err "           swh-plugins (LADSPA gate_1410/mbeq_1197/sc4_1882)"
+        err "  Runtime: pipewire (+ pipewire-audio for pw-cat), pipewire-pulse,"
+        err "           wireplumber, libpulse (pactl), gtk3, libayatana-appindicator"
         err "  Python:  ${PYTHON_DEPS[*]}"
         exit 1
     fi
@@ -274,6 +344,37 @@ check_deps() {
     fi
 
     ok "All dependencies present."
+
+    # Tray icon: gtk3 dev is needed to compile the `tray` cargo feature, which
+    # scripts/build_rust.sh now enables BY DEFAULT.  This is a warning, not an
+    # error: the Rust build retries without the feature, so the app keeps its
+    # window and only loses the notification icon.
+    if ! pkg-config --exists gtk+-3.0 2>/dev/null; then
+        warn "gtk+-3.0 (GTK3 dev) not found — the build will retry WITHOUT the tray icon."
+        warn "  Arch: pacman -S gtk3 libayatana-appindicator | Debian: apt install libgtk-3-dev libayatana-appindicator3-dev"
+        warn "  Or build without the icon on purpose: HOLAF_NO_TRAY=1 ./build.sh"
+    fi
+
+    # MIDI (cargo feature `midi`, also ON by default) is built against the ALSA
+    # sequencer through alsa-sys, which needs the alsa .pc file.
+    if ! pkg-config --exists alsa 2>/dev/null; then
+        warn "alsa (ALSA dev headers) not found — the Rust UI cannot be built with MIDI."
+        warn "  Arch: pacman -S alsa-lib | Debian: apt install libasound2-dev"
+    fi
+
+    # Programs the binaries EXEC (not linked libraries): without them the build
+    # is fine, but the feature they power degrades at run time, so this is a
+    # warning, never an error.
+    #   pw-cat -> VU meters (rust/crates/holaf-ui/src/capture.rs)
+    #   pactl  -> app list / app move (rust/crates/holaf-pw/src/sink_inputs.rs)
+    local rt_missing=()
+    has pw-cat || rt_missing+=("pw-cat (Arch: pipewire-audio | Debian/Fedora: pipewire-bin/pipewire-utils)")
+    has pactl  || rt_missing+=("pactl (Arch: libpulse | Debian/Fedora: pulseaudio-utils)")
+    for m in "${rt_missing[@]:-}"; do
+        [[ -n "$m" ]] || continue
+        warn "missing runtime helper: $m"
+        warn "  the build is unaffected; that feature stays inert until it is installed"
+    done
 }
 
 build_icons() {
@@ -301,6 +402,16 @@ build_rust_binaries() {
     #  (the launcher then logs that holaf-ui is missing and starts Qt).
     # ========================================================================
     hdr "Step 2/4 — Building Rust UI + daemon + CLI"
+
+    # The system-tray icon (cargo feature `tray`) is ON BY DEFAULT here: it is
+    # part of the packaged app.  HOLAF_NO_TRAY=1 (or the legacy HOLAF_TRAY=0)
+    # removes it; the env is inherited by scripts/build_rust.sh, which also
+    # falls back to a tray-less build if GTK3/appindicator are missing.
+    if [[ "${HOLAF_NO_TRAY:-0}" == "1" || "${HOLAF_TRAY:-1}" == "0" ]]; then
+        log "Tray icon DISABLED (HOLAF_NO_TRAY/HOLAF_TRAY=0)"
+    else
+        log "Tray icon: ENABLED by default (feature \`tray\`; HOLAF_NO_TRAY=1 to drop it)"
+    fi
 
     local script="$ROOT_DIR/scripts/build_rust.sh"
     if [[ ! -x "$script" ]]; then
