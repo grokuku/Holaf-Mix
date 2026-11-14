@@ -1,4 +1,4 @@
-"""Hidden diagnostics window (Ctrl+Shift+D) — the Qt half of the diagnostics.
+"""Diagnostics window ("Debug window" menu entry) — the Qt half of the diagnostics.
 
 Why
 ---
@@ -29,8 +29,9 @@ Threading rules (same contract as the main window)
   and merges them into the last full report (:func:`merge_report`), so it never
   re-runs ``pw-dump`` or the ``/proc`` scan.
 
-The window is deliberately not reachable from any menu or button: it exists
-only through the **Ctrl+Shift+D** shortcut installed by ``MainWindow``.
+The window is not reachable from any button: it opens from the application
+context menu (**right click → Debug window**, see
+``src.ui.main_window.MainWindow.build_app_context_menu``).
 """
 
 import datetime
@@ -156,7 +157,7 @@ class DiagnosticsDialog(QDialog):
         self._workers: Dict[int, ReportWorker] = {}
         self._requests: Dict[int, bool] = {}
 
-        self.setWindowTitle("Holaf-Mix — Diagnostics   (Ctrl+Shift+D)")
+        self.setWindowTitle("Holaf-Mix — Diagnostics")
         self.setModal(False)
         self.setSizeGripEnabled(True)
         self.resize(*DEFAULT_SIZE)

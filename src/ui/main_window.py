@@ -1,8 +1,9 @@
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                 QLabel, QScrollArea, QFrame, QPushButton, QInputDialog, QMessageBox,
                                 QDialog, QCheckBox, QDialogButtonBox, QSizePolicy, QSystemTrayIcon, QMenu, QApplication, QStyle)
-from PySide6.QtCore import Qt, QThreadPool, QRunnable, Slot, QTimer, QByteArray
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import (Qt, QThreadPool, QRunnable, Slot, QTimer, QByteArray, Signal,
+                            QEvent, QUrl)
+from PySide6.QtGui import QAction, QIcon, QDesktopServices, QCursor
 from src.config import settings
 from src.models.strip_model import Strip, StripType, StripMode
 from src.ui.widgets.strip_widget import StripWidget
@@ -28,10 +29,20 @@ THREAD_POOL_MAX_WORKERS = 4
 # before they'll accept LED update messages).
 MIDI_FEEDBACK_SETTLE_MS = 200
 
-# Hidden diagnostics window (no menu entry, no button — the shortcut only).
-# Ctrl+Shift+D is free: the app defines no other QShortcut and the strip
-# widgets only use local buttons/dialogs (verified against the whole tree).
-DIAGNOSTICS_SHORTCUT = "Ctrl+Shift+D"
+# --- Application context menu (right click anywhere) ---
+# The menu replaced the old ``Ctrl+Shift+D`` shortcut: a hidden keyboard
+# shortcut is undiscoverable (users reported "nothing happens"), whereas a
+# right click is what they try first.  Same entries everywhere in the window,
+# so the order and the labels live here — one place to read and to test.
+MENU_RESTART_ENGINE = "Restart audio engine"
+MENU_DEBUG_WINDOW = "Debug window"
+MENU_OPEN_PROJECT_PAGE = "Open project page"
+
+# Project home page opened by "Open project page" (bug reports, docs, releases).
+PROJECT_PAGE_URL = "https://github.com/grokuku/Holaf-Mix"
+
+# How long a success notice stays in the status bar (an error notice stays).
+RESTART_NOTICE_TIMEOUT_MS = 8000
 
 # --- Custom Dialog for App Selection ---
 class AppSelectionDialog(QDialog):
@@ -92,6 +103,10 @@ class BackendWorker(QRunnable):
             print(f"Backend Task Error: {e}")
 
 class MainWindow(QMainWindow):
+    # Emitted by the restart worker (any thread); the connected slot runs on the
+    # UI thread because the receiver lives there (Qt auto → queued connection).
+    engine_restart_done = Signal(bool, str)
+
     def __init__(self, audio_engine=None, midi_engine=None):
         super().__init__()
         self.setWindowTitle("Holaf-Mix")
@@ -149,36 +164,336 @@ class MainWindow(QMainWindow):
         self.meter_timer.timeout.connect(self._update_meters)
         self.meter_timer.start()
 
-        # Hidden diagnostics window (Ctrl+Shift+D).  Not referenced by any
-        # menu/button on purpose: it is a debugging tool, not a feature.
+        # Hidden diagnostics window: reachable from the context menu
+        # ("Debug window") only.  It is a debugging tool, not a feature.
         self._diagnostics_dialog = None
-        self.diagnostics_shortcut = QShortcut(QKeySequence(DIAGNOSTICS_SHORTCUT), self)
-        self.diagnostics_shortcut.setContext(Qt.ApplicationShortcut)
-        self.diagnostics_shortcut.activated.connect(self.open_diagnostics)
+        # True while a context menu is exec()ing (one menu at a time).
+        self._context_menu_open = False
+
+        # --- Full "Restart audio engine" state (context menu) ---
+        # One restart at a time: a second click while a restart is running is
+        # ignored (and said so in the status bar) instead of stacking workers
+        # that would race on the same audio graph.
+        self._full_restart_running = False
+        self._wait_cursor_shown = False
+        # Emitted from the worker thread; the slot runs on the UI thread
+        # (queued connection), which is how the worker reports back without
+        # touching widgets from its own thread.
+        self.engine_restart_done.connect(self._on_engine_restart_done)
+
+        # --- Right click anywhere opens the application menu ---
+        # Two complementary mechanisms, because a widget tree has two ways of
+        # receiving a right click:
+        #
+        # * ``contextMenuEvent`` on the window itself — the background, the
+        #   empty areas, and (by Qt propagation of an ignored context event)
+        #   anything that does not handle it itself;
+        # * an event filter on every widget of this window whose policy is
+        #   ``Qt.DefaultContextMenu`` — installed in
+        #   :meth:`_install_context_menu_filters` and refreshed after each
+        #   ``refresh_ui`` (strips are recreated there), so a right click on a
+        #   strip, a VU meter or a section header opens the menu even if that
+        #   widget would have swallowed the event.
+        #
+        # The filter consumes the event when it opens the menu (returns True),
+        # so one click can never open the menu twice.  Widgets that *do* own a
+        # context menu (strip name label → "Rename…", FX buttons → effect
+        # parameters) have ``Qt.CustomContextMenu`` and are left alone: they
+        # append the application entries to their own menu instead (see
+        # ``StripWidget.app_menu_provider``).
+        self._install_context_menu_filters()
+
+    # -------------------------------------------------- application menu
+    def _install_context_menu_filters(self):
+        """Route the right clicks of every child widget to :meth:`eventFilter`.
+
+        Cheap and idempotent (a few dozen widgets, called again after each
+        ``refresh_ui``): installing on the whole QApplication instead would put
+        a Python call in front of *every* event of the process, including the
+        25 Hz VU-meter repaints.
+        """
+        for widget in self.findChildren(QWidget):
+            if widget.contextMenuPolicy() not in (Qt.DefaultContextMenu, Qt.NoContextMenu):
+                continue  # owns its menu (CustomContextMenu) or has none at all
+            widget.removeEventFilter(self)  # idempotent install
+            widget.installEventFilter(self)
+
+    def build_app_context_menu(self, menu=None):
+        """Return the application context menu (right click anywhere).
+
+        Entries, in this order:
+
+        1. **Restart audio engine** — full reset without quitting the app;
+        2. **Debug window** — the diagnostics window (used to be `Ctrl+Shift+D`);
+        3. *separator*;
+        4. **Open project page** — the GitHub home page.
+
+        ``menu`` (optional) is an existing QMenu to extend: child widgets that
+        own a local context menu (strip label, FX buttons) pass theirs so the
+        application entries are appended after their own, separated by a
+        separator line.
+        """
+        own = menu is None
+        if own:
+            menu = QMenu(self)
+        else:
+            menu.addSeparator()
+
+        action_restart = menu.addAction(MENU_RESTART_ENGINE)
+        action_restart.triggered.connect(self.restart_audio_engine)
+        action_debug = menu.addAction(MENU_DEBUG_WINDOW)
+        action_debug.triggered.connect(self.open_diagnostics)
+        menu.addSeparator()
+        action_project = menu.addAction(MENU_OPEN_PROJECT_PAGE)
+        action_project.triggered.connect(self.open_project_page)
+        if own:
+            # Not part of the visible entries, but handy for tests/tools that
+            # need to find an entry back from the menu.
+            menu.setObjectName("appContextMenu")
+        return menu
+
+    def _show_app_context_menu(self, global_pos):
+        """Open the application menu at ``global_pos`` (one at a time)."""
+        if self._context_menu_open:
+            return
+        self._context_menu_open = True
+        try:
+            self.build_app_context_menu().exec(global_pos)
+        finally:
+            self._context_menu_open = False
+
+    def _is_own_context_menu_target(self, obj):
+        """Should a right click on ``obj`` open the application menu?
+
+        True for every child widget of this window that does not already own a
+        context menu (the window itself is covered by
+        :meth:`contextMenuEvent`).  Qt popups (menus, combo-box lists) and
+        widgets of another window are left alone.
+        """
+        if not isinstance(obj, QWidget):
+            return False
+        try:
+            if obj.window() is not self:
+                return False
+        except RuntimeError:  # widget already deleted by the C++ side
+            return False
+        return obj.contextMenuPolicy() in (Qt.DefaultContextMenu, Qt.NoContextMenu)
+
+    def eventFilter(self, obj, event):
+        """Open the application menu on any right click inside this window.
+
+        See the installation site in ``__init__`` for why a filter is used on
+        top of ``contextMenuEvent``.  Returning True consumes the event, so the
+        menu can never be opened twice for one click (once by the filter, once
+        by the widget's own ``contextMenuEvent`` propagation).
+        """
+        if event.type() == QEvent.ContextMenu and self._is_own_context_menu_target(obj):
+            self._show_app_context_menu(self._event_global_pos(event))
+            return True
+        return super().eventFilter(obj, event)
+
+    def contextMenuEvent(self, event):  # noqa: N802 (Qt API)
+        """Right click on the window itself (background, empty areas)."""
+        self._show_app_context_menu(self._event_global_pos(event))
+        event.accept()
+
+    @staticmethod
+    def _event_global_pos(event):
+        """Global position of a context-menu event (mouse fallback)."""
+        global_pos = getattr(event, "globalPos", None)
+        if callable(global_pos):
+            try:
+                return global_pos()
+            except Exception:  # noqa: BLE001 - non-mouse context event
+                pass
+        return QCursor.pos()
+
+    # ------------------------------------------------------- menu actions
+    def open_project_page(self):
+        """Menu action: open the Holaf-Mix GitHub page in the browser."""
+        opened = False
+        try:
+            opened = QDesktopServices.openUrl(QUrl(PROJECT_PAGE_URL))
+        except Exception as exc:  # noqa: BLE001 - a browser failure must not crash
+            logger.error("openUrl(%s) failed: %s", PROJECT_PAGE_URL, exc)
+        if not opened:
+            logger.warning("could not open the project page (%s)", PROJECT_PAGE_URL)
+            self._report_failure(
+                "Could not open the project page",
+                f"No browser could be launched for:\n{PROJECT_PAGE_URL}",
+            )
+
+    def restart_audio_engine(self):
+        """Menu action: restart the audio engine without leaving the app.
+
+        The engine work (``shutdown`` → fresh daemon / ``start_engine``) blocks
+        for as long as PipeWire needs, so it always runs on a
+        ``BackendWorker`` thread: the UI stays responsive, the cursor turns
+        into a wait cursor and the status bar narrates the operation.
+
+        Non-reentrant: while a restart is in flight, further clicks are
+        ignored with an explicit status message (two concurrent restarts would
+        race on the same graph).  Works with both engines (Rust daemon and
+        classic Python engine).
+        """
+        if not self.audio_engine:
+            self._report_failure(
+                "No audio engine",
+                "This window was started without an audio engine — nothing to restart.",
+            )
+            return
+        if self._full_restart_running:
+            logger.info("audio engine restart already in progress — click ignored")
+            self._show_status("Audio engine restart already in progress…",
+                              RESTART_NOTICE_TIMEOUT_MS)
+            return
+
+        self._full_restart_running = True
+        if not self._wait_cursor_shown:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self._wait_cursor_shown = True
+        self._show_status("Audio engine restarting…")
+        logger.info("audio engine restart requested (context menu)")
+        # Snapshot of the strips: the UI thread may add/remove/rename strips
+        # while the worker runs, and start_engine() must see one coherent list.
+        self._run_in_background(self._restart_engine_task, list(self.strips))
+
+    def _restart_engine_task(self, strips):
+        """Worker: restart the engine, then report back on the UI thread.
+
+        Never raises (a worker traceback would only land in the app's stderr,
+        which a desktop-launched app does not have): the outcome is emitted as
+        ``engine_restart_done(ok, message)`` — ``message`` is the notice on
+        success and the *reason* on failure — and rendered by
+        :meth:`_on_engine_restart_done`.
+        """
+        try:
+            self._restart_engine_now(strips)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            logger.exception("audio engine restart failed")
+            reason = str(exc) or exc.__class__.__name__
+            self.engine_restart_done.emit(False, reason)
+            return
+        logger.info("audio engine restarted")
+        self.engine_restart_done.emit(True, "Audio engine restarted")
+
+    def _restart_engine_now(self, strips):
+        """Blocking half of the restart (worker thread only).
+
+        Rust engine
+            ``shutdown()`` → ``stop_daemon()`` when this process owns the
+            daemon (a fresh daemon is the actual point of the reset: it clears
+            a stuck graph or a misbehaving daemon) → ``ensure_daemon_running()``
+            (idempotent: it also revives a daemon that died) →
+            ``start_engine(strips)``.  A daemon started by the user by hand is
+            never killed — exactly the ownership rule used at app quit — but
+            the graph is rebuilt all the same.
+
+        Python engine
+            ``shutdown()`` then ``start_engine(strips)``.
+
+        In both cases ``start_engine`` re-reads the daemon's meter sources
+        (``IpcAudioEngine._sync_meter_sources``) or rebuilds its own capture
+        streams, so the VU meters come back without extra work here.
+        """
+        engine = self.audio_engine
+        owned_daemon = bool(getattr(engine, "_rust_daemon_spawned_by_us", False))
+        is_rust = hasattr(engine, "_rust_daemon_spawned_by_us")
+
+        engine.shutdown()  # best effort on both engines
+
+        if is_rust:
+            from src.backend import rust_launcher
+
+            if owned_daemon:
+                # A stop failure must not abort the restart: the next step
+                # (ensure_daemon_running) reuses whatever is still alive.
+                try:
+                    if not rust_launcher.stop_daemon():
+                        logger.info("restart: daemon was already gone — respawning it")
+                except Exception:  # noqa: BLE001 - revive below regardless
+                    logger.warning("restart: could not stop the daemon", exc_info=True)
+            handle = rust_launcher.ensure_daemon_running()
+            if not getattr(handle, "ok", False):
+                reason = getattr(handle, "reason", "") or "holafd is not answering"
+                raise RuntimeError(reason)
+            # Ownership may have changed: a daemon we did not have to stop is
+            # no longer ours, and the app-quit teardown must not kill it.
+            engine._rust_daemon_spawned_by_us = bool(getattr(handle, "spawned_by_us", False))
+
+        engine.start_engine(strips)
+
+    @Slot(bool, str)
+    def _on_engine_restart_done(self, ok, message):
+        """UI thread: end the wait cursor and report the restart outcome."""
+        self._full_restart_running = False
+        if self._wait_cursor_shown:
+            QApplication.restoreOverrideCursor()
+            self._wait_cursor_shown = False
+        if ok:
+            self._show_status(message, RESTART_NOTICE_TIMEOUT_MS)
+        else:
+            self._show_status(f"Audio engine restart failed: {message}")
+            self._report_failure(
+                "Audio engine restart failed",
+                f"{message}\n\nThe app keeps running. The log and the current "
+                "graph state are in the Debug window (right click → Debug window).",
+            )
+
+    def _show_status(self, message, timeout_ms=0):
+        """Show ``message`` in the status bar (never raises)."""
+        try:
+            self.statusBar().showMessage(message, timeout_ms)
+        except Exception:  # noqa: BLE001 - the notice is best effort
+            logger.debug("could not show '%s' in the status bar", message)
+
+    def _report_failure(self, title, message):
+        """Tell the user something failed, without ever raising.
+
+        Logged first (the log feed is shown in the diagnostics window) then a
+        single modal warning: a failing menu action must be visible, not
+        silent — that is what made the old hidden shortcut feel broken.
+        """
+        logger.error("%s: %s", title, message)
+        try:
+            QMessageBox.warning(self, title, message)
+        except Exception:  # noqa: BLE001 - a modal failure must not crash either
+            logger.debug("could not show the '%s' warning box", title)
 
     def open_diagnostics(self):
-        """Show (or raise) the hidden diagnostics window — Ctrl+Shift+D.
+        """Show (or raise) the diagnostics window — "Debug window" menu entry.
 
         The dialog collects the whole state on a worker thread of this
         window's pool, so opening it never blocks the UI even when the daemon
         or PipeWire is unresponsive.  The dialog module is imported here (not
         at module level) so a run that never opens it does not pay for the
-        import.
+        import — and a failed import is reported to the user instead of dying
+        as a traceback on a stderr nobody sees (a lazy import inside a frozen
+        bundle is exactly where that can happen).
         """
-        from src.ui.diagnostics_dialog import DiagnosticsDialog
+        try:
+            from src.ui.diagnostics_dialog import DiagnosticsDialog
 
-        if self._diagnostics_dialog is None:
-            self._diagnostics_dialog = DiagnosticsDialog(
-                audio_engine=self.audio_engine,
-                # Callable, not a snapshot: the strip list is live data.
-                strips=lambda: self.strips,
-                thread_pool=self.thread_pool,
-                parent=self,
+            if self._diagnostics_dialog is None:
+                self._diagnostics_dialog = DiagnosticsDialog(
+                    audio_engine=self.audio_engine,
+                    # Callable, not a snapshot: the strip list is live data.
+                    strips=lambda: self.strips,
+                    thread_pool=self.thread_pool,
+                    parent=self,
+                )
+            dialog = self._diagnostics_dialog
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            logger.exception("could not open the diagnostics window")
+            self._report_failure(
+                "Debug window unavailable",
+                "The diagnostics window could not be opened:\n"
+                f"{exc.__class__.__name__}: {exc}",
             )
-        dialog = self._diagnostics_dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+            return
         # The dialog re-collects itself in showEvent(), so a reopened window
         # always shows fresh state (a stale report is worse than none).
 
@@ -406,6 +721,9 @@ class MainWindow(QMainWindow):
         for strip in self.strips:
             widget = StripWidget(strip)
             self.widgets[strip.uid] = widget
+            # Right click on a strip name / FX button keeps its local menu but
+            # gains the application entries (see MainWindow.build_app_context_menu).
+            widget.app_menu_provider = self.build_app_context_menu
             
             # --- SIGNAL CONNECTIONS ---
             widget.volume_changed.connect(self.on_strip_volume_changed)
@@ -428,6 +746,10 @@ class MainWindow(QMainWindow):
                 self.outputs_container.content_layout.addWidget(widget)
         
         self._populate_devices()
+
+        # Strips were just (re)created: route their right clicks to the
+        # application menu (see _install_context_menu_filters).
+        self._install_context_menu_filters()
         
         # Increase delay to ensure layout count is accurate
         QTimer.singleShot(50, self._adjust_window_size)

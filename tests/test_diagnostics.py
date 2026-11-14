@@ -845,39 +845,58 @@ class TestDiagnosticsDialog(unittest.TestCase):
         self.assertEqual(text, dialog.report_text())
         dialog.close()
 
-    def test_shortcut_slot_opens_the_hidden_window(self):
-        """Ctrl+Shift+D wiring (step 3): the MainWindow slot creates the dialog.
+    def test_menu_action_opens_the_diagnostics_window(self):
+        """"Debug window" wiring: the context-menu entry creates the dialog.
 
         ``MainWindow`` itself is not built here: its constructor also creates a
         tray icon, a meter timer that polls PipeWire and (on close) rewrites
         ``config.json``.  A QWidget stub carrying the same attributes exercises
-        exactly the code path of the shortcut handler.
+        exactly the code path of the menu action (``open_project_page`` /
+        ``restart_audio_engine`` / ``build_app_context_menu`` do not call
+        ``super()`` or any QMainWindow-only API, so they can be borrowed that
+        way; the full window is covered by ``tests/test_app_menu.py``).
         """
-        from PySide6.QtGui import QKeySequence
         from PySide6.QtWidgets import QWidget
 
         from src.ui.diagnostics_dialog import DiagnosticsDialog
-        from src.ui.main_window import DIAGNOSTICS_SHORTCUT, MainWindow
-
-        self.assertEqual(QKeySequence(DIAGNOSTICS_SHORTCUT).toString(), "Ctrl+Shift+D")
+        from src.ui.main_window import MENU_DEBUG_WINDOW, MainWindow
 
         class _WindowStub(QWidget):
+            # Borrow the real slot: it calls no QMainWindow-only API and no
+            # ``super()``, so it runs unchanged on this stub.
+            open_diagnostics = MainWindow.open_diagnostics
+
             def __init__(self):
                 super().__init__()
                 self.audio_engine = FakeRustEngine()
                 self.strips = [_strip("uid-desk", "Desktop")]
                 self.thread_pool = QThreadPool()
                 self._diagnostics_dialog = None
+                self._failures = []
+
+            # ``open_diagnostics`` reports a failure through this hook.
+            def _report_failure(self, title, message):
+                self._failures.append((title, message))
+
+            # Bound on purpose: build_app_context_menu connects every entry.
+            def restart_audio_engine(self):
+                raise AssertionError("the 'Debug window' entry must not restart")
+
+            def open_project_page(self):
+                raise AssertionError("the 'Debug window' entry must not open a browser")
 
         stub = _WindowStub()
-        stub._build_options = None
-        MainWindow.open_diagnostics(stub)
+        # The menu entry is what must run: find it by its label and trigger it.
+        menu = MainWindow.build_app_context_menu(stub)
+        action = next(a for a in menu.actions() if a.text() == MENU_DEBUG_WINDOW)
+        action.trigger()
+
         dialog = stub._diagnostics_dialog
         self.assertIsInstance(dialog, DiagnosticsDialog)
+        self.assertEqual(stub._failures, [])
         self.assertTrue(dialog.isVisible())
-        # No menu entry / no button: the dialog is reachable from the shortcut
-        # only, and reopening reuses the same window.
-        MainWindow.open_diagnostics(stub)
+        # Reopening from the menu reuses the same window.
+        action.trigger()
         self.assertIs(stub._diagnostics_dialog, dialog)
         dialog._build_options = lambda live_only: {"include_graph": False,
                                                   "include_system": False,

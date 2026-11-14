@@ -68,6 +68,12 @@ class StripWidget(QFrame):
         super().__init__(parent)
         self.strip = strip_model
         self._is_learning = False
+        # Optional callable injected by ``MainWindow``:
+        # ``provider(menu)`` appends the application context-menu entries
+        # ("Restart audio engine" / "Debug window" / "Open project page") to a
+        # local QMenu.  Kept as an attribute (no import of the main window
+        # here) so this widget stays usable on its own.
+        self.app_menu_provider = None
 
         # --- Throttling Mechanism ---
         # The QTimer detects external changes to self.strip.volume (e.g. from
@@ -334,20 +340,43 @@ class StripWidget(QFrame):
         parent_layout.addWidget(fx_frame)
 
     def _on_fx_context_menu(self, effect_key, pos):
-        """Opens the configuration dialog for the effect."""
+        """Opens the configuration dialog for the effect.
+
+        An FX button with no editable parameters (e.g. RNNoise) used to do
+        nothing at all on right click; it now falls back to the application
+        menu (see ``app_menu_provider``) so every right click in the app gives
+        the same entries.
+        """
         fx_data = self.strip.effects.get(effect_key)
         if not fx_data or not isinstance(fx_data, dict):
-            return # Should not happen with new model
-            
+            self._show_app_menu_at(self.fx_buttons.get(effect_key), pos)
+            return
+
         params = fx_data.get('params', {})
         if not params:
-            return # No parameters to configure (e.g. maybe RNNoise)
-            
+            # No parameters to configure (e.g. maybe RNNoise)
+            self._show_app_menu_at(self.fx_buttons.get(effect_key), pos)
+            return
+
         dlg = EffectSettingsDialog(effect_key, params, self)
         # Dialog modifies params in-place via shared dict reference.
         # On close, emit once to notify main_window (save + engine restart if active).
         dlg.exec()
         self.effect_params_changed.emit(self.strip.uid, effect_key)
+
+    def _show_app_menu_at(self, widget, pos):
+        """Open the application menu (main window's) at ``pos`` on ``widget``.
+
+        ``app_menu_provider`` is injected by ``MainWindow``; when it is absent
+        (a StripWidget built standalone, e.g. in a test) there is no menu to
+        show and nothing happens.
+        """
+        provider = self.app_menu_provider
+        if not callable(provider) or widget is None:
+            return
+        menu = QMenu(self)
+        provider(menu)
+        menu.exec(widget.mapToGlobal(pos))
 
     def _on_fx_toggled(self, effect_key, checked, button):
         # Update Model (Structure is now {active: bool, params: dict})
@@ -449,10 +478,19 @@ class StripWidget(QFrame):
         return super().eventFilter(obj, event)
 
     def _on_label_context_menu(self, pos):
+        """Strip name right click: rename, then the application entries.
+
+        The label owns a context menu (rename), so the MainWindow event filter
+        leaves it alone; ``app_menu_provider`` extends *this* menu with
+        "Restart audio engine" / "Debug window" / "Open project page" so a
+        right click on a strip name gives both.
+        """
         menu = QMenu(self)
         action_rename = QAction("Rename...", self)
         action_rename.triggered.connect(self._rename_strip)
         menu.addAction(action_rename)
+        if callable(self.app_menu_provider):
+            self.app_menu_provider(menu)
         menu.exec(self.lbl_name.mapToGlobal(pos))
 
     def _rename_strip(self):

@@ -112,13 +112,29 @@ spec complète dans [`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md).
     *   Select "Learn Volume/Mute/Mono".
     *   Move a fader or press a button on your controller.
     *   The mapping is saved automatically.
+5.  **Right click anywhere** for the application menu (*Restart audio engine*,
+    *Debug window*, *Open project page*) — see below.
 
-## Dépannage (touche secrète `Ctrl+Shift+D`)
+## Menu contextuel (clic droit)
+
+Un **clic droit n'importe où** dans Holaf-Mix ouvre le menu de l'application
+(fond de fenêtre, strips, vumètres, en-têtes de section).  Il contient :
+
+| Entrée | Effet |
+| --- | --- |
+| **Restart audio engine** | Réinitialise complètement le moteur audio (arrêt du graphe puis reconstruction, avec un daemon `holafd` neuf quand c'est Holaf-Mix qui l'a lancé) **sans quitter l'application**. La barre de statut affiche « Audio engine restarting… » puis « Audio engine restarted » ; un second clic pendant l'opération est ignoré (un seul redémarrage à la fois). En cas d'échec, un message explicite s'affiche et l'app continue de tourner. |
+| **Debug window** | Ouvre la fenêtre de diagnostic (voir ci-dessous). Remplace l'ancien raccourci `Ctrl+Shift+D`, qui n'existe plus. |
+| **Open project page** | Ouvre <https://github.com/grokuku/Holaf-Mix> dans le navigateur par défaut. |
+
+Deux zones gardent en plus leur menu local, enrichi des entrées ci-dessus :
+le **nom d'un strip** (clic droit → *Rename…* puis le menu de l'application) et
+les boutons **FX** (clic droit → réglages de l'effet quand il en a).
+
+## Dépannage (`clic droit → Debug window`)
 
 Quand le son craque, qu'un strip ne route pas ou qu'une appli est muette,
-il n'y a pas de menu « aide » : lancez Holaf-Mix puis appuyez sur
-**`Ctrl+Shift+D`**.  Une fenêtre de diagnostic s'ouvre (aucun bouton dans
-l'interface, uniquement ce raccourci).
+il n'y a pas de menu « aide » : lancez Holaf-Mix puis faites un **clic droit
+n'importe où → Debug window**.  Une fenêtre de diagnostic s'ouvre.
 
 Elle rassemble, en un seul endroit, ce qu'il fallait sinon demander en
 commandes shell (`pactl`, `pw-cli`, `pw-link`, `pw-top`, `holafctl status`) :

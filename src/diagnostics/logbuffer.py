@@ -1,9 +1,9 @@
 """In-memory log ring buffer (last N log lines, for the diagnostics window).
 
 The app logs to stderr today, which is useless once it runs from a desktop
-launcher: the user has no terminal to copy from.  The hidden diagnostics window
-(Ctrl+Shift+D, see :mod:`src.ui.diagnostics_dialog`) therefore needs the last
-few hundred log lines *inside the process*.
+launcher: the user has no terminal to copy from.  The diagnostics window
+(right click → *Debug window*, see :mod:`src.ui.diagnostics_dialog`) therefore
+needs the last few hundred log lines *inside the process*.
 
 Design constraints:
 

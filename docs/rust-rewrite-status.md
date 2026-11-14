@@ -336,12 +336,15 @@ Tests : `rust/crates/holaf-pw/tests/bus_naming.rs` (live) — noms dérivés du
 libellé + collisions, idempotence d'un apply répété, renommage (bus et chaîne FX),
 suppression d'un strip renommé, remplacement d'un nœud `Holaf_Strip_*`.
 
-## 2.5 Fenêtre de diagnostic (`Ctrl+Shift+D`)
+## 2.5 Fenêtre de diagnostic (clic droit → « Debug window »)
 
-Un outil de debug caché, ouvrable uniquement au clavier (`Ctrl+Shift+D`, aucun
-menu ni bouton) : il remplace la collection manuelle de `pactl` / `pw-cli` /
-`pw-link` / `pw-top` / `holafctl status` par une fenêtre unique + un rapport
-texte copiable en un clic (voir la section « Dépannage » du README).
+Un outil de debug, ouvert depuis le menu contextuel de l'application (clic droit
+n'importe où → **Debug window** ; il n'y a aucun bouton dédié) : il remplace la
+collection manuelle de `pactl` / `pw-cli` / `pw-link` / `pw-top` /
+`holafctl status` par une fenêtre unique + un rapport texte copiable en un clic
+(voir la section « Dépannage » du README).  Le même menu porte *Restart audio
+engine* et *Open project page* (`src/ui/main_window.py`,
+`build_app_context_menu`).
 
 * `src/diagnostics/collector.py` — **collecte pure, sans Qt** :
   `collect_report(engine, options)` → dict (environnement, `engine.status()`,

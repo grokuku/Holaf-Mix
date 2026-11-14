@@ -6,7 +6,8 @@ Two independent halves, on purpose:
   no global state: it takes the audio engine (either backend) plus an options
   dict and returns a plain report dict, so it is unit-testable on a machine
   without PySide6 (headless CI / container).
-* :mod:`src.ui.diagnostics_dialog` — the Qt window (Ctrl+Shift+D).  It only
+* :mod:`src.ui.diagnostics_dialog` — the Qt window (opened from the app
+  context menu: right click → *Debug window*).  It only
   *displays* what the collector produced and never touches PipeWire or the
   engine directly, so a collection bug can never freeze the UI thread.
 
