@@ -567,6 +567,23 @@ fn draw_diagnostics(state: &mut AppState, ui: &mut Ui) {
                             "captures — recorder: {}",
                             report.recorder.summary()
                         ));
+                        // Which daemon the recorder reaches: two different
+                        // PipeWire clients are enough to make every `--target`
+                        // resolve to nothing.
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "recorder daemon: {}",
+                                report.recorder.endpoint()
+                            ))
+                            .size(10.0)
+                            .weak(),
+                        );
+                        if let Some(note) = report.captures.note() {
+                            ui.label(
+                                egui::RichText::new(format!("! no capture: {note}"))
+                                    .color(egui::Color32::from_rgb(0xd0, 0x60, 0x60)),
+                            );
+                        }
                         if report.captures.is_empty() {
                             ui.label(
                                 egui::RichText::new(

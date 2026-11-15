@@ -403,6 +403,14 @@ fn simulated_captures(case: &str) -> Result<holaf_ui::diagnostics::CaptureSummar
         uid: uid.to_string(),
         source: source.to_string(),
         target: source.trim_end_matches(".monitor").to_string(),
+        // The exact line the app spawns (the `-P` property is the only argument a
+        // shell would misread, hence the quotes).
+        command: format!(
+            "{} --record -P '{{\"stream.capture.sink\":true}}' --target {} --format f32 --rate \
+             48000 --channels 2 -",
+            holaf_ui::diagnostics::default_recorder(),
+            source.trim_end_matches(".monitor")
+        ),
         monitor: source.ends_with(".monitor"),
         pid: Some(4211),
         state,

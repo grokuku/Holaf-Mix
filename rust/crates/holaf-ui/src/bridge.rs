@@ -911,23 +911,36 @@ mod pw {
     ) {
         let Some(backend) = backend.as_mut() else {
             capture.stop_all();
+            capture
+                .stats()
+                .set_note("the engine is not connected - no capture can run");
             uids.clear();
             return;
         };
+        // Every bail-out below is recorded **in the report**, not only in the
+        // log: a capture that never starts is one of the ways all the VU bars
+        // read 0.000 while the graph is perfectly healthy, and the user cannot
+        // read a log (the app is started from a .desktop file).
         let sources = match backend.meter_sources() {
             Ok(value) => engine_json::meter_sources(&value),
             Err(err) => {
-                log::debug!("metering: meter_sources failed: {err}");
+                log::warn!("metering: meter_sources failed: {err}");
                 capture.stop_all();
+                capture
+                    .stats()
+                    .set_note(format!("the engine refused `meter_sources`: {err}"));
                 uids.clear();
                 return;
             }
         };
         if sources.is_empty() {
             if !capture.is_empty() {
-                log::debug!("metering: the engine reports no source");
+                log::warn!("metering: the engine reports no source");
             }
             capture.stop_all();
+            capture
+                .stats()
+                .set_note("the engine reports no metering source (running=false, or no strip)");
             uids.clear();
             return;
         }
@@ -935,6 +948,7 @@ mod pw {
         let mut wanted: Vec<String> = sources.keys().cloned().collect();
         wanted.sort();
         let slots = board.assign(&wanted);
+        capture.stats().clear_note();
         // `sync` takes the uid→source map; `wanted` only drives the slot order.
         capture.sync(&sources, &slots, board);
         *uids = wanted;

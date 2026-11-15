@@ -356,22 +356,30 @@ fn spawn_stream(
     // needs `stream.capture.sink` (see the module docs — without either, the
     // stream quietly records the default source and the meter stays dark).
     let (node, monitor) = capture_target(source);
-    let mut command = Command::new(recorder);
-    command.arg("--record");
+    // The arguments are built as data first, so the **exact** command line can be
+    // published to the report: `pw-cat` is an external binary whose options are
+    // not ours to assume (a 1.x may refuse one of them), and a user who can paste
+    // the command learns more in one second than from any log line.
+    let mut args: Vec<String> = vec!["--record".to_string()];
     if monitor {
-        command.arg("-P").arg(MONITOR_PROPERTIES);
+        args.push("-P".to_string());
+        args.push(MONITOR_PROPERTIES.to_string());
     }
-    let mut child = command
-        .arg("--target")
-        .arg(node)
-        .arg("--format")
-        .arg("f32")
-        .arg("--rate")
-        .arg(METER_RATE.to_string())
-        .arg("--channels")
-        .arg(METER_CHANNELS.to_string())
+    args.extend([
+        "--target".to_string(),
+        node.to_string(),
+        "--format".to_string(),
+        "f32".to_string(),
+        "--rate".to_string(),
+        METER_RATE.to_string(),
+        "--channels".to_string(),
+        METER_CHANNELS.to_string(),
         // `-` = raw stream on stdout (verified on pw-cat 0.3.65 and 1.x).
-        .arg("-")
+        "-".to_string(),
+    ]);
+    let command_line = render_command(recorder, &args);
+    let mut child = Command::new(recorder)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Kept, and drained into the log: a `pw-cat` that cannot open its
@@ -385,10 +393,17 @@ fn spawn_stream(
             // not with the base `pipewire` one): a cause the report can name,
             // unlike a dark bar and a log line nobody sees.
             let reason = format!("{recorder}: {err}");
-            stats.spawn_failed(uid, source, node, monitor, &reason);
+            stats.spawn_failed(uid, source, node, monitor, &command_line, &reason);
             reason
         })?;
-    stats.started(uid, source, node, monitor, Some(child.id()));
+    stats.started(
+        uid,
+        source,
+        node,
+        monitor,
+        Some(child.id()),
+        &command_line,
+    );
 
     // Every failure path below must reap the child: a `pw-cat` left running with
     // no reader would hold the graph open for the whole session.
@@ -543,6 +558,26 @@ fn spawn_stream(
         stderr,
         exit_reported: false,
     })
+}
+
+/// Render `program` + `args` as a line that can be pasted into a shell.
+///
+/// Only what a shell would misread is quoted (the JSON property is the only such
+/// argument here), so the line stays readable in the report:
+/// `pw-cat --record -P '{"stream.capture.sink":true}' --target … -`.
+pub fn render_command(program: &str, args: &[String]) -> String {
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        if arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || "\"'${}".contains(c)) {
+            line.push('\'');
+            line.push_str(arg);
+            line.push('\'');
+        } else {
+            line.push_str(arg);
+        }
+    }
+    line
 }
 
 /// Fill `buffer` completely, or report how much arrived.
@@ -865,9 +900,14 @@ mod tests {
         script.to_string_lossy().into_owned()
     }
 
-    /// Read the board for up to 2 s, returning the last level seen.
+    /// Read the board for up to 5 s, returning the last level seen.
+    ///
+    /// 5 s (not 2) because the whole test binary runs in parallel and every
+    /// capture here spawns a real child: a loaded machine can take a second to
+    /// schedule the script, and a test that fails on a busy CI box teaches
+    /// nothing.  It returns as soon as a level arrives.
     fn wait_for_level(board: &MeterBoard, uid: &str) -> [f32; 2] {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut last = [0.0, 0.0];
         while std::time::Instant::now() < deadline {
             last = board.read(uid).unwrap_or([0.0, 0.0]);
@@ -994,9 +1034,10 @@ mod tests {
         script.to_string_lossy().into_owned()
     }
 
-    /// Wait until `predicate` holds, or give up after 2 s (a slow container).
+    /// Wait until `predicate` holds, or give up after 5 s (a loaded machine
+    /// spawns these children in bursts — see [`wait_for_level`]).
     fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if predicate() {
                 return true;
@@ -1038,6 +1079,41 @@ mod tests {
             facts.state
         );
         capture.stop_all();
+    }
+
+    /// The command line the report prints must be **pasteable**: the `-P` JSON is
+    /// the one argument a shell would split, so it must come out quoted, and the
+    /// rest must stay readable.
+    #[test]
+    fn the_reported_command_line_is_pasteable() {
+        let args: Vec<String> = [
+            "--record",
+            "-P",
+            MONITOR_PROPERTIES,
+            "--target",
+            "Holaf_Bus_Mic",
+            "--format",
+            "f32",
+            "--rate",
+            "48000",
+            "--channels",
+            "2",
+            "-",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let line = render_command("pw-cat", &args);
+        assert_eq!(
+            line,
+            "pw-cat --record -P '{\"stream.capture.sink\":true}' --target Holaf_Bus_Mic \
+             --format f32 --rate 48000 --channels 2 -"
+        );
+        // A path with a space is quoted too (a wrapper script in /tmp/some dir).
+        assert_eq!(
+            render_command("/tmp/a b/pw-cat", &["--record".to_string()]),
+            "/tmp/a b/pw-cat --record"
+        );
     }
 
     /// `detect_sample_format` is what turns “impossible block” into an actionable

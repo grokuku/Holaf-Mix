@@ -325,6 +325,17 @@ pub struct RecorderProbe {
     pub path: Option<String>,
     /// First line of `<command> --version`, when it could be read.
     pub version: Option<String>,
+    /// `PIPEWIRE_REMOTE` (the daemon name/address `pw-cat` will connect to).
+    ///
+    /// The engine and the recorder are two different clients of PipeWire: if
+    /// they do not reach the **same** daemon, every `--target` resolves to
+    /// nothing, `pw-cat` records the default source and the meters stay dark
+    /// while the graph is healthy.  Printing it costs one line and removes the
+    /// guesswork.
+    pub remote: Option<String>,
+    /// `XDG_RUNTIME_DIR` (where the default socket lives), then
+    /// `PIPEWIRE_RUNTIME_DIR` when it is set.
+    pub runtime_dir: Option<String>,
 }
 
 impl RecorderProbe {
@@ -354,6 +365,23 @@ impl RecorderProbe {
             }
         ));
         line
+    }
+
+    /// The daemon/socket the recorder will connect to, on one line
+    /// (`remote default · XDG_RUNTIME_DIR=/run/user/1000`).
+    ///
+    /// A `pw-cat` that reaches *another* daemon than the engine resolves no
+    /// `--target` at all and the bars stay dark with a healthy graph — this line
+    /// is what makes that visible in a pasted report.
+    pub fn endpoint(&self) -> String {
+        format!(
+            "remote {} · {}",
+            self.remote.as_deref().unwrap_or("default"),
+            match &self.runtime_dir {
+                Some(dir) => format!("XDG_RUNTIME_DIR={dir}"),
+                None => "XDG_RUNTIME_DIR unset".to_string(),
+            }
+        )
     }
 
     /// Can a capture possibly start?
@@ -458,6 +486,13 @@ pub struct CaptureFacts {
     pub source: String,
     /// What `pw-cat --target` really received (the node name).
     pub target: String,
+    /// The **exact** command line that was spawned, quoted for a shell.
+    ///
+    /// This is the single most actionable line of the whole section: the user can
+    /// paste it and see what `pw-cat` really does on their machine (whether
+    /// `-P '{"stream.capture.sink":true}'` is accepted there, whether the target
+    /// resolves, what format comes out).
+    pub command: String,
     /// Is the target a **sink monitor** (`-P stream.capture.sink=true`)?
     pub monitor: bool,
     /// The child's pid, `None` when it never started.
@@ -531,6 +566,11 @@ pub struct CaptureSummary {
     pub rejects: BTreeMap<String, u64>,
     /// One entry per strip the engine asked for, sorted by uid.
     pub sources: Vec<CaptureFacts>,
+    /// Why **no** capture was started, when that is the case (the engine
+    /// refused `meter_sources`, reported none, or is not connected).  Written by
+    /// the engine thread — the only place that knows — and printed by the
+    /// CAPTURES section: “no capture is running” alone names no cause.
+    pub note: Option<String>,
 }
 
 impl CaptureSummary {
@@ -566,6 +606,18 @@ impl CaptureSummary {
         self.rejects.get(reason.name()).copied().unwrap_or(0)
     }
 
+    /// Test helper: a note without a live registry (production goes through
+    /// [`CaptureRegistry::set_note`]).
+    #[cfg(test)]
+    fn set_note_for_test(&mut self, note: &str) {
+        self.note = Some(note.to_string());
+    }
+
+    /// Did the engine thread say why it started no capture?
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref().filter(|note| !note.is_empty())
+    }
+
     /// The capture that best explains a failure (a failed spawn first, then an
     /// ended stream), for a finding's hint.
     pub fn first_failure(&self) -> Option<&CaptureFacts> {
@@ -598,6 +650,8 @@ struct CaptureInner {
     rejected: u64,
     rejects: BTreeMap<String, u64>,
     sources: BTreeMap<String, CaptureEntry>,
+    /// Why no capture runs (see `CaptureSummary::note`).
+    note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -635,6 +689,7 @@ impl CaptureRegistry {
         target: &str,
         monitor: bool,
         pid: Option<u32>,
+        command: &str,
     ) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -646,6 +701,7 @@ impl CaptureRegistry {
                     uid: uid.to_string(),
                     source: source.to_string(),
                     target: target.to_string(),
+                    command: command.to_string(),
                     monitor,
                     pid,
                     state: CaptureState::Waiting,
@@ -672,6 +728,7 @@ impl CaptureRegistry {
         source: &str,
         target: &str,
         monitor: bool,
+        command: &str,
         reason: &str,
     ) {
         let Ok(mut inner) = self.inner.lock() else {
@@ -684,6 +741,7 @@ impl CaptureRegistry {
                     uid: uid.to_string(),
                     source: source.to_string(),
                     target: target.to_string(),
+                    command: command.to_string(),
                     monitor,
                     pid: None,
                     state: CaptureState::Failed {
@@ -791,6 +849,21 @@ impl CaptureRegistry {
         }
     }
 
+    /// Record **why no capture runs** (the engine side of the chain): the report
+    /// prints it instead of leaving “no capture is running” to the reader.
+    pub fn set_note(&self, note: impl Into<String>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.note = Some(note.into());
+        }
+    }
+
+    /// Drop the note (captures are running again).
+    pub fn clear_note(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.note = None;
+        }
+    }
+
     /// Everything, as a plain value (the report never holds the mutex).
     pub fn summary(&self) -> CaptureSummary {
         let Ok(inner) = self.inner.lock() else {
@@ -814,6 +887,7 @@ impl CaptureRegistry {
             rejected: inner.rejected,
             rejects: inner.rejects.clone(),
             sources,
+            note: inner.note.clone(),
         }
     }
 }
@@ -841,6 +915,14 @@ pub struct Report {
     /// The capture children themselves: source, pid, state, blocks, rejects,
     /// last level and what `pw-cat` said on stderr (see [`CaptureSummary`]).
     pub captures: CaptureSummary,
+    /// Does this build/engine actually instrument the captures?
+    ///
+    /// `false` (a mock bridge, `--no-default-features`, a report built without
+    /// capture facts) means an *empty* [`Report::captures`] proves nothing: the
+    /// absence of a capture cannot be reported as a failure there.  `true` means
+    /// the engine thread publishes a registry, so “no capture running” while the
+    /// engine names sources is a real error (`metering_not_started`).
+    pub captures_instrumented: bool,
     /// Which recorder the captures spawn, resolved on this machine.
     pub recorder: RecorderProbe,
     pub system: SystemFacts,
@@ -961,6 +1043,7 @@ impl Report {
             meter_missing: inputs.meter_missing.to_vec(),
             meter_levels: inputs.meter_levels.to_vec(),
             captures: inputs.captures.cloned().unwrap_or_default(),
+            captures_instrumented: inputs.captures.is_some(),
             recorder: recorder_probe(),
             system: SystemFacts {
                 app_version: APP_VERSION.to_string(),
@@ -1350,6 +1433,37 @@ impl Report {
         // genuinely silent bus produced the same report — the user's “METERING:
         // TOUS les niveaux à 0.000”, which named no cause at all.
         let captures = &self.captures;
+
+        // **The engine names sources but this UI records none.**  That is the
+        // other half of “all the bars read 0.000”: the capture never even
+        // *started* (the engine thread could not ask, or the board had no slot),
+        // and no `pw-cat` exists to describe.  Nothing else in the report can
+        // show it — `meter_sources` is present in the status payload while the
+        // CAPTURES section is empty.
+        if self.captures_instrumented && engine.meter_sources > 0 && captures.is_empty() {
+            findings.push(
+                Finding::new(
+                    "metering_not_started",
+                    Severity::Error,
+                    format!(
+                        "the engine declares {} metering source(s) but this UI started no capture \
+                         at all{}",
+                        engine.meter_sources,
+                        self.captures
+                            .note()
+                            .map(|note| format!(" — {note}"))
+                            .unwrap_or_default()
+                    ),
+                )
+                .with_hint(
+                    "the capture lives in the engine thread: an engine that answers `status` but \
+                     refuses `meter_sources` (or a disconnect) leaves every bar at 0.000 — check \
+                     the Journal tab (a warning is logged on every re-sync), then restart the \
+                     audio engine from the tray menu",
+                ),
+            );
+        }
+
         if captures.never_streamed() {
             let failed = captures.count("failed");
             let ended = captures.count("ended");
@@ -1385,12 +1499,11 @@ impl Report {
                     self.recorder.command
                 )
             } else {
-                format!(
-                    "the captures are running but their stdout stays empty: check that the \
-                     target node exists (`pw-cli ls Node`) and that `{}` writes f32le (a WAV \
-                     header or another sample format would be counted as “partial” blocks)",
-                    self.recorder.command
-                )
+                "the captures are running but their stdout stays empty: paste the exact command \
+                 from the CAPTURES section in a terminal (it is printed under each source), check \
+                 that the target node exists (`pw-cli ls Node`) and that the recorder writes f32le \
+                 — a WAV header or another sample format would be counted as “partial” blocks"
+                    .to_string()
             };
             findings.push(
                 Finding::new("metering_dead", Severity::Error, message).with_hint(hint),
@@ -1764,8 +1877,17 @@ impl Report {
         // cannot explain a bar at 0.000 (nor a bar pinned at 1.000).
         lines.push("CAPTURES".to_string());
         lines.push(format!("  recorder        : {}", self.recorder.summary()));
+        lines.push(format!("  recorder daemon : {}", self.recorder.endpoint()));
+        if let Some(note) = self.captures.note() {
+            lines.push(format!("  ! no capture    : {note}"));
+        }
         if self.captures.is_empty() {
-            lines.push("  (no capture is running - the engine thread has asked for no source)".to_string());
+            lines.push(if self.captures_instrumented {
+                "  (no capture is running - the engine thread has asked for no source)".to_string()
+            } else {
+                "  (this build/engine does not instrument the captures: no pid/state to show)"
+                    .to_string()
+            });
         } else {
             let rejects = if self.captures.rejects.is_empty() {
                 String::new()
@@ -1809,6 +1931,7 @@ impl Report {
                     }
                 ));
                 lines.push(format!("        {}", facts.describe()));
+                lines.push(format!("        $ {}", facts.command));
                 for line in &facts.stderr_tail {
                     lines.push(format!("        stderr: {line}"));
                 }
@@ -2210,6 +2333,20 @@ pub fn recorder_probe() -> RecorderProbe {
         command,
         path: path.map(|path| path.display().to_string()),
         version,
+        // The recorder is a **second** PipeWire client: it must reach the same
+        // daemon as the engine, otherwise every `--target` resolves to nothing
+        // and the meters stay dark on a perfectly healthy graph.
+        remote: std::env::var("PIPEWIRE_REMOTE")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        runtime_dir: std::env::var("PIPEWIRE_RUNTIME_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("XDG_RUNTIME_DIR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            }),
     }
 }
 
@@ -2464,6 +2601,11 @@ mod tests {
             uid: uid.to_string(),
             source: source.to_string(),
             target: source.trim_end_matches(".monitor").to_string(),
+            command: format!(
+                "pw-cat --record -P '{{\"stream.capture.sink\":true}}' --target {} --format f32 \
+                 --rate 48000 --channels 2 -",
+                source.trim_end_matches(".monitor")
+            ),
             monitor: source.ends_with(".monitor"),
             pid: Some(4242),
             state,
@@ -2486,6 +2628,7 @@ mod tests {
             rejected,
             rejects: BTreeMap::new(),
             sources,
+            note: None,
         }
     }
 
@@ -2715,6 +2858,69 @@ mod tests {
         assert_eq!(report.errors(), 0, "{:?}", report.findings);
     }
 
+    /// **The engine names sources, the UI records none.**  The capture never
+    /// even started (the engine thread could not ask, the board had no slot, the
+    /// bridge is not connected), so there is no `pw-cat` to describe — the old
+    /// report showed seven bars at 0.000 and nothing else.
+    #[test]
+    fn no_capture_started_at_all_is_an_error_naming_the_reason() {
+        let status = healthy_status();
+        let strips = strips();
+        let mut captures = CaptureSummary::default();
+        captures.set_note_for_test(
+            "the engine refused `meter_sources`: the engine is not connected",
+        );
+        let levels = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [0.0_f32, 0.0]),
+            ("out-casque".to_string(), "Casque".to_string(), [0.0, 0.0]),
+        ];
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &levels,
+            captures: Some(&captures),
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        assert!(report.captures_instrumented);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_not_started")
+            .unwrap_or_else(|| panic!("no metering_not_started in {:?}", report.findings));
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding.message.contains("declares 1 metering source(s)"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains("refused `meter_sources`"),
+            "{}",
+            finding.message
+        );
+        let text = report.text();
+        assert!(text.contains("! no capture    :"), "{text}");
+
+        // A report whose capture chain is not instrumented says nothing (an
+        // empty section there proves nothing).
+        let plain = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        assert!(!plain.captures_instrumented);
+        assert!(
+            !plain
+                .findings
+                .iter()
+                .any(|finding| finding.id == "metering_not_started"),
+            "{:?}",
+            plain.findings
+        );
+    }
+
     /// The CAPTURES section must be **self-explanatory**: which recorder, whether
     /// it exists, what each capture targets, its pid/state/blocks and what
     /// `pw-cat` said.  It is the section the user will paste.
@@ -2762,14 +2968,28 @@ mod tests {
         assert!(text.contains("Mic ") && text.contains("Casque"), "{text}");
 
         // No capture at all: the section says so instead of reading like a
-        // truncated report.
+        // truncated report — and it distinguishes “nothing runs” (instrumented)
+        // from “this build shows no capture state” (no registry).
         let empty = Report::collect(&Inputs::empty(&[]));
+        assert!(!empty.captures_instrumented);
         assert!(
             empty
                 .text()
-                .contains("(no capture is running - the engine thread has asked for no source)"),
+                .contains("(this build/engine does not instrument the captures"),
             "{}",
             empty.text()
+        );
+        let not_running = Report::collect(&Inputs {
+            captures: Some(&CaptureSummary::default()),
+            ..Inputs::empty(&[])
+        });
+        assert!(not_running.captures_instrumented);
+        assert!(
+            not_running
+                .text()
+                .contains("(no capture is running - the engine thread has asked for no source)"),
+            "{}",
+            not_running.text()
         );
     }
 
@@ -2780,8 +3000,22 @@ mod tests {
         let registry = CaptureRegistry::new();
         registry.set_recorder("pw-cat");
         assert_eq!(registry.recorder(), "pw-cat");
-        registry.started("in-mic", "Holaf_Bus_Mic.monitor", "Holaf_Bus_Mic", true, Some(77));
-        registry.started("out-casque", "alsa_input.x", "alsa_input.x", false, Some(78));
+        registry.started(
+            "in-mic",
+            "Holaf_Bus_Mic.monitor",
+            "Holaf_Bus_Mic",
+            true,
+            Some(77),
+            "pw-cat --record --target Holaf_Bus_Mic -",
+        );
+        registry.started(
+            "out-casque",
+            "alsa_input.x",
+            "alsa_input.x",
+            false,
+            Some(78),
+            "pw-cat --record --target alsa_input.x -",
+        );
         // A block on one of them, a refused block on the other.
         registry.block(
             "in-mic",
@@ -2840,13 +3074,30 @@ mod tests {
                 detail: "the process exited with code 3".to_string()
             })
         );
-        registry.spawn_failed("new", "source.x", "source.x", false, "ENOENT");
+        registry.spawn_failed(
+            "new",
+            "source.x",
+            "source.x",
+            false,
+            "pw-cat --record --target source.x -",
+            "ENOENT",
+        );
         let summary = registry.summary();
         assert_eq!(summary.count("failed"), 1);
         assert!(summary.first_failure().is_some());
         registry.stopped("in-mic");
         assert_eq!(registry.summary().sources.len(), 2);
         assert!(!registry.summary().sources.iter().any(|f| f.uid == "in-mic"));
+
+        // The engine-side note explains an empty registry (the other way every
+        // bar reads 0.000: no capture was even started).
+        registry.set_note("the engine is not connected - no capture can run");
+        assert_eq!(
+            registry.summary().note(),
+            Some("the engine is not connected - no capture can run")
+        );
+        registry.clear_note();
+        assert_eq!(registry.summary().note(), None);
 
         // The stderr tail is bounded (a chatty pw-cat must not grow the report).
         for index in 0..(STDERR_TAIL + 4) {

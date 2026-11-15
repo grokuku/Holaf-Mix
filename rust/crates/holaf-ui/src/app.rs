@@ -4209,9 +4209,10 @@ mod tests {
         assert!(text.contains("\nCAPTURES"), "{text}");
         assert!(text.contains("recorder        :"), "{text}");
         assert!(
-            text.contains("(no capture is running - the engine thread has asked for no source)"),
+            text.contains("(this build/engine does not instrument the captures"),
             "{text}"
         );
+        assert!(!report.captures_instrumented);
         assert!(report.captures.is_empty());
         assert!(
             !report

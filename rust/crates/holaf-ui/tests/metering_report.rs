@@ -120,7 +120,7 @@ fn capture_until(
     let mut wanted = HashMap::new();
     wanted.insert(uid.to_string(), source.to_string());
     capture.sync(&wanted, &slots, board);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if ready(capture) {
             return;

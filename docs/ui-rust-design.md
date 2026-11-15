@@ -636,7 +636,7 @@ pour le port, `engine_live` pour le moteur — + 1 doctest), et **343** avec
 
 | Manque | Effet visible | Étape |
 |---|---|---|
-| **tray icon** | **fait** (2026-11-14, backend **ksni**/D-Bus depuis le 2026-11-15 — plus de GTK), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte StatusNotifier, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Depuis le 2026-11-15 il porte **tout** le menu applicatif (l'ancien menu clic droit de la fenêtre n'existe plus) : `Show/Hide`, `MIDI port...`, `Restart audio engine`, `Debug window`, `Open project page`, `Quit`. La croix **quitte** par défaut (cacher sur Wayland est impossible : `Visible(false)` y est un no-op) ; cacher reste possible via `ui_rust.tray_hide_on_close` (défaut `false`). Voir §10quater | fait |
+| **tray icon** | **fait** (2026-11-14, backend **ksni**/D-Bus depuis le 2026-11-15 — plus de GTK), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte StatusNotifier, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Depuis le 2026-11-15 il porte **tout** le menu applicatif (l'ancien menu clic droit de la fenêtre n'existe plus) : `Show/Hide`, `MIDI port...`, `Restart audio engine`, `Debug window`, `Open project page`, `Quit`. La croix **cache dans le tray** par défaut (`ui_rust.tray_hide_on_close`, défaut `true` comme Qt) — la demande de l'utilisateur ; sans tray réel (aucun hôte StatusNotifier) elle **quitte**. Le no-op Wayland de `Visible(false)` est neutralisé par la paire `Visible` + `Minimized`. Voir §10quater | fait |
 | `pw-dump` dans le diagnostic | le port Rust ne lit pas `pw-dump` : le **démon** publie déjà son propre graphe (`status().holaf_nodes`, `strips[].node_name`, `pending`), ce qui couvre les constats utiles. En revanche le **quantum** est publié (`status.timing`, depuis `pw-metadata -n settings` : `rate`, `quantum`, `force-quantum`, min/max) et `small_quantum` (< 256) est actif ; les compteurs **ERR** ne sont disponibles que si `pw-top -b` existe (PipeWire ≥ 0.3.66) — en 0.3.65 le binaire n'a pas de mode batch, donc `pwt_errors` reste muet et `pw_top_unavailable` (info) affiche la raison exacte. Rien n'est inventé | assumé |
 | routage applicatif côté démon | **fait** : `Backend::app_list` liste les flux de sortie audio (`pactl -f json list sink-inputs` + `list sinks` pour résoudre le `node.name` du bus) en excluant les flux du démon (son pid, ses enfants — les `pw-cat` de métrage —, ses nœuds `Holaf_*` et l'app Qt), et `app_move` déplace le flux via le gestionnaire de session (`pactl move-sink-input`) **puis relit** la liste pour vérifier que le flux est bien sur le bus ; `stub: true` n'est plus renvoyé | fait |
 | apprentissage MIDI par propriété | **fait** : le bouton MIDI d'un strip ouvre le menu Qt (`Learn Volume` / `Learn Mute` / `Learn Mono`, `Clear Mappings`, plus `Cancel learn` quand un learn est armé) ; voir §10ter | fait |
@@ -678,7 +678,10 @@ cargo run -p holaf-ui --bin holaf-ui-snapshot -- \
     --out ../docs/ui-rust-dialog.png --height 700
 # --dialog : diagnostics | apps | fx | device | add | delete | menu
 #            midi-port | midi-port-none | midi-learn | midi-menu
-# --dialog-tab : summary | engine | graph | system
+# --dialog-tab : summary | engine | graph | system | journal
+# --captures : dead | misread | live   (section CAPTURES de l'onglet Graph ;
+#              le moteur mock ne lance aucun pw-cat, donc sans ce drapeau la
+#              section ne peut montrer que « no capture is running »)
 ```
 
 Un dialogue est une `egui::Area` : il flotte **au-dessus** de la fenêtre et ne
@@ -1044,14 +1047,19 @@ instantanément — d'où le test `a_menu_survives_the_idle_frames_after_it_open
 
 `close_action(available, hide_on_close)` encode la règle de `closeEvent` de Qt :
 **cacher** seulement si `available()` **et** la préférence
-`ui_rust.tray_hide_on_close` ; sinon **quitter**.  Le défaut est passé à `false`
-le 2026-11-15 : sur Wayland un client **ne peut pas** cacher son toplevel
-(`ViewportCommand::Visible(false)` n'a pas d'équivalent dans le protocole), donc
-« cacher » annulait la fermeture sans rien cacher — « la croix ne ferme plus la
-fenêtre ».  Quand la préférence est active, `send_visible()` envoie aussi
-`Minimized`, qui marche sur les deux backends.  Cacher sans moyen de revenir
-laisserait un processus inatteignable — c'est précisément ce que le code Qt
-évitait avec `isSystemTrayAvailable()`.
+`ui_rust.tray_hide_on_close` ; sinon **quitter**.  Le défaut est **`true`** (la
+demande de l'utilisateur : « la croix quitte complètement le programme, moi je
+pensais que ça allait juste fermer la fenêtre pour ne laisser que le tray
+icon »).  Il avait été mis à `false` le 2026-11-15 parce que « cacher » ne cachait
+rien sur Wayland : un client **ne peut pas** démapper son toplevel
+(`ViewportCommand::Visible(false)` n'a pas d'équivalent dans le protocole).  Le
+correctif est dans la *coquille*, pas dans la préférence :
+`tray::visibility_commands(visible)` — la seule copie de cette règle, utilisée
+par `main::send_visible` — envoie `Visible(x)` **et** `Minimized(!x)`, plus
+`Focus` au retour ; `Minimized` marche sur les deux backends.  Cacher sans moyen
+de revenir laisserait un processus inatteignable — c'est précisément ce que le
+code Qt évitait avec `isSystemTrayAvailable()`, et le repli « pas de tray →
+quitter » est vérifié en premier.
 
 `menu_action(id)` est une fonction pure : un id inconnu (menu d'une autre app,
 entrée future) est **ignoré**, jamais mal routé.
@@ -1217,13 +1225,40 @@ confondre avec un vrai niveau : si un `pw-cat` écrivait autre chose que du
 donnent des « échantillons » énormes → RMS ≫ 1 → barre collée à 1.00 avec des
 baisses de 15 % de temps en temps (exactement la description de l'utilisateur).
 `MeterSample::is_implausible` (pic > `IMPLAUSIBLE_PEAK` = +40 dBFS) rejette
-ces blocs : la barre reste **noire** et le journal dit « impossible block ».
-Un test de non-régression rejoue les vrais octets d'un flux s16 relu en f32.
+ces blocs : la barre reste **noire**, le journal dit « impossible block » et le
+rapport les **compte** (voir le paragraphe suivant).  Un test de non-régression
+rejoue les vrais octets d'un flux s16 relu en f32.
 Enfin le rapport de diagnostic a une section **METERING** (et un onglet Graph
 qui affiche `L=… R=…` par strip, comme le rapport Python) : « les VU sont à
 fond » et « les niveaux n'arrivent pas » ne se ressemblent plus.  Un finding
 `metering_pinned` signale « toutes les barres à 1.000 » (= au moins +6 dBFS
 partout : bus trop chaud, route doublée, ou format mal lu).
+
+Troisième rapport utilisateur — « METERING : TOUS les niveaux à 0.000 » — sans
+aucune cause visible.  La chaîne de mesure a maintenant sa propre section
+**CAPTURES** (rapport *et* onglet Graph), alimentée par chaque `pw-cat` lui-même
+via `diagnostics::CaptureRegistry` (partagé entre le thread moteur et le thread
+UI) : source demandée, nœud réellement passé à `--target` (et s'il est un monitor
+de sink), **pid**, état (`waiting`/`streaming`/`ended`/`failed`), blocs décodés et
+blocs rejetés (avec la raison : `implausible`, `partial`), dernier RMS/peak, âge du
+dernier bloc et les 5 dernières lignes de stderr du `pw-cat`.  En tête : le client
+d'enregistrement **résolu** (`pw-cat -> /usr/bin/pw-cat (version 0.3.65)`,
+`HOLAF_PW_CAT` = valeur effective), le **démon visé** (`remote` /
+`XDG_RUNTIME_DIR` : deux clients PipeWire différents suffisent à ce que tout
+`--target` ne résolve rien), les compteurs globaux, et sous chaque source la
+**ligne de commande exacte** lancée (`pw-cat --record -P
+'{"stream.capture.sink":true}' --target Holaf_Bus_Mic --format f32 --rate 48000
+--channels 2 -`) — collable telle quelle pour reproduire à la main.  Quatre
+findings en découlent : `metering_not_started` (erreur — le moteur déclare des
+sources mais l'UI n'a lancé **aucune** capture : `meter_sources` refusé, moteur
+déconnecté ; le rapport porte alors la raison en clair), `metering_dead` (erreur —
+aucun bloc n'est jamais arrivé : binaire absent/`pipewire-audio` non installé,
+stream mort aussitôt, ou stdout muet), `metering_implausible` (erreur — les blocs
+arrivent mais sont jetés, avec le format deviné sur les octets : `s16le`, `s32le`,
+`f64le`, en-tête WAV) et `metering_silent` (info — les blocs arrivent, tout est à 0 :
+bus muets, strips MUTED, ou nœud capté sans signal).  Plus rien de muet : le garde
+anti-format **compte** ce qu'il jette au lieu de le faire en silence, et un stream
+court se termine en `partial` au lieu de passer pour du silence.
 
 | RMS | dBFS | avant (`rms×5`) | 1er correctif (−60…0) | maintenant (−60…+6) |
 |---|---|---|---|---|
