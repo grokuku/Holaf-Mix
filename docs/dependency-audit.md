@@ -20,6 +20,7 @@
 | 5 | `tap-plugins` (étage TUBE WARMTH) | absent de BUILD.md et du PKGBUILD alors que `spa.rs` / `export_fixtures.py` nomment `tap_tubewarmth` | documenté + déclaré (Debian/Fedora en dépendance, **AUR sur Arch** ⇒ optdepend + doc) | **corrigé** |
 | 6 | Commentaire MSRV | « Arch ships 1.99.x as of 2026-11 » (périmé) | commentaire à jour (stable **1.100.0**, 2026-11-12) ; **pin `1.98` inchangé** (plancher volontaire) | **corrigé** |
 | 7 | `pipewire 0.10.1`, `egui/eframe 0.37`, `image 0.25.10`, `midir 0.11.1`, `signal-hook 0.4.6`, `env_logger 0.11.11` | — | — | **déjà à jour**, non touchés |
+| 8 | **Garde-fou CI « Wayland »** | cassé dès l'activation de `clipboard` : il exigeait « aucune crate `x11*` dans le graphe », or `arboard` déclare `x11rb` en dépendance **non optionnelle** (voir §5.2) | le garde-fou vérifie ce qui compte réellement — `eframe`/`winit` **sans** `x11`, aucun client X11 **C** (`x11-dl`, `xcb`, `libxcb`), et l'**origine** des crates `x11rb*` (uniquement `arboard`) — dans `scripts/check-wayland-guard.sh`, appelé par le workflow | **corrigé**, vérifié |
 
 Tests : **582 → 587** (`cargo test --workspace`), **356 → 362**
 (`cargo test -p holaf-ui --features tray`), 207 tests Python inchangés et verts.
@@ -38,7 +39,7 @@ Tests : **582 → 587** (`cargo test --workspace`), **356 → 362**
 | `gtk` | **0.18.2** (obligatoire avec `tray`) | **optionnel**, uniquement pour `--features tray-gtk` | §3.3 |
 | `zbus` | — | **5.19.0** (optionnel, feature `tray`) | sonde d'hôte StatusNotifier |
 | `muda` (via tray-icon) | 0.15.3 | 0.21.2 (`+ feature snapshot`) | publié en `com.canonical.dbusmenu` |
-| `arboard` | absent du graphe | **3.7.0** (via `eframe/clipboard`) | presse-papier X11/Wayland |
+| `arboard` | absent du graphe | **3.7.0** (via `eframe/clipboard`) | presse-papier X11/Wayland — tire `x11rb` **inconditionnellement** sur Linux, voir §5.2 |
 | `smithay-clipboard` | absent | **0.7.3** | protocole `wlr-data-control` (Wayland) |
 | `egui_system_font_provider` / `fontique` | absents | **0.37.0 / 0.11.1** | polices du système |
 | `pipewire`, `image`, `midir`, `signal-hook`, `env_logger` | 0.10.1 / 0.25.10 / 0.11.1 / 0.4.6 / 0.11.11 | identiques | déjà les dernières versions |
@@ -270,6 +271,99 @@ ldd rust/target/release/holaf-ui | grep -iE 'gtk|gdk|glib|pango|appindicator'   
 La deuxième est vérifiée automatiquement en CI (nouvelle étape), pour qu'une
 réintroduction silencieuse casse le job.
 
+### 5.2 « `holaf-ui` tire des crates X11 » — ce que c'est vraiment (`x11rb` via `arboard`)
+
+> MISE À JOUR 2026-11-15 (suite) — l'étape CI « Verify the Wayland window
+> backend » échouait sur `holaf-ui pulls an X11 crate without --features x11`
+> depuis l'activation de la feature `clipboard`. Voici la mesure, la raison, et
+> ce que le garde-fou vérifie désormais.
+
+**Mesure (`--features tray`, configuration livrée) :**
+
+```
+$ cargo tree -p holaf-ui --features tray -i x11rb
+x11rb v0.13.2
+└── arboard v3.7.0
+    └── egui-winit v0.37.0
+        └── eframe v0.37.0
+            └── holaf-ui v0.1.0
+$ cargo tree -p holaf-ui --features tray -i x11rb-protocol --depth 1
+x11rb-protocol v0.13.2
+x11rb v0.13.2
+```
+
+Ce sont les **deux seules** crates X11 du graphe livré
+(`cargo tree -e normal --prefix none --format '{p}' | grep -iE 'x11|xcb'` n'en
+liste aucune autre). Pas de `x11-dl`, pas de `xcb`/`libxcb`, pas de
+`as-raw-xcb-connection`, et **`tray-icon 0.26` + `ksni` n'en tire aucune**
+(`zbus` est du D-Bus pur).
+
+**Pourquoi on ne peut pas la retirer** (mesuré dans le `Cargo.toml` amont
+`arboard 3.7.0`, pas supposé) :
+
+```toml
+[target.'cfg(all(unix, not(any(target_os="macos", ...))))'.dependencies]
+x11rb = "0.13"          # ← ni `optional = true`, ni `dep:` dans une feature
+```
+
+Il n'existe donc **aucune combinaison de features** qui sorte `x11rb` du
+graphe : ses features sont `image-data`, `wayland-data-control`,
+`wl-clipboard-rs`, `windows-sys`, `core-graphics` — rien pour couper X11, et
+`x11rb` n'est pas optionnel. `egui-winit` déclare déjà `arboard` en
+`default-features = false, features = ["image-data"]` et transmet
+`arboard?/wayland-data-control` par sa feature `wayland` : **c'est déjà la
+configuration la plus « Wayland-only » possible**. Ajouter une dépendance
+directe à `arboard` (`default-features = false`) ne change rien — cargo unifie
+les features et `x11rb` reste.
+
+**Pourquoi c'est sans danger pour le bureau Wayland :**
+
+1. `arboard` choisit son backend **à l'exécution**
+   (`src/platform/linux/mod.rs`) : si `WAYLAND_DISPLAY` est défini il prend
+   `wlr-data-control` via `wl-clipboard-rs`, **sinon** X11. Sur le bureau de
+   l'utilisateur (Wayland exclusif) le chemin X11 n'est jamais emprunté — et
+   avec la feature `wayland-data-control` **active** (vérifiée par le
+   garde-fou), la copie fonctionne vraiment (c'était le bug « Copy report »).
+2. `x11rb` est une implémentation **X11 en Rust pur** (protocole par socket) :
+   **aucune bibliothèque C n'est liée** — `ldd rust/target/release/holaf-ui`
+   ne montre ni `libX11` ni `libxcb` (6 entrées + vdso au total, voir §2.2).
+3. Ce n'est **pas** `x11rb` qui décide du backend de fenêtre : ce rôle revient
+   à `winit`/`glutin`, dont le chemin X11 est `x11-dl` (+ `as-raw-xcb-connection`,
+   `xcb-*`). C'est cette distinction — « crate X11 présente » ≠ « client X11 » —
+   que l'ancien garde-fou ignorait.
+
+**Ce que le garde-fou vérifie maintenant** (`scripts/check-wayland-guard.sh`,
+appelé par `.github/workflows/build.yml`, exécutable localement à l'identique) :
+
+| # | Vérification | Pour les configurations |
+|---|---|---|
+| 1 | `eframe` et `winit` ont la feature `wayland` **et pas** la feature `x11` | défaut **et** `--features tray` |
+| 2 | aucune crate **client X11 C** : `x11-dl`, `xcb`, `xcb-*`, `libxcb`, `libx11`, `as-raw-xcb-connection`, `xkbcommon-x11` | défaut **et** `--features tray` |
+| 3 | chaque crate `x11rb`/`x11rb-protocol` présente est tirée **uniquement** par `arboard` (ou `x11rb`), jamais par `winit`/`glutin`/`eframe` — testé par `cargo tree -i <crate> --depth 1` | défaut **et** `--features tray` |
+| 4 | `arboard` a bien la feature `wayland-data-control` (sinon la copie ne quitte pas la fenêtre sous Wayland) | défaut **et** `--features tray` |
+| 5 | contrôle **positif** : `--features x11` compile et active réellement `eframe/x11` + `winit/x11` + `x11-dl` | `--features x11` |
+
+Le contrôle 5 sert de témoin : les règles 1–3 cherchent exactement ce que la
+configuration X11 contient, donc un garde-fou devenu aveugle (grep cassé,
+sortie vide) échouerait au lieu de passer.
+
+> **Piège mesuré, à ne pas réintroduire :** `cargo tree -e features` sur
+> l'arbre **complet** déduplique les occurrences répétées d'un paquet et
+> n'affiche la liste de ses features qu'une fois, parfois sur une occurrence
+> marquée `(*)` plus bas dans l'arbre. Un `grep 'eframe feature "x11"'` sur
+> l'arbre complet renvoie donc un **faux négatif**, même avec
+> `--features x11`. La forme fiable est la vue inverse par paquet :
+> `cargo tree -e features -i eframe --depth 1 --prefix none`.
+
+Commandes de référence (celles qui font foi) :
+
+```bash
+./scripts/check-wayland-guard.sh                                    # → garde PASSED
+cargo tree -p holaf-ui --features tray -i x11rb                     # → arboard seul
+cargo tree -p holaf-ui --features tray -e features -i eframe --depth 1 | grep x11   # → vide
+ldd rust/target/release/holaf-ui | grep -iE 'libx11|libxcb'         # → vide
+```
+
 ---
 
 ## 6. Vérifications effectuées
@@ -292,7 +386,10 @@ graphique, pas de bus de session) :
 | `pip download --no-deps -r requirements.txt` | les 6 paquets se résolvent (numpy 2.4.6, pyinstaller 6.22.3, PySide6 6.12.0, …) |
 | `python3 -m PyInstaller --version` | 6.22.3 (présent, donc `build.sh` peut packager) |
 | `cargo tree -p holaf-ui --features tray` | pas de `gtk`/`glib`/`gdk`/`pango`/`atk`/`libappindicator` |
-| `ldd rust/target/release/holaf-ui` (tray ksni) | 7 entrées, **0 bibliothèque GTK/GLib** |
+| `./scripts/check-wayland-guard.sh` | **PASSED** (les 5 contrôles du §5.2, sur `default` et `--features tray`, + le `cargo check --features x11`) |
+| `cargo tree -p holaf-ui --features tray -i x11rb` | `x11rb` ← `arboard` ← `egui-winit` ← `eframe` ← `holaf-ui` (seule provenance X11 du graphe livré) |
+| `cargo tree -p holaf-ui --features tray -e features -i eframe --depth 1` | `clipboard`, `default_fonts`, `glow`, `system_fonts`, `wayland` — **pas** `x11` |
+| `ldd rust/target/release/holaf-ui` (tray ksni) | 7 entrées, **0 bibliothèque GTK/GLib**, **0 `libX11`/`libxcb`** |
 | `cargo test -p holaf-ui --features tray --test tray_live` | OK (bus D-Bus privé + faux watcher : enregistrement + menu publié) |
 | régénération des captures (`holaf-ui-snapshot`) | 3 PNG régénérés, **déterministes** (deux runs ⇒ mêmes octets) |
 | `python3 -c "yaml.safe_load(...)"` sur `.github/workflows/build.yml` | YAML valide, 1 job |
@@ -339,6 +436,8 @@ Python / packaging / CI / doc :
 * `build.sh`, `scripts/build_rust.sh`
 * `packaging/PKGBUILD`, `packaging/holaf-mix.spec`
 * `.github/workflows/build.yml`
+* `scripts/check-wayland-guard.sh` — **nouveau** (garde-fou Wayland, exécutable
+  localement ; le workflow l'appelle au lieu d'inliner les `cargo tree`)
 * `BUILD.md`, `README.md`, `rust/README.md`
 * `docs/ui-rust-design.md`, `docs/migration-to-pure-rust.md`
 * `docs/dependency-audit.md` — **ce document**
@@ -363,3 +462,10 @@ Python / packaging / CI / doc :
    accepte une dépendance directe à `arboard` pour faire un aller-retour de
    lecture), le message pourra devenir exact même dans le cas « compositeur qui
    refuse `zwlr_data_control_manager_v1` ».
+5. **`x11rb` dans le graphe** : il ne peut disparaître que si `arboard` rend sa
+   dépendance X11 optionnelle (amont). Une PR amont `x11rb` en
+   `optional = true` + feature `x11` (activée par défaut pour ne rien casser)
+   permettrait alors `default-features = false` côté `egui-winit`/`holaf-ui` et
+   un garde-fou « zéro crate X11 » à nouveau littéral. En attendant, le
+   garde-fou du §5.2 vérifie l'**origine** et l'**absence de client X11 C**, ce
+   qui couvre le risque réel (XWayland / icône « X11 »).

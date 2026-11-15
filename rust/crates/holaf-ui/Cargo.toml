@@ -41,6 +41,18 @@ engine-pw = ["dep:holaf-pw"]
 # of claiming the text reached the desktop.  (Before this feature existed the
 # dialog always said "copied to the clipboard" while egui quietly filled its
 # in-app fallback string: the button lied.)
+#
+# This is the ONE feature that puts X11 crates into the shipped dependency
+# graph, and it cannot be avoided: `arboard` declares `x11rb` as a
+# **non-optional** Linux dependency, so no combination of features removes it
+# (`default-features = false` + `wayland-data-control` — already what
+# egui-winit asks for — still pulls it).  `x11rb` is a pure-Rust X11 *protocol*
+# implementation: under Wayland `arboard` never takes that path (it selects
+# `wl-clipboard-rs` as soon as `WAYLAND_DISPLAY` is set) and it links no C
+# library.  The CI guard therefore forbids the X11 **window** backend
+# (`eframe/x11`, `winit/x11`, `x11-dl`) and only admits `x11rb*` **from
+# `arboard`** — see `scripts/check-wayland-guard.sh` and
+# `docs/dependency-audit.md` §5.2.
 clipboard = ["eframe/clipboard"]
 # **System fonts** (eframe's `system_fonts` ⇒ `egui_system_font_provider` +
 # `fontique`): fallback fonts from the host, so a device name with emoji,

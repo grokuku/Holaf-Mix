@@ -133,6 +133,16 @@ Mesuré ici (`ldd rust/target/release/holaf-ui`) :
   (`libX11`, `libxcb`, `libXcursor`…), contrairement à l'ancien build
   libappindicator.
 
+> **Une crate X11 est tout de même dans le graphe `cargo`** : `x11rb` (et
+> `x11rb-protocol`), tirée **uniquement** par `arboard`, le presse-papier de la
+> feature `clipboard` — qui déclare `x11rb` sans possibilité de la couper
+> (`docs/dependency-audit.md` §5.2).  Ce n'est pas un client X11 : c'est du
+> protocole X11 en Rust pur, jamais utilisé sous Wayland (`arboard` prend son
+> chemin `wl-clipboard-rs` dès que `WAYLAND_DISPLAY` est défini) et liant
+> aucune bibliothèque C.  Le backend de **fenêtre**, lui, reste sans X11 :
+> garde-fou `scripts/check-wayland-guard.sh` (exécutable à la main, aussi
+> lancé par la CI).
+
 | | Arch | Debian / Ubuntu | Rôle |
 |---|---|---|---|
 | client Wayland | `wayland` | `libwayland-dev` | `libwayland-client.so.0`, **`dlopen`é** au run par `winit` (feature `wayland-sys/dlopen` → aucune édition de liens dans un build sans tray) |

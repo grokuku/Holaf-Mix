@@ -483,25 +483,34 @@ jobs:
         # a stray `x11` in a dependency's defaults would silently bring XWayland
         # back.
         #
+        # WHAT THE GUARD MEANS (it used to be « no crate matching `x11*` »,
+        # which is no longer achievable nor desirable):
+        #
+        #   * FORBIDDEN: eframe's `x11` feature, winit's `x11` backend, and any
+        #     X11 *C client* crate (`x11-dl`, `xcb`, `libxcb`,
+        #     `as-raw-xcb-connection`).  Those are what make the binary show up
+        #     as an X11/XWayland application — the actual bug.
+        #   * ALLOWED, but only from the clipboard: `x11rb`/`x11rb-protocol`.
+        #     `arboard` (eframe's `clipboard` feature, i.e. « Copy report »)
+        #     declares `x11rb` as a NON-optional Linux dependency, with no
+        #     feature to switch it off (`default-features = false` +
+        #     `wayland-data-control` — already what egui-winit asks for — still
+        #     pulls it).  `x11rb` is a pure-Rust X11 protocol implementation: it
+        #     is never used under Wayland (`arboard` picks its
+        #     `wl-clipboard-rs` path as soon as `WAYLAND_DISPLAY` is set) and it
+        #     links no C library (`ldd` shows no libX11/libxcb).
+        #     This is why the guard checks the *origin* of every X11 crate in
+        #     the graph (`cargo tree -i`) instead of their mere presence.
+        #
         # X11 stays available as an opt-in feature (`--features x11`) for an
         # X11-only machine; this step checks both, so neither can rot.
+        #
+        # The checks live in `scripts/check-wayland-guard.sh` so they can be run
+        # locally (`./scripts/check-wayland-guard.sh`) with the exact same rules.
         continue-on-error: false
         run: |
           set -euo pipefail
-          cd rust
-          # 1. The shipped configuration: Wayland only.
-          if cargo tree --locked -p holaf-ui -e normal | grep -qE '^.*\bx11(-dl|rb)? v'; then
-            echo "::error::holaf-ui pulls an X11 crate without --features x11"
-            exit 1
-          fi
-          cargo tree --locked -p holaf-ui -e features | grep -q 'wayland' \
-            || { echo "::error::the Wayland backend is gone from eframe"; exit 1; }
-          echo "  OK   holaf-ui is Wayland-only by default (no x11 crate)"
-          # 2. The opt-in X11 build still compiles.
-          cargo check --locked -p holaf-ui --features x11
-          cargo tree --locked -p holaf-ui --features x11 -e normal | grep -q 'x11-dl' \
-            || { echo "::error::--features x11 no longer enables the X11 backend"; exit 1; }
-          echo "  OK   holaf-ui builds with --features x11 (opt-in, not shipped)"
+          ./scripts/check-wayland-guard.sh
 
       - name: Verify generated SPA bindings (bindgen sanity)
         # Regression guard for upstream pipewire-rs issue #112: with an
