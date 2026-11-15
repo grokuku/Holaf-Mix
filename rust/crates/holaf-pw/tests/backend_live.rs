@@ -720,3 +720,80 @@ fn dedicated_fx_host_owns_the_mainloop_and_respawns() {
     backend.stop().expect("stop");
     assert!(!pid_alive(pid2), "the FX host (pid {pid2}) must not outlive stop()");
 }
+
+/// **Regression: a stereo bus routed into a MONO device must be linked.**
+///
+/// A card in the Pro Audio profile exposes one **mono** node per physical
+/// channel (`…-00.pro-output-0`, a single `playback_MONO` port) instead of a
+/// stereo `analog-stereo` node (two ports).  The port-pair matcher used to
+/// accept only `(stereo, stereo)` and `(mono, mono)`; `(stereo source, mono
+/// target)` produced **no pair at all**, so `apply_snapshot` kept the route
+/// pending, reported `degraded: true`, retried forever in the log — and the
+/// device stayed **completely silent** while the Python engine (`_auto_link_ports`,
+/// where `MONO` counts as the left channel) linked `left → MONO` and played.
+///
+/// Measured before the fix on this sandbox: `0` links, `degraded: true`,
+/// `pending: ["route:…"]`; after: `1` link, `degraded: false`, and audio
+/// arrives on the mono node.
+#[test]
+fn a_route_into_a_mono_device_is_linked() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    fresh_sandbox_daemon();
+
+    // A mono sink: exactly the port shape of a Pro Audio `pro-output-0`.
+    const MONO: &str = "alsa_output.holaf_test.pro-output-0";
+    let created = run(
+        "pactl",
+        &[
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={MONO}"),
+            "channels=1",
+        ],
+    );
+    assert!(
+        created.is_some(),
+        "pactl must be able to create a mono null-sink ({MONO})"
+    );
+
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    let mut mono_out = Strip::with_uid("o-mono", "Mono Out", StripType::Output);
+    mono_out.device_name = Some(MONO.to_string());
+    mono_out.volume = 0.5;
+    let mut source = Strip::with_uid("i-src", "Src", StripType::Input);
+    source.routes = vec!["o-mono".to_string()];
+
+    let res = backend
+        .apply_snapshot(&[mono_out, source])
+        .expect("apply_snapshot (mono device)");
+    assert_eq!(res["applied"], 2);
+    assert_eq!(
+        res["degraded"], false,
+        "a mono target is a usable route, not a pending one: {res}"
+    );
+    assert_eq!(res["pending"].as_array().map(Vec::len), Some(0), "{res}");
+
+    std::thread::sleep(Duration::from_millis(300));
+    let bus = node_id_by_name("Holaf_Bus_Src").expect("the input bus exists");
+    let device = node_id_by_name(MONO).expect("the mono device is in the graph");
+    let links = link_count(bus, device);
+    assert!(
+        links >= 1,
+        "the bus must be linked into the mono device (got {links} links) — \
+         without it the strip is silent while the graph looks healthy"
+    );
+    backend.stop().expect("stop");
+}

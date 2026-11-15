@@ -1813,25 +1813,7 @@ impl Engine {
             let dst_fr = view.port_fr(target.id, PortDir::In);
             drop(view);
 
-            let pairs: Vec<(u32, u32)> = if mono {
-                // Mono source: the left channel feeds **both** destination
-                // channels — never src_r as well (PipeWire SUMS linked inputs,
-                // which would add +6 dB on a correlated signal).
-                match (src_fl, dst_fl, dst_fr) {
-                    (Some(s), Some(dl), Some(dr)) => vec![(s, dl), (s, dr)],
-                    (Some(s), Some(dl), None) => vec![(s, dl)],
-                    _ => Vec::new(),
-                }
-            } else {
-                // Stereo: strict FL→FL / FR→FR.  The single-port fallbacks keep
-                // a genuinely mono node usable (one link, no duplication).
-                match (src_fl, src_fr, dst_fl, dst_fr) {
-                    (Some(sl), Some(sr), Some(dl), Some(dr)) => vec![(sl, dl), (sr, dr)],
-                    (Some(sl), None, Some(dl), None) => vec![(sl, dl)],
-                    (None, Some(sr), None, Some(dr)) => vec![(sr, dr)],
-                    _ => Vec::new(),
-                }
-            };
+            let pairs: Vec<(u32, u32)> = LiveView::port_pairs(src_fl, src_fr, dst_fl, dst_fr, mono);
 
             if pairs.is_empty() {
                 self.session

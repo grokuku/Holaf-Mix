@@ -268,6 +268,13 @@ pub fn strip_ui(
         },
     };
     let combo = combo_display(&mut child, &device_text, theme);
+    // The combo can only show the profile segment of the node name (see
+    // `device_display_name`): the tooltip carries the identity, so a user can
+    // always tell which node a strip is bound to and see a missing device.
+    let combo = match strip.device_name.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) => combo.on_hover_text(device_tooltip(name, device_presence)),
+        None => combo,
+    };
     // Where the button ended up, published for the device pop-up
     // (`dialogs::draw_device_picker`): the list unfolds *under the button*, like
     // the Qt `QComboBox` drop-down.  egui memory is the channel because views
@@ -638,13 +645,21 @@ pub fn pointer_pos(ui: &Ui, fallback: Rect) -> egui::Pos2 {
 
 /// What the device combo says for a bound strip.
 ///
-/// A device that the engine does not list is shown as `<name> (Not Found)`, the
-/// exact wording of `set_device_list` in Qt.  The label is then elided like the
-/// Qt `desc[:15] + "..."` rule, so a long node name cannot widen the combo
-/// (which is a fixed 90 px inside the strip).
+/// A device that the engine does not list is prefixed with `!` instead of the
+/// Qt `<name> (Not Found)` suffix.  The reason is measurable: the combo is a
+/// fixed 90 px box and the label is elided to 15 characters, so
+/// `<full node name> (Not Found)` — which is always longer than 15 characters —
+/// lost the **whole** marker and showed a meaningless fragment
+/// (`alsa_output.go…`).  The strip looked bound while nothing was routed, and
+/// the user had no way to see that the device was gone.  The marker now comes
+/// first so it can never be elided; the exact node name is one hover away
+/// (`views::strip` puts it in the tooltip).
+///
+/// The rest keeps the Qt `desc[:15] + "..."` rule, so a long node name cannot
+/// widen the combo.
 pub fn device_combo_text(device_name: &str, presence: DevicePresence) -> String {
     let mut text = match presence {
-        DevicePresence::Missing => format!("{device_name} (Not Found)"),
+        DevicePresence::Missing => format!("! {}", device_display_name(device_name)),
         DevicePresence::Found | DevicePresence::Unknown => device_display_name(device_name),
     };
     if text.chars().count() > 15 {
@@ -652,6 +667,24 @@ pub fn device_combo_text(device_name: &str, presence: DevicePresence) -> String 
         text.push('…');
     }
     text
+}
+
+/// The hover text of the device combo: the **exact** `node.name` a strip is
+/// bound to, plus what the engine thinks of it.
+///
+/// The combo itself can only show ~15 characters (`device_display_name` keeps
+/// the profile segment: `analog-stereo`, `pro-output-0`), which is ambiguous as
+/// soon as two devices of the same family are present — the user could not tell
+/// *which* node a strip was really on, nor notice that the stored name no
+/// longer exists.
+pub fn device_tooltip(device_name: &str, presence: DevicePresence) -> String {
+    match presence {
+        DevicePresence::Missing => format!(
+            "{device_name}\n(device not found: nothing is routed to it, and its meter stays dark)"
+        ),
+        DevicePresence::Found => device_name.to_string(),
+        DevicePresence::Unknown => format!("{device_name}\n(no device list from the engine yet)"),
+    }
 }
 
 #[cfg(test)]
@@ -697,11 +730,16 @@ mod tests {
         assert!(long.ends_with('…'), "{long}");
     }
 
+    /// **The marker must survive the elision.**  The combo is 90 px wide and
+    /// the label is cut at 15 characters, so the Qt wording
+    /// `<name> (Not Found)` — always longer than that — lost the *whole*
+    /// warning and showed `alsa_output.go…`: a strip whose device is gone
+    /// looked perfectly bound while nothing was routed to it.
     #[test]
     fn a_missing_device_is_shown_as_not_found() {
         assert_eq!(
             device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Missing),
-            "alsa_output.go…"
+            "! analog-stereo"
         );
         assert_eq!(
             device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Found),
@@ -712,11 +750,30 @@ mod tests {
             device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Unknown),
             "analog-stereo"
         );
-        // A short name fits, `(Not Found)` included.
-        assert_eq!(
-            device_combo_text("hp", DevicePresence::Missing),
-            "hp (Not Found)"
+        // A long profile segment is still elided, but after the marker.
+        let long = device_combo_text(
+            "alsa_output.usb-X-00.analog-surround-40",
+            DevicePresence::Missing,
         );
+        assert!(long.starts_with("! "), "{long}");
+        assert_eq!(long.chars().count(), 15, "{long}");
+        assert!(long.ends_with('…'), "{long}");
+        // A short name fits entirely.
+        assert_eq!(device_combo_text("hp", DevicePresence::Missing), "! hp");
+    }
+
+    /// The tooltip always carries the **whole** `node.name`, which is the only
+    /// way to tell two devices of the same family apart (the combo shows the
+    /// profile segment: `analog-stereo` for every analog card).
+    #[test]
+    fn the_device_tooltip_shows_the_full_node_name() {
+        let name = "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0";
+        assert_eq!(device_tooltip(name, DevicePresence::Found), name);
+        let missing = device_tooltip(name, DevicePresence::Missing);
+        assert!(missing.starts_with(name), "{missing}");
+        assert!(missing.contains("not found"), "{missing}");
+        let unknown = device_tooltip(name, DevicePresence::Unknown);
+        assert!(unknown.starts_with(name), "{unknown}");
     }
 
     /// Draw one strip headless in several heights: the layout maths must never

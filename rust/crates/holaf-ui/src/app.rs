@@ -1571,6 +1571,25 @@ impl AppState {
         self.last_meter_tick = now;
         for index in 0..self.strips.len() {
             let uid = self.strips[index].uid.clone();
+            // A strip whose device is **gone** must not show a level.  Its
+            // capture cannot resolve `<device>.monitor`, and `pw-cat` does not
+            // fail in that case: it silently records the *default source*
+            // (measured: a bogus `--target` recorded the default sink's monitor
+            // at full level).  The bar then mirrored whatever was playing
+            // elsewhere — a hot VU on a strip that makes no sound at all, which
+            // is exactly how a missing device used to be reported (it was not).
+            if devices::presence(&self.strips[index], &self.engine_devices)
+                == DevicePresence::Missing
+            {
+                if self.meter_missing.insert(uid.clone()) {
+                    log::warn!(
+                        "metering: {:?} is bound to a device the engine does not list - VU forced dark",
+                        self.strips[index].label
+                    );
+                }
+                self.feed_levels(&uid, [0.0, 0.0], dt);
+                continue;
+            }
             match board.read(&uid) {
                 Some(levels) => {
                     self.meter_missing.remove(&uid);
@@ -1720,25 +1739,48 @@ impl AppState {
 
     /// Re-bind the strips whose device survived under a new `node.name`.
     ///
-    /// Called whenever the engine reports its device list.  A repair rewrites
-    /// `device_name` (the user's config is then saved, like any other edit) and
-    /// schedules the debounced `apply_snapshot`, because the device a strip is
-    /// bound to *is* part of the graph plan.  A strip whose device is gone keeps
-    /// its `device_name` (never silently unbound: the device may come back) and
-    /// is listed in [`Self::missing_devices`] so the view shows `(Not Found)`.
+    /// Called whenever the engine reports its device list.  Only a **confident**
+    /// match ([`devices::MatchKind::is_confident`]) may rewrite `device_name`:
+    /// the new name is written to the model, the config is saved like any other
+    /// edit, and the debounced `apply_snapshot` is scheduled because the device
+    /// a strip is bound to *is* part of the graph plan.
+    ///
+    /// A *guessed* match (same vendor head + same profile suffix, different
+    /// instance — i.e. possibly another card, or another port such as a mono
+    /// `pro-output-0`) is **never written and never persisted**: it is reported
+    /// as a suggestion and the strip is listed as missing, so the user sees
+    /// `! <name>` and picks the device himself.  Silently saving a guess is how
+    /// a strip ends up bound to a node that does not carry its audio at all —
+    /// and it survives restarts, because the write is saved.
+    ///
+    /// A strip whose device is gone keeps its `device_name` (never silently
+    /// unbound: the device may come back) and is listed in
+    /// [`Self::missing_devices`] so the view shows the marker.
     pub fn reconcile_devices(&mut self) {
         let now = self.now;
         let (repairs, missing) = devices::reconcile(&self.strips, &self.engine_devices);
+        let mut missing = missing;
+        let (applied, guessed): (Vec<_>, Vec<_>) = repairs
+            .into_iter()
+            .partition(|repair| repair.kind.is_confident());
+        // A guess leaves the strip where it was: on a device that is not there.
+        for repair in &guessed {
+            missing.push((
+                repair.uid.clone(),
+                repair.label.clone(),
+                repair.declared.clone(),
+            ));
+        }
         self.missing_devices = missing.iter().map(|(uid, _, _)| uid.clone()).collect();
-        if repairs.is_empty() {
+        if applied.is_empty() && guessed.is_empty() {
             for (uid, label, declared) in &missing {
                 log::debug!("device of {label:?} ({uid}) is gone: {declared}");
             }
             return;
         }
-        for repair in &repairs {
-            // An approximate match is a *guess*: it is logged loudly, because it
-            // rewrites the user's configuration.
+        for repair in &applied {
+            // Anything but the exact stored name rewrites the user's
+            // configuration, so it is logged loudly.
             log::warn!(
                 "device {:?} of {:?} not found - re-bound to {:?} ({:?})",
                 repair.declared,
@@ -1750,12 +1792,40 @@ impl AppState {
                 self.strips[index].device_name = Some(repair.resolved.clone());
             }
         }
-        let summary = repairs
-            .iter()
-            .map(|repair| format!("{} → {}", repair.label, repair.resolved))
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.status = Some(format!("device re-bound: {summary}"));
+        for repair in &guessed {
+            log::warn!(
+                "device {:?} of {:?} not found - closest candidate {:?} NOT applied ({:?}): 
+                 too weak a resemblance to rewrite the config, pick the device manually",
+                repair.declared,
+                repair.label,
+                repair.resolved,
+                repair.kind
+            );
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !applied.is_empty() {
+            let summary = applied
+                .iter()
+                .map(|repair| format!("{} → {}", repair.label, repair.resolved))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("device re-bound: {summary}"));
+        }
+        if !guessed.is_empty() {
+            let summary = guessed
+                .iter()
+                .map(|repair| format!("{} ({}?)", repair.label, repair.resolved))
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!(
+                "device not found, not re-bound automatically: {summary} - pick it manually"
+            ));
+        }
+        self.status = Some(parts.join(" - "));
+        if applied.is_empty() {
+            // Nothing was rewritten: the graph and the config stay as they are.
+            return;
+        }
         self.device_restart.request(now);
         self.request_save(now);
     }
@@ -3343,6 +3413,55 @@ mod tests {
         assert!(after > 0.0 && after < 0.8, "{after}");
     }
 
+    /// **A gone device must not paint a level.**  `pw-cat` does not fail when
+    /// its `--target` does not resolve: it records the *default source*
+    /// (measured on the sandbox: a bogus target returned the default sink's
+    /// monitor at full level).  A strip bound to an unplugged/renamed device
+    /// therefore showed a hot VU while producing no sound at all — the exact
+    /// picture of the "no sound + pinned meters" report.
+    #[test]
+    fn a_strip_whose_device_is_gone_shows_a_dark_vu() {
+        let mut s = state();
+        let board = MeterBoard::new();
+        // The HP strip is bound to a Bluetooth headset in the fixture; the
+        // engine now lists a Pro Audio node only (the headset was unpaired).
+        let hp = s.strip_index("out-hp").expect("the fixture has HP");
+        let hp_device = s.strips[hp].device_name.clone().expect("HP has a device");
+        let hp_uid = s.strips[hp].uid.clone();
+        s.engine_devices = vec![DeviceInfo {
+            id: 3,
+            name: "alsa_output.usb-PreSonus-00.pro-output-0".to_string(),
+            media_class: "Audio/Sink".to_string(),
+            description: None,
+        }];
+        assert_eq!(s.device_presence(&hp_uid), DevicePresence::Missing);
+        // The capture of the default source publishes a hot level for it.
+        let slots = board.assign(std::slice::from_ref(&hp_uid));
+        board.publish(slots[&hp_uid], [1.0, 1.0]);
+        let now = Instant::now();
+        for tick in 0..200 {
+            s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
+        }
+        let shown = s.levels_for(hp);
+        assert!(
+            shown[0] < 1e-6 && shown[1] < 1e-6,
+            "a strip whose device is missing must not show a phantom level: {shown:?}"
+        );
+        // …and it is reported once, so the log names the culprit.
+        assert!(s.meter_missing.contains(&hp_uid));
+        // The device comes back: the real level is shown again.
+        s.engine_devices = vec![DeviceInfo {
+            id: 3,
+            name: hp_device,
+            media_class: "Audio/Sink".to_string(),
+            description: None,
+        }];
+        assert_eq!(s.device_presence(&hp_uid), DevicePresence::Found);
+        s.feed_from_board(&board, now + METER_INTERVAL * 41, METER_INTERVAL);
+        assert!(s.levels_for(hp)[0] > 0.9, "{:?}", s.levels_for(hp));
+        assert!(!s.meter_missing.contains(&hp_uid));
+    }
+
     #[test]
     fn the_mock_bridge_has_no_meter_board_but_the_engine_does_not_matter() {
         // Guard the contract `poll_engine` relies on: a bridge without a board
@@ -4667,25 +4786,32 @@ mod tests {
         }
     }
 
+    /// A device whose **instance segment survives** (same card, new profile:
+    /// `analog-surround-40` → `pro-output-0`) is the same physical device, so
+    /// the strip is re-bound and the fix is persisted.
     #[test]
-    fn a_renamed_device_is_re_bound_by_description_and_persisted() {
-        let path = scratch_config("device-rename");
+    fn a_device_that_changed_profile_on_the_same_instance_is_re_bound_and_persisted() {
+        let path = scratch_config("device-profile-change");
         let mut s = AppState::from_config(&path);
         s.set_clock(Instant::now());
-        // The fixture's Casque strip points at the built-in analog output; the
-        // machine rebooted and the PCI address changed.
         let casque = s
             .strips
             .iter()
             .position(|strip| strip.label == "Casque")
             .expect("the fixture has a Casque strip");
         let declared = s.strips[casque].device_name.clone().unwrap();
-        // The card was re-plugged: same model, new USB serial, and the built-in
-        // analog output is present too (it must NOT win: different profile).
-        let devices = vec![
+        assert!(
+            declared.contains("usb-PreSonus_Studio_26c_01424548-00"),
+            "fixture changed: {declared}"
+        );
+        // The card switched to the Pro Audio profile: a mono port per channel,
+        // same USB serial.  The built-in analog output is there too and must not
+        // win (different vendor head, no instance in common).
+        s.engine = EngineState::Connected;
+        s.engine_devices = vec![
             device(
-                "alsa_output.usb-PreSonus_Studio_26c_99999999-00.analog-surround-40",
-                Some("PreSonus Studio 26c Analog Surround 4.0"),
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+                Some("PreSonus Studio 26c Pro"),
                 "Audio/Sink",
             ),
             device(
@@ -4693,19 +4819,11 @@ mod tests {
                 Some("Built-in Audio Analog Stereo"),
                 "Audio/Sink",
             ),
-            device(
-                "alsa_input.usb-PreSonus_Studio_26c_01424548-00.analog-stereo",
-                None,
-                "Audio/Source",
-            ),
         ];
-        s.engine = EngineState::Connected;
-        s.engine_devices = devices;
         s.reconcile_devices();
-        // The name was rewritten to the device that is really there…
         assert_eq!(
             s.strips[casque].device_name.as_deref(),
-            Some("alsa_output.usb-PreSonus_Studio_26c_99999999-00.analog-surround-40"),
+            Some("alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0"),
             "declared was {declared}"
         );
         assert!(!s.missing_devices.contains(&s.strips[casque].uid));
@@ -4720,8 +4838,58 @@ mod tests {
         s.reconcile_devices();
         assert_eq!(
             s.strips[casque].device_name.as_deref(),
-            Some("alsa_output.usb-PreSonus_Studio_26c_99999999-00.analog-surround-40")
+            Some("alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0")
         );
+        s.strips = Vec::new();
+        s.config.as_mut().unwrap().cancel_save();
+    }
+
+    /// **A guess is never written, and never saved.**  A device that only shares
+    /// the vendor head and the profile (`…_99999999-00.analog-surround-40` vs
+    /// the configured `…_01424548-00.analog-surround-40`) is *another unit*: the
+    /// old code re-bound the strip to it and persisted the rewrite, which is how
+    /// a strip can end up pointing at a node that does not carry its audio (and
+    /// stays that way across restarts).  Now the strip keeps its stored name,
+    /// shows the missing-device marker, and the candidate is only suggested.
+    #[test]
+    fn a_guessed_device_rebind_is_reported_but_not_applied_nor_saved() {
+        let path = scratch_config("device-guess");
+        let mut s = AppState::from_config(&path);
+        s.set_clock(Instant::now());
+        let casque = s
+            .strips
+            .iter()
+            .position(|strip| strip.label == "Casque")
+            .expect("the fixture has a Casque strip");
+        let declared = s.strips[casque].device_name.clone().unwrap();
+        // The user's config is clean before the reconciliation runs.
+        assert!(s.config.as_ref().unwrap().loaded());
+        s.config.as_mut().unwrap().cancel_save();
+        s.engine = EngineState::Connected;
+        s.engine_devices = vec![device(
+            "alsa_output.usb-PreSonus_Studio_26c_99999999-00.analog-surround-40",
+            Some("PreSonus Studio 26c Analog Surround 4.0"),
+            "Audio/Sink",
+        )];
+        s.reconcile_devices();
+        // The model is untouched…
+        assert_eq!(
+            s.strips[casque].device_name.as_deref(),
+            Some(declared.as_str())
+        );
+        // …the strip is flagged, so the view shows `! <name>`…
+        assert!(s.missing_devices.contains(&s.strips[casque].uid));
+        assert_eq!(
+            s.device_presence(&s.strips[casque].uid.clone()),
+            crate::devices::DevicePresence::Missing
+        );
+        // …and the status names the candidate without claiming it is applied.
+        let status = s.status.as_deref().unwrap_or_default();
+        assert!(status.contains("not re-bound"), "{status}");
+        assert!(status.contains("manual"), "{status}");
+        // Nothing was scheduled: no graph rebuild, no config write.
+        assert!(!s.device_restart.is_pending());
+        assert!(!s.config.as_ref().unwrap().save_pending());
         s.strips = Vec::new();
         s.config.as_mut().unwrap().cancel_save();
     }

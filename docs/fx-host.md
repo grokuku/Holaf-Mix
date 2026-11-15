@@ -297,6 +297,32 @@ même façon** (conteneur sans temps réel, cf. §8) : 4 canaux n'est pas pire.
 change ni le câblage, ni le format négocié, ni le DSP ; `pw-top` ne montre aucun
 `ERR` et le monitor du device 4 canaux restitue la tonalité sans trou.
 
+### 8 quater. Déviation corrigée : cible **mono** (Pro Audio, un port par canal)
+
+Le profil *Pro Audio* d'une carte expose **un nœud mono par sortie physique**
+(`…-00.pro-output-0`, un seul port `playback_MONO`) et non plus un nœud stéréo
+`analog-stereo`.  Cas non couvert par §8 bis (qui parle d'un device **4
+canaux**) :
+
+| source | cible | Python `_auto_link_ports` | Rust **avant** | Rust **après** |
+|---|---|---|---|---|
+| stéréo (bus, `monitor_FL`/`FR`) | mono (`playback_MONO`) | 1 lien (`left → MONO`, `MONO` compte comme canal gauche) | **0 lien** | 1 lien |
+| mono (`capture_MONO`) | stéréo (`playback_FL`/`FR`) | 2 liens (le canal dupliqué) | **0 lien** | 2 liens |
+| stéréo | stéréo | 2 liens | 2 liens | 2 liens |
+| mono | mono | 1 lien | 1 lien | 1 lien |
+
+Le branchement « stéréo » de `link_nodes` n'acceptait que `(stéréo, stéréo)` et
+`(mono, mono)` ; toute autre combinaison tombait dans `_ => Vec::new()`.
+Conséquence mesurée en headless : `apply_snapshot` → `degraded: true`,
+`pending: ["route:…"]`, **aucun lien**, et le strip est **muet** alors que le
+graphe paraît sain (la route est retentée à chaque apply, indéfiniment).
+
+La politique est maintenant une fonction pure (`LiveView::port_pairs`) avec ses
+tests, et un test live (`a_route_into_a_mono_device_is_linked`, `backend_live`)
+qui crée un null-sink mono et exige `degraded=false` + au moins un lien.
+Règle invariante : **deux canaux source ne sont jamais liés dans le même port
+cible** (PipeWire somme les entrées liées → +6 dB).
+
 ### Reproduire / mesurer sur la machine de l'utilisateur
 
 ```bash

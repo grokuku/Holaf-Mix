@@ -188,7 +188,7 @@
             "kind": "input",
             "mode": "physical",
             "volume": 1.0,
-            "mute": true,
+            "mute": false,
             "is_mono": true,
             "routes": [
                 "5f2928d1-499c-41b6-961d-27926b51a70c"

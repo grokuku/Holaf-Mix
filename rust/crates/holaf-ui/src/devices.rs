@@ -27,7 +27,9 @@
 //!
 //! Rule 4 refuses to guess: two equally good candidates mean "no match", never
 //! "pick the first one" (routing a strip to the wrong speakers is worse than
-//! showing it as missing).
+//! showing it as missing).  A match that only shares the vendor head and the
+//! profile suffix is reported as a *suggestion* and never written back — see
+//! [`MatchKind::is_confident`].
 //!
 //! Everything here is pure — `&[Strip]` + `&[DeviceInfo]` in, repairs out — so
 //! the whole matching policy is unit-tested without PipeWire.
@@ -41,6 +43,29 @@ use crate::engine_json::DeviceInfo;
 /// Vendor head (2) + profile suffix (2) is the minimum meaningful resemblance:
 /// `alsa_output.X.analog-stereo` → `alsa_output.Y.analog-stereo`.
 pub const MIN_SCORE: u32 = 4;
+
+/// Smallest score at which an [`MatchKind::Approximate`] match may **rewrite the
+/// user's stored `device_name`**.
+///
+/// The only similarity that identifies the *same physical device* is the
+/// **instance segment** (`usb-PreSonus_Studio_26c_01424548-00`, `pci-0000_00_1f`):
+///
+/// ```text
+/// alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40
+/// alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0     → score 5
+///            └──────────── same instance ────────────┘             (vendor 2 + instance 3)
+///
+/// alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40
+/// alsa_output.usb-PreSonus_Studio_26c_99999999-00.analog-surround-40 → score 4
+///            └──────────── another unit ─────────────┘             (vendor 2 + profile 2)
+/// ```
+///
+/// A score of 4 is *"same vendor, same profile"*: that is another card, or
+/// another port of another card, and rewriting the config on it binds the strip
+/// to a node that may not carry its audio at all (a mono Pro Audio
+/// `pro-output-0` is a different node from a stereo `analog-stereo`).  Those
+/// matches are reported, never applied — and never saved.
+pub const MIN_CONFIDENT_SCORE: u32 = 5;
 
 /// How a device was matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +84,23 @@ impl MatchKind {
     /// stored name — the user's config is about to be rewritten.)
     pub fn is_approximate(self) -> bool {
         !matches!(self, MatchKind::Name)
+    }
+
+    /// Is this match sure enough to **rewrite and persist** `device_name`?
+    ///
+    /// * [`MatchKind::Name`] — the stored name is the device's name (only the
+    ///   letter case may be normalised): safe.
+    /// * [`MatchKind::Description`] — the engine publishes the very description
+    ///   the strip was bound with: same device announcement, safe.
+    /// * [`MatchKind::Approximate`] — only when the instance segment survived
+    ///   (`score >= [`MIN_CONFIDENT_SCORE`]`): the same card under a new
+    ///   profile.  Below that it is a *guess* (same vendor + same profile on
+    ///   another unit) and must never touch the user's configuration.
+    pub fn is_confident(self) -> bool {
+        match self {
+            MatchKind::Name | MatchKind::Description => true,
+            MatchKind::Approximate { score } => score >= MIN_CONFIDENT_SCORE,
+        }
     }
 }
 
@@ -286,7 +328,7 @@ pub fn reconcile(
 }
 
 /// What the strip's device combo must show.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevicePresence {
     /// No authoritative device list yet (no engine, or none received): show the
     /// stored name, never a false `(Not Found)`.
@@ -390,6 +432,37 @@ mod tests {
         let devices = [device("alsa_output.usb-Kingston_2.analog-stereo", None)];
         let found = resolve("alsa_output.usb-Kingston_1.analog-stereo", None, &devices).unwrap();
         assert_eq!(found.kind, MatchKind::Approximate { score: 4 });
+    }
+
+    /// Only a match that keeps the **instance segment** may rewrite the user's
+    /// `device_name`.  Vendor + profile alone (4) is another unit; vendor +
+    /// instance (5) is the same card under a new profile.
+    #[test]
+    fn only_a_match_that_keeps_the_instance_may_be_written_back() {
+        // Same card, new profile (analog-surround-40 → pro-output-0): 5.
+        let same_card = MatchKind::Approximate {
+            score: name_score(
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40",
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+            ),
+        };
+        assert_eq!(same_card, MatchKind::Approximate { score: 5 });
+        assert!(same_card.is_confident(), "the same card must be re-bound");
+        // Same vendor, same profile, **another unit** (different USB serial): 4.
+        let other_unit = MatchKind::Approximate {
+            score: name_score(
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.analog-surround-40",
+                "alsa_output.usb-PreSonus_Studio_26c_99999999-00.analog-surround-40",
+            ),
+        };
+        assert_eq!(other_unit, MatchKind::Approximate { score: 4 });
+        assert!(
+            !other_unit.is_confident(),
+            "another unit must never be written into the config"
+        );
+        // An exact name and an exact description always are.
+        assert!(MatchKind::Name.is_confident());
+        assert!(MatchKind::Description.is_confident());
     }
 
     #[test]

@@ -241,6 +241,69 @@ impl LiveView {
             .iter()
             .filter(move |l| l.out_node == node_id || l.in_node == node_id)
     }
+
+    /// The port pairs to link between one source node and one sink node.
+    ///
+    /// Pure so the *policy* is unit-tested without a graph (the caller resolves
+    /// the ids from a live snapshot).  It reproduces
+    /// `_auto_link_ports` of the Python engine, which is the reference the
+    /// mixer is compared against:
+    ///
+    /// | source | target | links |
+    /// |---|---|---|
+    /// | stereo | stereo | `FL→FL`, `FR→FR` |
+    /// | mono (or `force_mono`) | stereo | the one channel into **both** target ports |
+    /// | stereo | **mono** | `FL→MONO` (one link: the target has one input) |
+    /// | mono | mono | the one link |
+    ///
+    /// Two source channels are **never** linked into the same target port:
+    /// PipeWire sums linked inputs, which would add +6 dB on a correlated
+    /// signal.
+    ///
+    /// # Why this is a function (regression)
+    ///
+    /// The stereo branch used to accept only `(stereo, stereo)` and
+    /// `(mono, mono)`; a stereo source feeding a **mono sink** (a Pro Audio
+    /// `pro-output-0` node, a mono USB interface, a mono null-sink — one
+    /// `playback_MONO` port) produced **no pair at all**: the route stayed
+    /// pending, `degraded` became true, and the strip was simply silent, while
+    /// the Python engine linked `left → MONO` and played.  Measured on the
+    /// headless sandbox: `0 links` with the old rule, `1 link` with this one.
+    pub fn port_pairs(
+        src_left: Option<u32>,
+        src_right: Option<u32>,
+        dst_left: Option<u32>,
+        dst_right: Option<u32>,
+        force_mono: bool,
+    ) -> Vec<(u32, u32)> {
+        // A strip in MONO, or a node that only publishes one port, feeds every
+        // target port from that single channel.
+        let single = src_left.or(src_right);
+        let duplicate = force_mono || src_left.is_none() || src_right.is_none();
+        if duplicate {
+            let Some(single) = single else {
+                return Vec::new();
+            };
+            return match (dst_left, dst_right) {
+                (Some(dl), Some(dr)) if dl != dr => vec![(single, dl), (single, dr)],
+                (Some(dl), _) => vec![(single, dl)],
+                (None, Some(dr)) => vec![(single, dr)],
+                _ => Vec::new(),
+            };
+        }
+        let (Some(sl), Some(sr)) = (src_left, src_right) else {
+            return Vec::new();
+        };
+        match (dst_left, dst_right) {
+            (Some(dl), Some(dr)) if dl == dr => vec![(sl, dl)],
+            (Some(dl), Some(dr)) => vec![(sl, dl), (sr, dr)],
+            // A mono target: the left channel reaches the only input port.  The
+            // right channel has nowhere to go, and must not be summed in.
+            (Some(dl), None) => vec![(sl, dl)],
+            (None, Some(dr)) => vec![(sr, dr)],
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +486,54 @@ mod tests {
         let view = collect_view(&globals);
         assert_eq!(view.port_fl(10, PortDir::In), Some(401));
         assert_eq!(view.port_fr(10, PortDir::In), Some(400));
+    }
+
+    /// **The regression that made a whole strip silent**: a stereo source
+    /// (a bus, `monitor_FL`/`monitor_FR`) routed to a **mono** sink (a Pro Audio
+    /// `pro-output-0` node: one `playback_MONO` port) used to produce *no link
+    /// at all*, so `apply_snapshot` reported the route as pending and nothing
+    /// reached the device.  The Python engine linked `left → MONO`.
+    #[test]
+    fn a_stereo_source_reaches_a_mono_sink() {
+        assert_eq!(LiveView::port_pairs(Some(1), Some(2), Some(9), None, false), vec![(1, 9)]);
+        // A target that publishes only its right port still gets a link.
+        assert_eq!(LiveView::port_pairs(Some(1), Some(2), None, Some(9), false), vec![(2, 9)]);
+    }
+
+    /// A mono source (a Pro Audio `pro-input-0` capture node, a mono device)
+    /// feeding a stereo target is duplicated into both target ports — one link
+    /// per port, never two source channels into one port.
+    #[test]
+    fn a_mono_source_feeds_both_channels_of_a_stereo_target() {
+        assert_eq!(
+            LiveView::port_pairs(Some(1), None, Some(8), Some(9), false),
+            vec![(1, 8), (1, 9)]
+        );
+        // Only a right port published: use it, do not lose the signal.
+        assert_eq!(
+            LiveView::port_pairs(None, Some(2), Some(8), Some(9), false),
+            vec![(2, 8), (2, 9)]
+        );
+        // Mono strip (force_mono) with a stereo node: the left channel wins.
+        assert_eq!(
+            LiveView::port_pairs(Some(1), Some(2), Some(8), Some(9), true),
+            vec![(1, 8), (1, 9)]
+        );
+    }
+
+    #[test]
+    fn stereo_to_stereo_keeps_the_channel_pairs_and_never_sums() {
+        assert_eq!(
+            LiveView::port_pairs(Some(1), Some(2), Some(8), Some(9), false),
+            vec![(1, 8), (2, 9)]
+        );
+        // Mono to mono: exactly one link.
+        assert_eq!(LiveView::port_pairs(Some(1), None, Some(9), None, false), vec![(1, 9)]);
+        // Nothing to link: no ports on one side.
+        assert!(LiveView::port_pairs(None, None, Some(8), Some(9), false).is_empty());
+        assert!(LiveView::port_pairs(Some(1), Some(2), None, None, false).is_empty());
+        // A node publishing the same port twice would create a duplicate link.
+        assert_eq!(LiveView::port_pairs(Some(1), Some(2), Some(9), Some(9), false), vec![(1, 9)]);
     }
 
     #[test]
