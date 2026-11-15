@@ -26,6 +26,11 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+/// Characters a strip combo holds: the box is 90 px wide and the Qt side
+/// truncated at 15 (`desc[:15] + "..."`).  Shared by the combo label and the
+/// pop-up's short form so both shorten the same way.
+pub const COMBO_CHARS: usize = 15;
+
 /// One physical audio device known to the engine (`Backend::device_list`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -55,23 +60,24 @@ impl DeviceInfo {
         self.media_class == "Audio/Source"
     }
 
-    /// The short label the combo shows: the description when the engine
-    /// publishes one (that is what the Qt combo displayed), else the shortened
-    /// node name.
+    /// The short label a combo shows: the description when the engine publishes
+    /// one (that is what the Qt combo displayed), else the model extracted from
+    /// the node name — see [`crate::devices::readable_label`] — cut to the 15
+    /// characters a 90 px combo can hold.
+    ///
+    /// The old rule kept the last dotted segment, so every analog card read
+    /// `analog-stereo`; two different cards were indistinguishable (reported).
     pub fn display(&self) -> String {
-        match &self.description {
-            Some(description) if !description.trim().is_empty() => {
-                let description = description.trim();
-                if description.chars().count() <= 15 {
-                    description.to_string()
-                } else {
-                    let mut short: String = description.chars().take(14).collect();
-                    short.push('…');
-                    short
-                }
-            }
-            _ => crate::views::strip::device_display_name(&self.name),
-        }
+        crate::devices::elide_chars(
+            &crate::devices::short_label(&self.name, self.description.as_deref()),
+            COMBO_CHARS,
+        )
+    }
+
+    /// The **full** readable label of the pop-up (`PreSonus Studio 26c ·
+    /// pro-output-0`), elided only when it is absurdly long.
+    pub fn label(&self) -> String {
+        crate::devices::readable_label(&self.name, self.description.as_deref())
     }
 
     /// What the device picker lists next to the label.

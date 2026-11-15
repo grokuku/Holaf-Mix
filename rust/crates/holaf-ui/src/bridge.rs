@@ -537,18 +537,37 @@ fn mock_status() -> Value {
     })
 }
 
-/// The device list the mock engine answers with (deterministic, two entries).
+/// The device list the mock engine answers with (deterministic).
+///
+/// The names are the ones the user's machine reports (a built-in HDA card plus
+/// a PreSonus Studio 26c over USB), because the device picker's *labels* are what
+/// a snapshot has to show: two analog cards both read `analog-stereo` under the
+/// old rule, which is the bug this list lets a reviewer see.  One entry has no
+/// `description` (the engine publishes one only when the node carries
+/// `node.description`/`node.nick`), so both label paths are exercised.
 fn mock_devices() -> Vec<DeviceInfo> {
     vec![
         DeviceInfo {
             id: 1,
-            name: "alsa_output.mock.analog-stereo".to_string(),
+            name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
             media_class: "Audio/Sink".to_string(),
-            description: Some("Mock Analog Stereo".to_string()),
+            description: Some("Built-in Audio Analog Stereo".to_string()),
         },
         DeviceInfo {
             id: 2,
-            name: "alsa_input.mock.analog-stereo".to_string(),
+            name: "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0".to_string(),
+            media_class: "Audio/Sink".to_string(),
+            description: None,
+        },
+        DeviceInfo {
+            id: 3,
+            name: "alsa_input.pci-0000_00_1f.3.analog-stereo".to_string(),
+            media_class: "Audio/Source".to_string(),
+            description: Some("Built-in Audio Analog Stereo".to_string()),
+        },
+        DeviceInfo {
+            id: 4,
+            name: "alsa_input.usb-PreSonus_Studio_26c_01424548-00.analog-stereo".to_string(),
             media_class: "Audio/Source".to_string(),
             description: None,
         },
@@ -587,7 +606,11 @@ mod pw {
         /// The thread also owns the meter capture ([`MeterCapture`]): one
         /// `pw-cat --record` child per source the engine names, publishing into
         /// the [`MeterBoard`] the UI reads.
-        pub fn spawn_pipewire() -> Self {
+        /// `downmix` is the mono-target policy from `config.json`
+        /// (`ui_rust.mono_downmix`, see [`holaf_pw::MonoDownmix`]).  It is sent to
+        /// the engine on every (re)connect, so a restart keeps the user's choice;
+        /// the default is the Python behaviour (`Left`).
+        pub fn spawn_pipewire(downmix: holaf_pw::MonoDownmix) -> Self {
             let (command_tx, command_rx) = mpsc::channel::<EngineCommand>();
             let (event_tx, event_rx) = mpsc::channel::<EngineEvent>();
             let levels = Arc::new(Mutex::new(HashMap::new()));
@@ -610,6 +633,7 @@ mod pw {
                     // (no daemon): stay alive, refuse operations, until
                     // `RestartEngine` or `Shutdown`.
                     let mut backend = connect_backend(&event_tx, &thread_status, &snapshot);
+                    apply_downmix(&mut backend, downmix);
                     if backend.is_some() {
                         refresh_meters(
                             &mut backend,
@@ -637,6 +661,7 @@ mod pw {
                                 }
                                 thread_status.set_connected(false);
                                 backend = connect_backend(&event_tx, &thread_status, &snapshot);
+                                apply_downmix(&mut backend, downmix);
                                 let outcome = match &backend {
                                     Some(_) => Ok(format!(
                                         "engine restarted ({} strips)",
@@ -744,6 +769,27 @@ mod pw {
                 meters: Some(board),
                 status,
             }
+        }
+    }
+
+    /// Tell a freshly connected backend which mono downmix the user chose.
+    ///
+    /// Best effort: an engine that refuses the policy keeps its default (the
+    /// Python behaviour), which is the safe direction — the alternative would be
+    /// a mixer that stops working because of a cosmetic setting.
+    fn apply_downmix(
+        backend: &mut Option<holaf_pw::PipeWireBackend>,
+        downmix: holaf_pw::MonoDownmix,
+    ) {
+        let Some(backend) = backend.as_mut() else {
+            return;
+        };
+        match backend.set_mono_downmix(downmix) {
+            Ok(_) => log::info!("engine: mono downmix '{}'", downmix.as_str()),
+            Err(err) => log::warn!(
+                "engine: cannot set mono downmix '{}': {err} (keeping the default)",
+                downmix.as_str()
+            ),
         }
     }
 
@@ -1080,9 +1126,22 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(devices.len(), 2);
-        assert!(devices.iter().any(|device| device.is_sink()));
-        assert!(devices.iter().any(|device| device.is_source()));
+        assert_eq!(devices.len(), 4, "the mock lists two sinks and two sources");
+        assert_eq!(devices.iter().filter(|device| device.is_sink()).count(), 2);
+        assert_eq!(devices.iter().filter(|device| device.is_source()).count(), 2);
+        // Two sinks with two *different* labels: the whole point of the list.
+        let labels: Vec<String> = devices
+            .iter()
+            .filter(|device| device.is_sink())
+            .map(|device| device.label())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Built-in Audio Analog Stereo".to_string(),
+                "PreSonus Studio 26c · pro-output-0".to_string(),
+            ]
+        );
         bridge.shutdown();
     }
 

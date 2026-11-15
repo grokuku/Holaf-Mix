@@ -71,6 +71,7 @@ use holaf_core::model::{EffectKey, Strip};
 
 use crate::chainhost::FxHostMode;
 use crate::engine::{Engine, EngineOp};
+use crate::live::MonoDownmix;
 
 /// How long an operation may block on the PipeWire worker before the backend
 /// reports `backend_timeout`.  Real graph ops (chain loads, registry polls)
@@ -192,6 +193,17 @@ impl PipeWireBackend {
             Err(RecvTimeoutError::Timeout) => Err(backend_timeout("engine op")),
             Err(RecvTimeoutError::Disconnected) => Err(backend_down()),
         }
+    }
+
+    /// Choose how a stereo strip feeds a **mono** target
+    /// (`ui_rust.mono_downmix` → [`MonoDownmix`]).
+    ///
+    /// Inherent rather than part of the [`Backend`] trait: it is a *policy* of
+    /// this engine, not an operation of the mixer.  The default
+    /// ([`MonoDownmix::Left`]) is the Python behaviour, so a caller that never
+    /// asks for anything gets exactly the previous graph.
+    pub fn set_mono_downmix(&mut self, policy: MonoDownmix) -> Result<Value, BackendError> {
+        self.call(EngineOp::SetMonoDownmix { policy })
     }
 
     /// Ask the worker to tear the graph down and exit (used by `stop`/`Drop`).

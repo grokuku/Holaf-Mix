@@ -1,5 +1,10 @@
 # État de la réécriture Rust du cœur de Holaf-Mix
 
+> **Archive (2026-11-15)** : la couche Python a été **supprimée**.  Ce
+> document décrit l'état du chantier *à l'époque* (quand `main.py` lançait
+> encore l'UI et que le Python servait de repli).  Pour le produit actuel,
+> voir `README.md`, `BUILD.md` et [`python-removal.md`](./python-removal.md).
+
 Document de suivi « productif » du chantier **holafd** (réécriture Rust du
 cœur).  La spec technique détaillée vit dans
 [`rust-rewrite-spec.md`](./rust-rewrite-spec.md) ; le guide du développeur Rust

@@ -15,7 +15,7 @@
 //! a real user daemon by accident: the runtime dir must point at the headless
 //! sandbox (`/tmp/pw-runtime` / `…holaf…`) or `HOLAF_PW_LIVE=1` must be set.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -794,6 +794,283 @@ fn a_route_into_a_mono_device_is_linked() {
         links >= 1,
         "the bus must be linked into the mono device (got {links} links) — \
          without it the strip is silent while the graph looks healthy"
+    );
+    backend.stop().expect("stop");
+}
+
+// ---------------------------------------------------------------------------
+// The VU meters are POST-FADER (measured, not assumed)
+// ---------------------------------------------------------------------------
+
+/// A 60 s stereo WAV of a 1 kHz tone at `amplitude` (`pw-cat` needs a file
+/// libsndfile recognises, and it must outlast the measurement).
+fn write_tone(path: &std::path::Path, amplitude: f32) {
+    let rate = 48_000u32;
+    let seconds = 60u32;
+    let mut data = Vec::with_capacity((rate * seconds * 4) as usize);
+    for i in 0..rate * seconds {
+        let value =
+            (amplitude * 32_767.0 * (std::f32::consts::TAU * 1000.0 * i as f32 / rate as f32).sin())
+                as i16;
+        data.extend_from_slice(&value.to_le_bytes());
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    let data_len = data.len() as u32;
+    let mut file = Vec::with_capacity(44 + data.len());
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&(36 + data_len).to_le_bytes());
+    file.extend_from_slice(b"WAVEfmt ");
+    file.extend_from_slice(&16u32.to_le_bytes());
+    file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    file.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    file.extend_from_slice(&rate.to_le_bytes());
+    file.extend_from_slice(&(rate * 4).to_le_bytes());
+    file.extend_from_slice(&4u16.to_le_bytes());
+    file.extend_from_slice(&16u16.to_le_bytes());
+    file.extend_from_slice(b"data");
+    file.extend_from_slice(&data_len.to_le_bytes());
+    file.extend_from_slice(&data);
+    std::fs::write(path, file).expect("write the tone");
+}
+
+/// Record the **monitor** of `node` for `seconds` and return the RMS of the tail
+/// (the last 250 ms), i.e. exactly what the UI's meter capture feeds into
+/// `holaf_ui::meters`.
+fn monitor_rms(node: &str, seconds: u64) -> Option<f32> {
+    let path = format!("/tmp/holaf-vu-{node}.raw");
+    let mut recorder = Command::new("pw-cat")
+        .args(["--record", "--target", node])
+        .args(["-P", "{\"stream.capture.sink\":true}"])
+        .args(["--format", "f32", "--rate", "48000", "--channels", "2"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    std::thread::sleep(Duration::from_secs(seconds));
+    let _ = recorder.kill();
+    let _ = recorder.wait();
+    let bytes = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let samples: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect();
+    let tail_len = (48_000 / 4 * 2).min(samples.len());
+    let tail = &samples[samples.len() - tail_len..];
+    let left: Vec<f32> = tail.iter().step_by(2).copied().collect();
+    if left.is_empty() {
+        return None;
+    }
+    let sum: f32 = left.iter().map(|sample| sample * sample).sum();
+    Some((sum / left.len() as f32).sqrt())
+}
+
+/// **The VU level follows the fader.**  This is the measurement the user's bug
+/// report (“les vu-mètres sont toujours à fond, même quand le son est faible”)
+/// needed: a known tone plays into a bus, and the level the UI would publish is
+/// taken at fader 1.0 and at fader 0.3.
+///
+/// The capture tap must be **post-fader**.  A bare `adapter`/`null-audio-sink`
+/// is not: measured on this sandbox, its monitor reads the same RMS at every
+/// `channelVolumes` (pre-fader), which is why the engine also writes
+/// `Props.monitorVolumes` with the strip volume — exactly like the Python engine
+/// (`pactl set-source-volume <source>.monitor`).  Enabling
+/// `monitor.channel-volumes` *as well* would double the attenuation (measured:
+/// 0.3 → 0.032 instead of 0.106), so the UI must not scale the level again.
+#[test]
+fn the_vu_monitor_level_follows_the_strip_fader() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    fresh_sandbox_daemon();
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    // One virtual output strip: its bus is the node its VU records.
+    let mut strip = Strip::with_uid("vu-out", "VU Out", StripType::Output);
+    strip.volume = 1.0;
+    backend
+        .apply_snapshot(std::slice::from_ref(&strip))
+        .expect("apply_snapshot");
+    let sources = backend.meter_sources().expect("meter.sources");
+    let source = sources["sources"]["vu-out"]
+        .as_str()
+        .expect("the strip has a meter source")
+        .to_string();
+    let node = source
+        .strip_suffix(".monitor")
+        .expect("a virtual bus is metered through its monitor")
+        .to_string();
+
+    let wav = std::path::PathBuf::from("/tmp/holaf-vu-tone.wav");
+    write_tone(&wav, 0.5);
+    let mut player = Command::new("pw-cat")
+        .args(["--playback", "--target"])
+        .arg(&node)
+        .arg(&wav)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the tone");
+    std::thread::sleep(Duration::from_millis(400));
+
+    let loud = monitor_rms(&node, 2).expect("the monitor is recordable");
+    assert!(
+        loud > 0.2,
+        "the tone must reach the bus monitor (rms {loud}); \
+         `--target`/`stream.capture.sink` is what makes this work"
+    );
+
+    // The UI pushes the volume through `set_volume` (debounced in the app).
+    backend
+        .set_volume("vu-out", 0.3)
+        .expect("set_volume at 0.3");
+    std::thread::sleep(Duration::from_millis(400));
+    let quiet = monitor_rms(&node, 2).expect("the monitor is recordable");
+
+    // `pulse_linear_gain(0.3)` = 0.027: a −31 dB drop, i.e. the level the bar
+    // shows really is post-fader (pre-fader would leave it identical).
+    assert!(
+        quiet < loud * 0.2,
+        "the monitor is PRE-fader: rms {loud} at volume 1.0 vs {quiet} at 0.3 \
+         (expected ≈ {})",
+        loud * 0.027
+    );
+    assert!(quiet > 0.0, "the fader must attenuate, not mute");
+
+    // A muted strip is silent on the monitor too (the engine writes
+    // `monitorMute`), which is what makes a dark VU honest.
+    backend.set_mute("vu-out", true).expect("set_mute");
+    std::thread::sleep(Duration::from_millis(400));
+    let muted = monitor_rms(&node, 1).unwrap_or(0.0);
+    assert!(muted < loud * 0.02, "a muted strip must be silent: {muted}");
+
+    let _ = player.kill();
+    let _ = player.wait();
+    backend.stop().expect("stop");
+}
+
+/// `channelVolumes` of a node, read back from the daemon (`pw-cli enum-params`).
+fn channel_volume(node_id: u32) -> Option<f32> {
+    let text = run("pw-cli", &["enum-params", &node_id.to_string(), "Props"])?;
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("channelVolumes") {
+            for next in lines.iter().skip(i + 1).take(3) {
+                if let Some(token) = next.trim().strip_prefix("Float ") {
+                    return token.trim().parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// **The mono downmix option, live.**  A stereo bus routed to a mono device
+/// (one `playback_MONO` port, exactly the user's PreSonus `pro-output-0`):
+///
+/// * `left` (the default) links `FL → MONO`, so the right channel is lost;
+/// * `average` links **both** channels and trims the strip by −6 dB, so the
+///   device gets `(FL + FR) / 2` and nothing clips.
+///
+/// The policy is re-derived on the live graph (an existing route is torn down and
+/// re-created), which is what makes `ui_rust.mono_downmix` a setting and not a
+/// restart.
+#[test]
+fn the_mono_downmix_option_rewires_a_mono_route() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    fresh_sandbox_daemon();
+
+    // A mono sink: the port shape of a Pro Audio `pro-output-0`.
+    const MONO: &str = "alsa_output.holaf_downmix.pro-output-0";
+    assert!(
+        run(
+            "pactl",
+            &[
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={MONO}"),
+                "channels=1",
+            ],
+        )
+        .is_some(),
+        "pactl must be able to create a mono null-sink ({MONO})"
+    );
+
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    // `average` **before** the snapshot: the first apply already uses it.
+    backend
+        .set_mono_downmix(holaf_pw::MonoDownmix::Average)
+        .expect("set_mono_downmix");
+
+    let mut mono_out = Strip::with_uid("o-mono-dm", "Mono DM", StripType::Output);
+    mono_out.device_name = Some(MONO.to_string());
+    mono_out.volume = 0.5;
+    let mut source = Strip::with_uid("i-mono-dm", "Src DM", StripType::Input);
+    source.volume = 0.5;
+    source.routes = vec!["o-mono-dm".to_string()];
+    let res = backend
+        .apply_snapshot(&[mono_out, source])
+        .expect("apply_snapshot (mono downmix)");
+    assert_eq!(res["degraded"], false, "{res}");
+
+    std::thread::sleep(Duration::from_millis(300));
+    let bus = node_id_by_name("Holaf_Bus_Src_DM").expect("the input bus exists");
+    let device = node_id_by_name(MONO).expect("the mono device is in the graph");
+    let links = link_count(bus, device);
+    assert!(
+        links >= 2,
+        "`average` must feed both channels into the mono port (got {links} links)"
+    );
+    // The trim lives on the **source** strip's node (the bus that carries the
+    // downmixed signal into the mono port): `pulse_linear_gain(0.5)` = 0.125,
+    // halved by the −6 dB, i.e. the sum is the average.
+    let bus_id = node_id_by_name("Holaf_Bus_Src_DM").expect("the bus node");
+    let volume = channel_volume(bus_id).expect("channelVolumes readable");
+    assert!(
+        (volume - holaf_core::model::pulse_linear_gain(0.5) * 0.5).abs() < 0.01,
+        "the strip must be trimmed by −6 dB so the sum is an average (got {volume})"
+    );
+
+    // Back to `left` on the live graph: one link, and the trim is gone.
+    backend
+        .set_mono_downmix(holaf_pw::MonoDownmix::Left)
+        .expect("set_mono_downmix back to left");
+    std::thread::sleep(Duration::from_millis(300));
+    let links = link_count(bus, device);
+    assert_eq!(
+        links, 1,
+        "`left` links the left channel only (got {links} links)"
+    );
+    let volume = channel_volume(bus_id).expect("channelVolumes readable");
+    assert!(
+        (volume - holaf_core::model::pulse_linear_gain(0.5)).abs() < 0.01,
+        "no trim without a downmix (got {volume})"
     );
     backend.stop().expect("stop");
 }

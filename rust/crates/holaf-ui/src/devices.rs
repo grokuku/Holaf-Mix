@@ -327,6 +327,250 @@ pub fn reconcile(
     (repairs, missing)
 }
 
+// ---------------------------------------------------------------------------
+// Readable labels
+// ---------------------------------------------------------------------------
+
+/// Longest model part a label shows before it is elided with `…`.
+///
+/// A verbose ALSA instance name (`C-Media_Electronics_Inc._USB_Audio_Device`)
+/// must not push the profile (`analog-stereo`) out of the pop-up: the profile is
+/// what tells two nodes of the same card apart.
+pub const MAX_MODEL_CHARS: usize = 42;
+
+/// The three parts of a PipeWire `node.name`.
+///
+/// ```text
+/// alsa_output . usb-PreSonus_Studio_26c_01424548-00 . pro-output-0
+/// └─ vendor ─┘ └──────────── instance ─────────────┘ └─ profile ─┘
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameParts<'a> {
+    /// `alsa_output`, `bluez_output` … or the whole name when it has no dot
+    /// (`Holaf_Bus_Mic`).
+    pub vendor: &'a str,
+    /// The card/instance segment (`usb-…`, `pci-…`, `AC_80_…`).
+    pub instance: Option<&'a str>,
+    /// The profile tail (`analog-stereo`, `pro-output-0`, `a2dp-sink`).
+    pub profile: Option<&'a str>,
+}
+
+/// Split a node name into its vendor / instance / profile parts.
+///
+/// Splitting on `.` alone is what made the old combo unusable: the PCI address
+/// of a built-in card contains a dot (`pci-0000_00_1f.3`), so the “last segment
+/// after the dot” was `analog-stereo` for **every** analog card.  The instance
+/// is everything between the vendor head and the last segment, dots included.
+pub fn name_parts(name: &str) -> NameParts<'_> {
+    let name = name.trim();
+    let Some((vendor, rest)) = name.split_once('.') else {
+        return NameParts {
+            vendor: name,
+            instance: None,
+            profile: None,
+        };
+    };
+    match rest.rsplit_once('.') {
+        Some((instance, profile)) => NameParts {
+            vendor,
+            instance: Some(instance),
+            profile: Some(profile),
+        },
+        None if !rest.is_empty() => NameParts {
+            vendor,
+            instance: Some(rest),
+            profile: None,
+        },
+        None => NameParts {
+            vendor,
+            instance: None,
+            profile: None,
+        },
+    }
+}
+
+/// Human-readable model of an instance segment, when it names one.
+///
+/// * `usb-PreSonus_Studio_26c_01424548-00` → `PreSonus Studio 26c` (the `usb-`
+///   prefix and the trailing serial go);
+/// * `usb-C-Media_Electronics_Inc._USB_Audio_Device-00` →
+///   `C-Media Electronics Inc. USB Audio Device`;
+/// * `pci-0000_00_1f.3` → `None` (a PCI address names nothing a user knows);
+/// * `AC_80_0B_1F_22_33_44` → `None` (a Bluetooth MAC address, likewise).
+pub fn instance_model(instance: &str) -> Option<String> {
+    let instance = instance.trim();
+    if instance.is_empty() {
+        return None;
+    }
+    // A bare bus prefix (`alsa_input.pci.analog-stereo`, where the dot-separated
+    // instance is just `pci`) names no model at all.
+    if matches!(instance, "pci" | "usb" | "platform" | "bluez" | "alsa") {
+        return None;
+    }
+    let mut text = instance;
+    if let Some(rest) = text.strip_prefix("pci-") {
+        // `pci-0000_00_1f.3`: an address, never a model.
+        if rest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '_' | '-' | '.'))
+        {
+            return None;
+        }
+        text = rest;
+    }
+    let text = text
+        .strip_prefix("usb-")
+        .or_else(|| text.strip_prefix("platform-"))
+        .unwrap_or(text);
+    let mut words: Vec<&str> = text.split('_').filter(|word| !word.is_empty()).collect();
+    // A MAC address (`AC_80_0B_1F_22_33_44`, `00_1B_63_AA_BB_CC`, `AA`) is
+    // all short hex groups: it identifies the device but reads as noise.
+    if words
+        .iter()
+        .all(|word| word.len() <= 2 && word.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    while words.len() > 1 && is_serial_token(words[words.len() - 1]) {
+        words.pop();
+    }
+    let mut model = words.join(" ");
+    // `USB_Audio_Device-00`: the trailing index is the card number, not the name.
+    if let Some(stripped) = strip_trailing_index(&model) {
+        model = stripped;
+    }
+    let model = model.trim();
+    if model.is_empty() || !model.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    Some(elide_chars(model, MAX_MODEL_CHARS))
+}
+
+/// A token that is a serial number / index rather than a word of a model:
+/// `01424548-00`, `0B1F22`, `00001234`.
+fn is_serial_token(token: &str) -> bool {
+    let serial_like = token
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || c == '-');
+    serial_like
+        && token.chars().any(|c| c.is_ascii_digit())
+        && (token.contains('-') || token.len() >= 6)
+}
+
+/// `USB_Audio_Device-00` → `USB_Audio_Device` (only when what remains still
+/// carries a letter, so `pci-0000` is never mangled into `pci`).
+fn strip_trailing_index(text: &str) -> Option<String> {
+    let (head, tail) = text.rsplit_once('-')?;
+    if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !head.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    Some(head.to_string())
+}
+
+/// Cut `text` to `max` characters, ending with `…` when something was cut.
+pub fn elide_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut short: String = text.chars().take(max.saturating_sub(1)).collect();
+    short.push('…');
+    short
+}
+
+/// A short, **distinctive** label for one device, sized for a name field.
+///
+/// Precedence: the engine's description (what the user reads on their desktop),
+/// then the model extracted from the instance segment, then the **profile** —
+/// which is all a `pci-0000_00_1f.3` style name offers and is exactly what the
+/// old rule always returned.
+///
+/// ```text
+/// alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0
+///     → PreSonus Studio 26c          (model, never `analog-stereo` again)
+/// alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo
+///     → C-Media Electronics Inc. USB Audio Device
+/// alsa_output.pci-0000_00_1f.3.analog-stereo
+///     → analog-stereo                (a PCI address names no model)
+/// ```
+pub fn short_label(name: &str, description: Option<&str>) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+    let parts = name_parts(name);
+    if let Some(description) = description.map(str::trim).filter(|d| !d.is_empty()) {
+        return description.to_string();
+    }
+    if let Some(model) = parts.instance.and_then(instance_model) {
+        return model;
+    }
+    match parts.profile.filter(|profile| useful_profile(profile)) {
+        Some(profile) => profile.to_string(),
+        None if parts.vendor.is_empty() => name.to_string(),
+        None => parts.vendor.to_string(),
+    }
+}
+
+/// The full, human label of one device — the device pop-up's row text.
+///
+/// The old rule kept the last dotted segment, which is the *profile*: every
+/// analog card therefore read `analog-stereo`, and the C-Media and the PreSonus
+/// were indistinguishable (reported by the user — the device menu was unusable).
+/// The label now prefers the human description the engine publishes, then the
+/// model extracted from the instance segment, and finally the vendor head:
+///
+/// | `node.name` | description | label |
+/// |---|---|---|
+/// | `alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0` | — | `PreSonus Studio 26c · pro-output-0` |
+/// | `alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo` | — | `C-Media Electronics Inc. USB Audio Device · analog-stereo` |
+/// | `alsa_output.pci-0000_00_1f.3.analog-stereo` | — | `alsa_output · analog-stereo` |
+/// | `alsa_output.pci-0000_00_1f.3.analog-stereo` | `Built-in Audio Analog Stereo` | `Built-in Audio Analog Stereo` |
+/// | `bluez_output.AC_80_0B_1F_22_33_44.a2dp-sink` | `WH-1000XM4` | `WH-1000XM4 · a2dp-sink` |
+///
+/// The profile is dropped when the description already carries it (`Built-in
+/// Audio Analog Stereo` must not become `… · analog-stereo`).
+pub fn readable_label(name: &str, description: Option<&str>) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+    let parts = name_parts(name);
+    let description = description.map(str::trim).filter(|d| !d.is_empty());
+    let head = match description {
+        Some(description) => description.to_string(),
+        None => match parts.instance.and_then(instance_model) {
+            Some(model) => model,
+            None if parts.vendor.is_empty() => name.to_string(),
+            None => parts.vendor.to_string(),
+        },
+    };
+    let profile = parts.profile.filter(|profile| useful_profile(profile));
+    match profile {
+        Some(profile) if !squash(&head).contains(&squash(profile)) => {
+            format!("{head} · {profile}")
+        }
+        _ => head,
+    }
+}
+
+/// A profile segment worth showing: `analog-stereo`, `pro-output-1` — but not a
+/// one-character tail (`bluez_output.AC_80….1`) and not a bare number.
+fn useful_profile(profile: &str) -> bool {
+    profile.chars().count() >= 3 && profile.chars().any(char::is_alphabetic)
+}
+
+/// Lowercase, letters and digits only — so `analog-stereo` matches the
+/// `Analog Stereo` inside a description.
+fn squash(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// What the strip's device combo must show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevicePresence {
@@ -536,6 +780,110 @@ mod tests {
         // A virtual bus is always fine.
         let bus = output("out-bus", None);
         assert_eq!(presence(&bus, &devices), DevicePresence::Found);
+    }
+
+    // --- readable labels ---------------------------------------------------
+
+    /// The regression the user reported: the combo kept the *last* segment, so
+    /// two different cards both read `analog-stereo` and the menu was unusable.
+    #[test]
+    fn two_different_cards_get_two_different_labels() {
+        let presonus =
+            readable_label("alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0", None);
+        let cmedia = readable_label(
+            "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo",
+            None,
+        );
+        assert_eq!(presonus, "PreSonus Studio 26c · pro-output-0");
+        assert_eq!(
+            cmedia,
+            "C-Media Electronics Inc. USB Audio Device · analog-stereo"
+        );
+        assert_ne!(presonus, cmedia);
+        // …and two profiles of the *same* card stay distinguishable.
+        let mono = readable_label(
+            "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-1",
+            None,
+        );
+        assert_ne!(presonus, mono);
+        assert!(mono.ends_with("pro-output-1"), "{mono}");
+    }
+
+    /// A PCI address identifies nothing a user knows, so the label falls back to
+    /// the vendor head + profile instead of `0000 00 1f 3`.
+    #[test]
+    fn an_address_like_instance_falls_back_to_the_vendor_head() {
+        assert_eq!(
+            readable_label("alsa_output.pci-0000_00_1f.3.analog-stereo", None),
+            "alsa_output · analog-stereo"
+        );
+        // An output and an input of the same card differ by their vendor head.
+        assert_eq!(
+            readable_label("alsa_input.pci-0000_00_1f.3.analog-stereo", None),
+            "alsa_input · analog-stereo"
+        );
+        // A Bluetooth MAC is noise as well.
+        assert_eq!(
+            readable_label("bluez_output.AC_80_0B_1F_22_33_44.a2dp-sink", None),
+            "bluez_output · a2dp-sink"
+        );
+    }
+
+    /// The description is what the user reads on their desktop, so it wins — and
+    /// the profile is not repeated when the description already says it.
+    #[test]
+    fn the_description_wins_and_the_profile_is_not_repeated() {
+        assert_eq!(
+            readable_label(
+                "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                Some("Built-in Audio Analog Stereo")
+            ),
+            "Built-in Audio Analog Stereo"
+        );
+        assert_eq!(
+            readable_label(
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+                Some("Studio 26c")
+            ),
+            "Studio 26c · pro-output-0"
+        );
+        // A blank description is the same as none.
+        assert_eq!(readable_label("alsa_output.hp", Some("   ")), "hp");
+    }
+
+    #[test]
+    fn a_serial_number_is_not_part_of_the_model() {
+        // `-00` is the card index, the hex blob is the serial.
+        assert_eq!(
+            instance_model("usb-PreSonus_Studio_26c_01424548-00").as_deref(),
+            Some("PreSonus Studio 26c")
+        );
+        assert_eq!(
+            instance_model("usb-Kingston_2").as_deref(),
+            Some("Kingston 2")
+        );
+        assert_eq!(instance_model("pci-0000_00_1f.3"), None);
+        assert_eq!(instance_model("AC_80_0B_1F_22_33_44"), None);
+        assert_eq!(instance_model(""), None);
+        // A model longer than `MAX_MODEL_CHARS` is elided, never dropped.
+        let long = instance_model(&format!("usb-{}", "X".repeat(100))).expect("a model");
+        assert_eq!(long.chars().count(), MAX_MODEL_CHARS);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn a_name_without_a_dot_is_kept_as_it_is() {
+        assert_eq!(readable_label("Holaf_Bus_Mic", None), "Holaf_Bus_Mic");
+        assert_eq!(readable_label("", None), "");
+        assert_eq!(readable_label("  alsa_output.hp  ", None), "hp");
+    }
+
+    #[test]
+    fn eliding_keeps_the_text_whole_until_the_limit() {
+        assert_eq!(elide_chars("abc", 15), "abc");
+        assert_eq!(elide_chars("abcdef", 4), "abc…");
+        assert_eq!(elide_chars("abcdef", 4).chars().count(), 4);
+        assert_eq!(elide_chars("abcdef", 0), "…");
     }
 
     #[test]

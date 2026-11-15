@@ -5,23 +5,22 @@
 #  a real Arch package (pacman owns the files, `depends` are resolved, a clean
 #  `pacman -Rns` uninstalls).
 #
-#  It is NOT how the project is delivered: the application ships as the
-#  GitHub Actions artifact (`.github/workflows/build.yml`),
-#  `holaf-mix-<version>-<arch>.tar.gz`, which already contains holaf-mix,
-#  holaf-ui, holafd, holafctl and the icons.  Building from this PKGBUILD is a
-#  deliberate choice (own machine, or distributing to other Arch users) — see
-#  BUILD.md §1 for the artifact path and §4 for this package.
+#  It is NOT how the project is delivered: the application ships as the GitHub
+#  Actions artifact (`.github/workflows/build.yml`),
+#  `holaf-mix-<version>-<arch>.tar.gz`, which already contains holaf-ui,
+#  holafd, holafctl and the icons.  Building from this PKGBUILD is a deliberate
+#  choice (own machine, or distributing to other Arch users) — see BUILD.md §1
+#  for the artifact path and §4 for this package.
 #
-#  In both cases the RUNTIME dependencies below must be installed; they are the
-#  same list the tarball needs (BUILD.md §1.3).
+#  Holaf-Mix is a 100 % Rust product: no Python, no PyInstaller, no venv.
 #
 #  Usage:
 #    makepkg -si          # build + install deps + install
 #    makepkg -s           # build + install deps (no install)
-#    makepkg --clean       # clean build dir
+#    makepkg --clean      # clean build dir
 #
 #  After install:
-#    holaf-mix             # run the app
+#    holaf-ui              # the app (or `holaf-mix`, a thin shell launcher)
 #    holaf-mix.desktop     # appears in KDE app menu under "Multimedia"
 #
 #  To uninstall:  sudo pacman -Rns holaf-mix
@@ -39,39 +38,20 @@ license=('MIT')
 #  that actually ships the file the code opens (archlinux.org file lists),
 #  not guessed:
 #
-#    ldd rust/target/release/holaf-ui | holafd   →  libpipewire-0.3.so.0,
-#        libasound.so.2 (NO GTK: the tray is a pure D-Bus StatusNotifierItem,
-#        see the tray note below)
-#    ldd + dlopen strings                        →  libGL (glow/glutin),
-#        libwayland-client (`wayland-sys` with `dlopen`), libxkbcommon
-#        (winit/xkbcommon-dl)
-#    exec'ed binaries (Rust + Python code)       →  pactl, pw-cat, pw-cli,
-#        pw-dump, pw-link, pw-metadata, pw-top
+#    ldd holaf-ui | holafd      →  libpipewire-0.3.so.0, libasound.so.2
+#                                   (NO GTK: the tray is a D-Bus
+#                                   StatusNotifierItem, see the tray note below)
+#    ldd + dlopen strings       →  libGL (glow/glutin), libwayland-client
+#                                   (`wayland-sys` with `dlopen`), libxkbcommon
+#                                   (winit/xkbcommon-dl)
+#    exec'ed binaries (Rust)    →  pactl, pw-cat, pw-cli, pw-dump, pw-link,
+#                                   pw-metadata, pw-top
 # ----------------------------------------------------------------------------
 depends=(
-    # --- Python side -------------------------------------------------------
-    # The PyInstaller bundle is built with the SYSTEM python, so these must be
-    # installed before `makepkg`.  Three of the previous names did not exist in
-    # any official Arch repo:
-    #   python-pyside6        -> pyside6        ([extra])
-    #   python-python-rtmidi  -> python-rtmidi  ([extra])
-    #   python-sounddevice    -> AUR only (see the comment below)
-    'python>=3.10'
-    'pyside6'
-    'python-numpy'
-    'python-mido'
-    'python-rtmidi'
-    # `python-sounddevice` has NO official-repo counterpart (AUR: 0.5.6).  It
-    # feeds only the *Python* metering fallback (src/backend/metering.py —
-    # PortAudio capture); the Rust UI records with `pw-cat`.  Declaring an AUR
-    # package in `depends` would make `makepkg -si` unresolvable, so install it
-    # separately when the Qt escape hatch must keep its meters:
-    #   python-sounddevice        [AUR]
-
     # --- PipeWire stack ---------------------------------------------------
     'pipewire'            # libpipewire-0.3.so.0 (ldd holaf-ui, holafd) and the
                           # tools pw-cli / pw-dump / pw-link / pw-metadata /
-                          # pw-top (Python engine, Rust diagnostics)
+                          # pw-top (diagnostics)
     'pipewire-audio'      # pw-cat — one child process per VU-meter source
                           # (rust/crates/holaf-ui/src/capture.rs)
     'pipewire-pulse'      # the PulseAudio-compatible SERVER: `pactl` is a
@@ -81,10 +61,7 @@ depends=(
                           # hard pacman conflict.  PulseAudio is gone from
                           # depends on purpose: the app is PipeWire-only.
     'libpulse'            # /usr/bin/pactl itself — used to list and move app
-                          # streams (rust/crates/holaf-pw/src/sink_inputs.rs,
-                          # src/backend/pipewire_utils.py).  `pipewire-pulse`
-                          # pulls it in, but holaf-ui EXECs the binary, so it
-                          # is declared explicitly.
+                          # streams (rust/crates/holaf-pw/src/sink_inputs.rs)
     'wireplumber'         # satisfies pipewire-pulse's `pipewire-session-manager`
                           # dependency and builds the graph Holaf-Mix renames,
                           # links and meters
@@ -92,13 +69,11 @@ depends=(
     # --- Window system: WAYLAND -------------------------------------------
     # holaf-ui is a Wayland client (eframe/winit with the `wayland` feature and
     # NO `x11`: that is what removes the "X11" application icon and the
-    # "needs an X server" behaviour on a Wayland desktop).  In a build WITHOUT
-    # the tray, winit `dlopen`s both libraries (`wayland-sys/dlopen`,
-    # `xkbcommon-dl`), so the ELF loader does not need them and pacman cannot
-    # see them as hard dependencies — declaring them here is still the only way
-    # `holaf-ui` starts on a minimal Wayland session.  (With `--features tray`,
-    # GTK3 links them anyway; the declared deps cover both builds.)
-    # An X11-only machine needs a build with `--features x11` and
+    # "needs an X server" behaviour on a Wayland desktop).  winit `dlopen`s both
+    # libraries (`wayland-sys/dlopen`, `xkbcommon-dl`), so the ELF loader does
+    # not need them and pacman cannot see them as hard dependencies — declaring
+    # them here is still the only way `holaf-ui` starts on a minimal Wayland
+    # session.  An X11-only machine needs a build with `--features x11` and
     # `libxkbcommon-x11` (optdepend below).
     'wayland'             # libwayland-client.so.0 — the Wayland client library
     'libxkbcommon'        # libxkbcommon.so.0 — keyboard handling (winit)
@@ -107,16 +82,14 @@ depends=(
     'alsa-lib'            # libasound.so.2 — hard-linked: midir talks to the
                           # ALSA sequencer for the AKAI MIDI Mix
     'swh-plugins'         # /usr/lib/ladspa/{gate_1410,mbeq_1197,sc4_1882}.so —
-                          # the exact files of FX_PLUGIN_MAP in
-                          # src/backend/audio_engine.py.  NOTE: `ladspa-plugins`
+                          # the LADSPA FX the UI offers.  NOTE: `ladspa-plugins`
                           # does not exist on Arch (nor on Debian), it was a
                           # phantom dependency.
     # NOTE: `tap-plugins` (tap_tubewarmth.so — the TUBE WARMTH strip) is NOT
-    # here on purpose: it is **AUR-only** on Arch (`tap-plugins` 1.0.1-3), and a
-    # `depends` entry on a non-repo package makes `makepkg` unresolvable for
-    # everyone.  It is an optdepend below instead — the other strips (gate,
-    # eq, comp, noise) work without it, the UI only offers the FX whose plugin
-    # file it finds in /usr/lib/ladspa.
+    # here on purpose: it is **AUR-only** on Arch, and a `depends` entry on a
+    # non-repo package makes `makepkg` unresolvable for everyone.  It is an
+    # optdepend below instead — the other strips work without it, the UI only
+    # offers the FX whose plugin file it finds in /usr/lib/ladspa.
 
     # Tray icon: `holaf-ui` is built with `--features tray` by
     # scripts/build_rust.sh (the default).  That feature is the **ksni**
@@ -129,29 +102,22 @@ makedepends=(
     'librsvg'              # rsvg-convert — `librsvg2` does not exist on Arch
                            # (that is the Debian/makedeb name)
     'imagemagick'          # magick, for the ICO/PNG bundling
-    # Rust UI (holaf-ui) + daemon (holafd) + CLI (holafctl): the UI is the
-    # app's window and the daemon is the audio backend of the Qt fallback;
-    # all three are embedded in the PyInstaller bundle and installed to
-    # /usr/bin.
-    'rust'
+    'rust'                 # holaf-ui + holafd + holafctl are the whole product
     'clang'                # bindgen needs libclang.so (libspa-sys / pipewire-sys)
     'pkgconf'              # the -sys crates (libspa-sys, pipewire-sys,
-                          # alsa-sys) probe the .pc files at build time
+                           # alsa-sys) probe the .pc files at build time
+    'wayland'              # wayland-scanner (winit generates its bindings)
+    'wayland-protocols'    # xdg-shell / xdg-decoration / viewporter XMLs
+    'libxkbcommon'         # keyboard protocol headers for the Wayland backend
     # NOTE: no `git` — the workspace has no git-sourced crate (Cargo.lock is
-    # registry-only), so cargo never shells out to it.
-    #
-    # NOTE: PyInstaller is NOT a makedep here.  There is no `python-pyinstaller`
-    # package in any official Arch repo (nor in the AUR under that name: the AUR
-    # package is `pyinstaller`), and it is a pure build-time tool, so it is
-    # installed with pip exactly like build.sh does.  build() fails with an
-    # explicit message when it is missing.
+    # registry-only), so cargo never shells out to it.  No Python either.
 )
 optdepends=(
     # `tap-plugins` is the TUBE WARMTH strip (`tap_tubewarmth.so` in
-    # /usr/lib/ladspa, named by rust/crates/holaf-core/src/spa.rs and
-    # tools/export_fixtures.py).  It is AUR-only on Arch, hence an optdepend and
-    # not a `depends` entry: every other strip works without it, and the UI only
-    # offers an FX whose plugin file it actually finds.
+    # /usr/lib/ladspa, named by rust/crates/holaf-core/src/spa.rs).  It is
+    # AUR-only on Arch, hence an optdepend and not a `depends` entry: every
+    # other strip works without it, and the UI only offers an FX whose plugin
+    # file it actually finds.
     'tap-plugins: TUBE WARMTH strip — AUR only (tap_tubewarmth.so in /usr/lib/ladspa); every other strip works without it'
     # `rnnoise` ([extra]) is the DENOISER LIBRARY, it ships NO LADSPA plugin:
     # the `noise_cancel` strip needs `librnnoise_ladspa.so`
@@ -160,9 +126,6 @@ optdepends=(
     # into /usr/lib/ladspa/ to enable that strip — the other three FX
     # (gate/mbeq/sc4) come from `swh-plugins`, a hard dependency.
     'rnnoise: noise_cancel strip — needs librnnoise_ladspa.so, built from source (not packaged)'
-    # The Qt (PySide6) UI is only the `HOLAF_UI=python` fallback now, and its GTK
-    # platform theme dlopen()s the SYSTEM GTK3.  holaf-ui itself links none.
-    'gtk3: only for the Qt (PySide6) fallback UI — its platform theme (plugins/platformthemes/libqgtk3.so) needs the SYSTEM GTK3'
     # A StatusNotifier HOST is what actually draws the tray icon; without one
     # the app detects it (org.kde.StatusNotifierWatcher has no owner), logs a
     # warning and closing the window QUITS instead of hiding — so it can never
@@ -196,11 +159,8 @@ build() {
     ./assets/icons/build_icons.sh
 
     # 2. Build the Rust UI (holaf-ui) + daemon (holafd) + CLI (holafctl) and
-    #    publish them to dist/ so that step 3 embeds them (packaging/
-    #    holaf-mix.spec reads dist/holaf-ui, dist/holafd).  holaf-ui is the
-    #    app's window and holafd the audio backend, so failing here would ship
-    #    an app that can only run the Qt fallback — make it a hard error
-    #    (cargo is in makedepends).
+    #    publish them to dist/.  These three ARE the product (no Python bundle,
+    #    no PyInstaller), so a failure here is fatal — cargo is in makedepends.
     ./scripts/build_rust.sh
     for bin in holaf-ui holafd holafctl; do
         if [[ ! -x "dist/$bin" ]]; then
@@ -210,24 +170,8 @@ build() {
     done
     msg "Rust binaries: holaf-ui ($(du -h dist/holaf-ui | cut -f1)), holafd, holafctl"
 
-    # 3. Build the standalone executable via PyInstaller
-    #    PyInstaller has no Arch package (official repos or AUR under that
-    #    name): it is a build-only tool installed with pip, like build.sh does.
-    #    Fail with a legible message instead of "pyinstaller: command not found".
-    if ! command -v pyinstaller >/dev/null 2>&1; then
-        error "pyinstaller not found."
-        error "  Arch has no pyinstaller package: pip install --user pyinstaller"
-        error "  (see BUILD.md, section 'Install build dependencies')"
-        exit 1
-    fi
-    pyinstaller \
-        --noconfirm \
-        --clean \
-        --workpath build/pyinstaller \
-        --distpath build/dist \
-        packaging/holaf-mix.spec
-
-    # 4. Re-render the .desktop with absolute install paths
+    # 3. Re-render the .desktop with absolute install paths
+    mkdir -p build
     sed \
         -e "s|__EXEC_PATH__|/usr/bin|g" \
         -e "s|__ICON_PATH__|/usr/share/holaf-mix/icons|g" \
@@ -238,27 +182,13 @@ build() {
 package() {
     cd "$_srcdir"
 
-    # --- Binary ---
-    install -Dm755 "build/dist/holaf-mix"             "$pkgdir/usr/bin/holaf-mix"
-    # If onedir mode, copy the whole folder:
-    if [[ -d build/dist/holaf-mix ]]; then
-        install -dm755 "$pkgdir/usr/lib/holaf-mix"
-        cp -r build/dist/holaf-mix/. "$pkgdir/usr/lib/holaf-mix/"
-        # Symlink to /usr/bin
-        ln -sf /usr/lib/holaf-mix/holaf-mix "$pkgdir/usr/bin/holaf-mix"
-    fi
-
-    # --- Rust UI + daemon + CLI ---------------------------------------
-    # All three are ALSO installed in /usr/bin, i.e. NEXT TO the holaf-mix
-    # executable: that is the first place src/launcher.py (holaf-ui) and
-    # src/backend/rust_launcher.py (holafd) probe in a frozen app, so the
-    # packaged binaries are found without any env var.  (They are embedded in
-    # the PyInstaller bundle too; these copies are what the .desktop file and
-    # holafctl users invoke directly, and what an operator can rebuild/upgrade
-    # independently of the Python bundle.)
+    # --- The application (Rust binaries) -------------------------------
+    # holaf-ui is the entry point; holaf-mix is the same "familiar command"
+    # kept alive by a 20-line shell script (no Python).
     install -Dm755 "dist/holaf-ui"  "$pkgdir/usr/bin/holaf-ui"
-    install -Dm755 "dist/holafd"   "$pkgdir/usr/bin/holafd"
-    install -Dm755 "dist/holafctl" "$pkgdir/usr/bin/holafctl"
+    install -Dm755 "dist/holafd"    "$pkgdir/usr/bin/holafd"
+    install -Dm755 "dist/holafctl"  "$pkgdir/usr/bin/holafctl"
+    install -Dm755 "packaging/holaf-mix.sh" "$pkgdir/usr/bin/holaf-mix"
 
     # --- Icons (all sizes for HiDPI support) ---
     install -dm755 "$pkgdir/usr/share/holaf-mix/icons"
@@ -284,13 +214,7 @@ package() {
     install -Dm644 build/holaf-mix.desktop \
         "$pkgdir/usr/share/applications/holaf-mix.desktop"
 
-    # --- Optional: default config next to the binary ---
-    # Commented out: each user gets their own config.json on first run.
-    # Uncomment to ship a pre-configured default:
-    # install -Dm644 config.json "$pkgdir/usr/share/holaf-mix/config.json.default"
-
     # --- License ---
-    # If you have a LICENSE file, install it
     if [[ -f LICENSE ]]; then
         install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     fi
@@ -306,17 +230,12 @@ post_install() {
     if [[ -x /usr/bin/update-desktop-database ]]; then
         update-desktop-database -q /usr/share/applications 2>/dev/null || true
     fi
-    echo "==> Holaf-Mix installed. Launch with: holaf-mix (or holaf-ui)"
-    echo "    UI:    Rust/egui binary 'holaf-ui' (/usr/bin/holaf-ui), started by the"
-    echo "           holaf-mix launcher. The Qt UI stays available as an escape"
-    echo "           hatch: HOLAF_UI=python holaf-mix"
-    echo "    Audio core: Rust daemon 'holafd' (/usr/bin/holafd, started on demand"
-    echo "           by the Qt UI; the Rust UI drives PipeWire in-process)."
-    echo "           CLI: holafctl status"
-    echo "    Config will be created at: ~/.config/holaf-mix/ on first run"
-    # NOTE: the app currently saves config next to the binary.
-    # If you want it in ~/.config/, patch src/config/settings.py to use
-    # XDG_CONFIG_HOME / ~/.config/holaf-mix/config.json
+    echo "==> Holaf-Mix installed. Launch with: holaf-ui (or holaf-mix)"
+    echo "    UI + audio: the Rust binary 'holaf-ui' drives PipeWire in-process"
+    echo "                (no daemon needed). CLI: holafctl status"
+    echo "    Config:     \$XDG_CONFIG_HOME/holaf-mix/config.json"
+    echo "                (~/.config/holaf-mix/config.json) on first run;"
+    echo "                'holaf-ui --help' shows --config / --midi."
 }
 
 post_upgrade() {

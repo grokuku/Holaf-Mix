@@ -49,6 +49,6 @@ pub mod sys;
 
 pub use backend::PipeWireBackend;
 pub use chainhost::{ChainHost, FxHostMode};
-pub use live::LiveView;
+pub use live::{LiveView, MonoDownmix};
 // Backwards-compatible re-export for the holaf-spike binary (J1 helpers).
 pub use spa_config::*;

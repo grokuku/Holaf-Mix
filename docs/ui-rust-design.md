@@ -1099,6 +1099,115 @@ l'utilisateur.  Tout ce qui *décide* est testé sans session graphique.
 
 ---
 
+## 10sexies. Deuxième essai sur machine réelle : menu de device et VU-mètres
+
+Trois défauts rapportés le 2026-11-15 (« le menu de selection est tout petit et
+le nom des entrees est a rallonge », « les vumetres sont toujours a fond (meme
+quand le son est faible) »), plus une question sur la sortie **mono** du PreSonus.
+
+### 10sexies.1 Menu de sélection de device
+
+La pop-up faisait **240 × ~70 px** (largeur = largeur de la combo clippée) et
+chaque entrée était le profil seul : `analog-stereo` pour la carte HDA **et**
+pour le PreSonus — indistinguables, donc inutilisable.
+
+* **Libellé** (`devices::readable_label` / `short_label`) : la description du
+  nœud quand l'engine la publie, sinon le **modèle** extrait du segment
+  d'instance, sinon le profil.  Le segment d'instance est maintenant lu
+  correctement (l'adresse PCI contient un point : `pci-0000_00_1f.3`, l'ancien
+  découpage sur `.` prenait `3` pour un profil) :
+
+  | `node.name` | libellé pop-up | combo (15 car.) |
+  |---|---|---|
+  | `alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0` | `PreSonus Studio 26c · pro-output-0` | `PreSonus Studi…` |
+  | `alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo` | `C-Media Electronics Inc. USB Audio Device · analog-stereo` | `C-Media Electr…` |
+  | `alsa_output.pci-0000_00_1f.3.analog-stereo` | `alsa_output · analog-stereo` (ou la description : `Built-in Audio Analog Stereo`) | `analog-stereo` |
+
+  Les suffixes de série (`-00`, `01424548`) sont retirés du modèle ; une adresse
+  PCI ou une MAC Bluetooth ne produit pas de libellé (« 0000 00 1f 3 » n'aide
+  personne) ; deux libellés identiques (deux interfaces USB du même modèle) sont
+  désambiguïsés par le segment d'instance.  `holaf-pw::device_list` publie
+  désormais `description` (`node.description` puis `node.nick`), ce qui donne le
+  nom que l'utilisateur lit dans son bureau.
+* **Pop-up** (`dialogs::picker_geometry` + `popup_geometry`, purs) : largeur =
+  largeur du plus long libellé mesurée par egui, bornée **380–560 px** et jamais
+  plus étroite que la combo ; hauteur = une ligne par device (`ROW_HEIGHT` 24 px)
+  avec un plancher de **240 px** (une liste de 3 devices respire) et un plafond de
+  **420 px** au-delà duquel la liste défile ; ouverture **sous** la combo, bascule
+  **au-dessus** quand il y a plus de place là (`popup_geometry` est testé pour 3,
+  10 et 40 devices, et pour une combo en bas de fenêtre).  Une ligne = un device :
+  `TextWrapMode::Truncate` et le `node.name` complet en infobulle (`DeviceChoice.detail`).
+* Snapshots (`holaf-ui-snapshot --dialog device --devices N`) :
+
+  | N devices | taille de la pop-up (mesurée) |
+  |---|---|
+  | 3 | 380 × 242 |
+  | 10 | 441 × 310 (largeur dictée par le libellé le plus long) |
+  | 30 | 441 × 422 (plafond, la liste défile) |
+
+  Capture (10 devices) : [`docs/ui-rust-device-picker.png`](./ui-rust-device-picker.png).
+
+### 10sexies.2 VU-mètres « toujours à fond »
+
+**Mesuré, pas supposé.**  Un `adapter`/`null-audio-sink` brut est **pré-fader** :
+un ton 1 kHz à 0.5 d'amplitude donne le même RMS (0.3535) à `channelVolumes`
+1.0, 0.3 et 0.085.  Les bus du moteur, eux, sont **post-fader** parce que
+`push_volume_mute_pod` écrit aussi `Props.monitorVolumes` — ce que fait le moteur
+Python avec `pactl set-source-volume <source>.monitor`.  Mesure sur le bus d'un
+strip, volume du strip à 1.0 / 0.3 / 0.1 : RMS **0.3535 / 0.0096 / 0.0004**,
+c.-à-d. exactement `pulse_linear_gain(volume)` (courbe cubique PulseAudio).
+Activer `monitor.channel-volumes` **en plus** doublerait l'atténuation (mesuré :
+0.3 → 0.032 au lieu de 0.106) : c'est le piège à ne pas refaire, et l'UI ne
+multiplie donc **jamais** le niveau par le volume du strip.
+
+La vraie cause du « à fond » était donc l'**échelle** : `min(1, rms × 5)`
+(parité Qt) sature à RMS 0.2 = **−14 dBFS**, donc tout morceau ou toute voix
+normale collait les deux barres en haut.  L'échelle est maintenant en dBFS
+(`meters::level_from_amplitude`) : −60 dBFS → 0, 0 dBFS → 1.
+
+| RMS | dBFS | avant (`rms×5`) | maintenant |
+|---|---|---|---|
+| 0.354 (sinus −6 dBFS) | −9 | 1.00 | 0.85 |
+| 0.2 | −14 | **1.00** | 0.77 |
+| 0.1 | −20 | 0.50 | 0.67 |
+| 0.0316 | −30 | 0.16 | 0.50 |
+| 0.00316 | −50 | 0.02 | 0.17 |
+
+En plus : un strip **mute** force un VU noir (le moteur coupe le monitor d'un bus,
+mais un strip physique enregistre sa *source* de device, dont `monitorMute` n'est
+pas à nous).  Tests : échelle (7 points + monotonie + silence/NaN), « un sinus
+faible n'est pas à fond », post-fader (fader 1.0 vs 0.3 vs 0.5), mute → noir,
+**et deux tests live** (opt-in) : `the_vu_monitor_level_follows_the_strip_fader`
+(RMS du monitor à 1.0 vs 0.3 vs mute) et `a_live_capture_feeds_the_board`.
+
+### 10sexies.3 Sortie mono : option de downmix L+R
+
+Le seul retour de l'utilisateur est un PreSonus en `pro-output-0` (**un** port
+`playback_MONO`) : le lien historique est `monitor_FL → playback_MONO`, donc la
+moitié droite du mix est perdue sans le moindre symptôme (un lien, aucune route
+en attente).  Trois options réalistes, toutes documentées dans
+`holaf_pw::MonoDownmix` :
+
+| `ui_rust.mono_downmix` | liens | gain sur un signal corrélé | verdict |
+|---|---|---|---|
+| `left` (**défaut**) | `FL → MONO` | 0 dB — moitié du mix perdue | parité Python, aucun changement pour qui ne demande rien |
+| `sum` | `FL → MONO` + `FR → MONO` (PipeWire somme) | **+6 dB** → risque d'écrêtage | à éviter, gardé pour comparer |
+| `average` (recommandé) | les deux liens **et** −6 dB sur le nœud du strip | 0 dB, rien de perdu = `(FL+FR)/2` | ce que fait tout DAW qui replie en mono |
+
+Un `−3 dB` supplémentaire (`(FL+FR)/2 × 0,707`) n'est **pas** cuit dans le gain :
+il rendrait le strip 3 dB plus bas que son étiquette, alors que le fader est là
+pour ça.  La politique est lue une fois au démarrage (`AppState::mono_downmix`),
+envoyée au thread moteur (`EngineBridge::spawn_pipewire(downmix)` →
+`PipeWireBackend::set_mono_downmix`), et **re-dérivée à chaud** : les routes sont
+recréées et les volumes repoussés (le trim de `average` vit dans le gain du nœud).
+Test live `the_mono_downmix_option_rewires_a_mono_route` : `average` → 2 liens +
+`channelVolumes` = 0.0625 (volume 0.5 × −6 dB), puis retour à `left` → 1 lien et
+plus de trim.  **Le défaut reste `left`** : le passage à `average` doit être validé
+par l'utilisateur sur son matériel (voir « reste à valider » dans le rapport de
+session).
+
+---
+
 ## 11. Raccourcis
 
 * Inventaire chiffré : [`docs/ui-inventory.md`](./ui-inventory.md)

@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  build.sh — End-to-end build script for Holaf-Mix
+#  build.sh — Build Holaf-Mix (100 % Rust) and package the distribution tarball
 # ============================================================================
-#  Renders the icon set, builds the Rust binaries (holaf-ui + holafd +
-#  holafctl), builds the standalone executable (embedding all three), and
-#  (optionally) packages everything into a tarball for distribution.
+#  Holaf-Mix ships as Rust binaries only: `holaf-ui` (the app), `holafd` (the
+#  audio daemon, an alternative/CLI backend) and `holafctl` (the CLI).  There is
+#  no Python, no PyInstaller and no venv anywhere in the build.
 #
 #  Usage:
-#    ./build.sh                          # icons + Rust daemon + executable
-#    ./build.sh --install-deps           # install system + Python deps
-#    ./build.sh --icons-only             # just rebuild icons
-#    ./build.sh --run                    # build, then launch the binary
-#    ./build.sh --tarball                # also produce a .tar.gz
-#    ./build.sh --clean                  # remove all build artifacts
-#    ./build.sh --onedir                 # onedir build instead of onefile
+#    ./build.sh                  # icons + cargo build (holaf-ui, holafd, holafctl)
+#    ./build.sh --tarball        # ... and produce dist/holaf-mix-<ver>-<arch>.tar.gz
+#    ./build.sh --run            # build, then launch dist/holaf-ui
+#    ./build.sh --icons-only     # just rebuild the icon set
+#    ./build.sh --check          # verify the build dependencies
+#    ./build.sh --install-deps   # install the system dependencies
+#    ./build.sh --clean          # remove build artifacts (build/ and dist/)
 #
 #  Env:
-#    HOLAF_NO_TRAY=1                     # build without the tray icon
-#                                        # (default: tray ON — D-Bus ksni,
-#                                        #  no GTK package needed)
-#    HOLAF_TRAY_GTK=1                    # force the old libappindicator
-#                                        # backend (needs gtk3 dev)
+#    HOLAF_NO_TRAY=1             # build without the tray icon
+#                                # (default: tray ON — D-Bus ksni, no GTK)
+#    HOLAF_TRAY_GTK=1            # force the old libappindicator backend
+#                                # (needs gtk3 + libayatana-appindicator)
+#    HOLAF_UI_X11=1              # add the X11 window backend (X11-only session)
 #
-#  Quick start on CachyOS:
-#    ./build.sh --install-deps           # one-time setup
-#    ./build.sh --run                    # build + launch
+#  Quick start on CachyOS / Arch:
+#    ./build.sh --install-deps   # one-time setup
+#    ./build.sh --run            # build + launch
 #
-#  See BUILD.md for full documentation and troubleshooting.
+#  The normal user path is NOT this script: it is the CI artefact
+#  (`.github/workflows/build.yml` → `holaf-mix-<sha>-<arch>`), unpacked and
+#  launched with `./holaf-ui`.  See BUILD.md.
 # ============================================================================
 
 set -euo pipefail
@@ -38,20 +40,25 @@ cd "$SCRIPT_DIR"
 ROOT_DIR="$SCRIPT_DIR"
 DIST_DIR="$ROOT_DIR/dist"
 BUILD_DIR="$ROOT_DIR/build"
-PYI_WORK="$BUILD_DIR/pyinstaller"
-PYI_DIST="$BUILD_DIR/dist"
-
-# Spec lives in packaging/ (alongside PKGBUILD and .desktop)
-SPEC_FILE="$ROOT_DIR/packaging/holaf-mix.spec"
 
 # --- App metadata ------------------------------------------------------------
 APP_NAME="holaf-mix"
 
-# Try to read version from src/__init__.py; fall back to git describe.
+# The version lives in the Rust workspace (rust/Cargo.toml, [workspace.package]);
+# git describe is only a fallback for a checkout where that file is missing.
 get_version() {
-    if [[ -f "$ROOT_DIR/src/__init__.py" ]] && \
-       grep -q '__version__' "$ROOT_DIR/src/__init__.py"; then
-        grep -oP '__version__\s*=\s*"\K[^"]+' "$ROOT_DIR/src/__init__.py"
+    local version=""
+    if [[ -f "$ROOT_DIR/rust/Cargo.toml" ]]; then
+        version=$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/                     { in_section = 0 }
+            in_section && /^version[[:space:]]*=/ {
+                gsub(/[",]/, "", $3); print $3; exit
+            }
+        ' "$ROOT_DIR/rust/Cargo.toml")
+    fi
+    if [[ -n "$version" ]]; then
+        printf '%s\n' "$version"
     else
         git describe --tags --always --dirty 2>/dev/null || echo "0.1.0-dev"
     fi
@@ -87,26 +94,17 @@ detect_distro() {
 }
 
 # --- Dependency lists --------------------------------------------------------
-# Note on CachyOS / Arch:
-#   - "librsvg2" is wrong — the package is just "librsvg" (it ships rsvg-convert)
-#   - "python-pyinstaller" is wrong — pyinstaller is not packaged for Arch at
-#     all (neither [extra] nor the AUR under that name). The official upstream
-#     recommendation is to `pip install pyinstaller` (it's a build-time tool,
-#     not a runtime dep, so pip is fine).
-#   - "python-pyside6" is the Debian name; on Arch it is "pyside6" (it is
-#     frequently out of date; pip gives you the version pinned in
-#     requirements.txt).
-#   - "ladspa-plugins" does NOT exist on Arch (it is not a Debian package
-#     either): the four LADSPA files the mixer loads come from
-#     "swh-plugins" -> /usr/lib/ladspa/{gate_1410,mbeq_1197,sc4_1882}.so
+# Notes on the package names (verified, not guessed):
+#   - "librsvg2" is wrong on Arch — the package is `librsvg` (rsvg-convert).
+#   - "ladspa-plugins" does NOT exist: the four LADSPA files come from
+#     `swh-plugins` -> /usr/lib/ladspa/{gate_1410,mbeq_1197,sc4_1882}.so
 #   - PipeWire is the ONLY audio server supported: `pipewire-pulse` provides
-#     `pulse-native-provider`, exactly like `pulseaudio`, so installing both
-#     triggers a hard pacman conflict and installs a server nothing talks to.
-#     The `pactl` binary the app EXECs comes from `libpulse`, not from either
-#     of them.
+#     `pulse-native-provider` exactly like `pulseaudio`, so installing both
+#     triggers a hard pacman conflict.  `pactl` comes from `libpulse`.
+#   - The tray is a D-Bus StatusNotifierItem (`ksni`): no GTK package at all.
 SYSTEM_DEPS_ARCH=(
     # --- build toolchain -------------------------------------------------
-    "base-devel"         # gcc/make (Rust link step, pip wheel builds)
+    "base-devel"         # gcc/make (Rust link step)
     "pkgconf"            # the -sys crates probe their .pc files at build time
     "clang"              # libclang.so for bindgen (libspa-sys, pipewire-sys)
     "rust"               # rustc/cargo >= MSRV (rust/Cargo.toml)
@@ -124,15 +122,9 @@ SYSTEM_DEPS_ARCH=(
     # TAP plugins (tap_tubewarmth — the TUBE WARMTH strip) are **AUR-only** on
     # Arch (`tap-plugins`), so they are NOT in this list: `pacman -S` would fail
     # for everyone.  Install it with an AUR helper if you want that strip:
-    #     yay -S tap-plugins        # or: git clone https://aur.archlinux.org/tap-plugins.git
+    #     yay -S tap-plugins
     # Without it every OTHER strip works; the UI simply cannot insert TUBE
     # WARMTH (it checks /usr/lib/ladspa before offering the FX).
-    #
-    # The tray icon (cargo feature `tray`, ON BY DEFAULT in
-    # scripts/build_rust.sh) needs NO package at all any more: the backend is
-    # `ksni`, a pure D-Bus StatusNotifierItem (no GTK3, no libappindicator —
-    # see docs/dependency-audit.md).  gtk3/libayatana-appindicator used to be
-    # listed here; they are not needed by any build any more.
     "ladspa"             # optional: analyseplugin/applyplugin (debug only)
 )
 SYSTEM_DEPS_DEBIAN=(
@@ -156,8 +148,8 @@ SYSTEM_DEPS_DEBIAN=(
     "libasound2-dev"     # alsa-sys (MIDI)
     "swh-plugins"        # gate_1410 / mbeq_1197 / sc4_1882 LADSPA plugins
     "tap-plugins"        # tap_tubewarmth — the TUBE WARMTH strip (in `main`)
-    # No tray package: the `tray` feature is ksni/D-Bus since the 2026-11-15
-    # migration, so GTK3/libayatana-appindicator are not needed any more.
+    # No tray package: the `tray` feature is ksni/D-Bus, so GTK3 and
+    # libayatana-appindicator are not needed.
     "ladspa-sdk"         # optional: analyseplugin/applyplugin (debug only)
 )
 SYSTEM_DEPS_FEDORA=(
@@ -180,18 +172,6 @@ SYSTEM_DEPS_FEDORA=(
     "ladspa-swh-plugins" # gate_1410 / mbeq_1197 / sc4_1882 (Fedora name)
     "ladspa-tap-plugins" # tap_tubewarmth — the TUBE WARMTH strip
     "pulseaudio-libs-devel"
-    # No tray package: the `tray` feature is ksni/D-Bus (no GTK), see
-    # docs/dependency-audit.md.
-)
-# Python deps installed via pip (NOT pacman) so versions match
-# requirements.txt and stay reproducible.
-PYTHON_DEPS=(
-    "PySide6"
-    "sounddevice"
-    "numpy"
-    "mido"
-    "python-rtmidi"
-    "pyinstaller"         # AUR-only on Arch, always installed via pip
 )
 
 # --- Helpers -----------------------------------------------------------------
@@ -199,9 +179,7 @@ has() { command -v "$1" >/dev/null 2>&1; }
 
 print_help() {
     # Print the leading docblock: every "#" comment line at the top of this
-    # file, from line 2 until the first real statement.  Computed rather than
-    # hardcoded as a line range — the header grows (HOLAF_NO_TRAY env, …) and a
-    # fixed range silently truncates the help text.
+    # file, from line 2 until the first real statement.
     awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
@@ -260,7 +238,6 @@ install_deps() {
             debian) printf '    sudo apt install %s\n'         "${SYSTEM_DEPS_DEBIAN[*]}" ;;
             fedora) printf '    sudo dnf install %s\n'         "${SYSTEM_DEPS_FEDORA[*]}" ;;
         esac
-        printf '    pip install %s\n' "${PYTHON_DEPS[*]}"
         printf '\033[1;33m[build]\033[0m Continue? [y/N] '
         read -r answer
         if [[ ! "$answer" =~ ^[Yy]$ ]]; then
@@ -271,15 +248,14 @@ install_deps() {
 
     if [[ "$DISTRO_FAMILY" == "unknown" ]]; then
         err "Unsupported distro. Please install manually:"
-        err "  System:  rsvg-convert (Arch: librsvg | Debian: librsvg2-bin), imagemagick"
-        err "           libpipewire/libspa dev headers + pkgconf + clang (bindgen),"
-        err "           libasound dev headers (MIDI), libpulse dev headers,"
-        err "           swh-plugins (LADSPA gate_1410/mbeq_1197/sc4_1882) +"
-        err "           tap-plugins (tap_tubewarmth; AUR-only on Arch)"
+        err "  Build:   rust (>= 1.98), pkgconf, clang (bindgen),"
+        err "           rsvg-convert (Arch: librsvg | Debian: librsvg2-bin),"
+        err "           imagemagick (magick), libpipewire/libspa dev headers,"
+        err "           libasound dev headers (MIDI)"
         err "  Runtime: pipewire (+ pipewire-audio for pw-cat), pipewire-pulse,"
-        err "           wireplumber, libpulse (pactl).  No tray package needed:"
-        err "           the tray is a D-Bus StatusNotifierItem (ksni), no GTK."
-        err "  Python:  ${PYTHON_DEPS[*]}"
+        err "           wireplumber, libpulse (pactl), alsa-lib, swh-plugins,"
+        err "           and optionally tap-plugins (AUR on Arch)."
+        err "  No tray package needed: the tray is a D-Bus StatusNotifierItem."
         exit 1
     fi
 
@@ -290,7 +266,6 @@ install_deps() {
                 err "pacman install failed. Try: sudo pacman -S --needed ${SYSTEM_DEPS_ARCH[*]}"
                 exit 1
             }
-            PIP_USER_FLAG="--user"
             ;;
         debian)
             log "Installing system packages via apt..."
@@ -299,8 +274,7 @@ install_deps() {
                 err "apt install failed"
                 exit 1
             }
-            PIP_USER_FLAG="--user --break-system-packages"
-            warn "Using --break-system-packages (PEP 668). Consider a venv instead."
+            warn "Rust >= 1.98 is required; Debian/Ubuntu's rustc is older — use rustup."
             ;;
         fedora)
             log "Installing system packages via dnf..."
@@ -308,26 +282,18 @@ install_deps() {
                 err "dnf install failed"
                 exit 1
             }
-            PIP_USER_FLAG="--user"
             ;;
     esac
 
-    log "Installing Python packages via pip ${PIP_USER_FLAG}..."
-    python3 -m pip install $PIP_USER_FLAG "${PYTHON_DEPS[@]}" || {
-        err "pip install failed"
-        exit 1
-    }
-
     ok "All dependencies installed."
-    ok "  Python deps: ${PYTHON_DEPS[*]}"
-    ok "  System deps: distro-appropriate packages above"
+    ok "  System deps: distro-appropriate packages above (no Python)"
 }
 
 check_deps() {
     log "Checking build dependencies..."
 
     local missing=()
-    has pyinstaller  || missing+=("pyinstaller (pip install pyinstaller)")
+    has cargo        || missing+=("cargo (install Rust: https://rustup.rs or the distro's rust package)")
     has rsvg-convert || missing+=("rsvg-convert (Arch: pacman -S librsvg | Debian: apt install librsvg2-bin)")
     has magick       || missing+=("magick (pacman -S imagemagick | apt install imagemagick)")
 
@@ -340,14 +306,7 @@ check_deps() {
         exit 1
     fi
 
-    # Python deps: try to import, fall back to a clear error
-    if ! python3 -c "import PySide6, sounddevice, numpy, mido, rtmidi" 2>/dev/null; then
-        err "Missing Python packages. Run './build.sh --install-deps' or:"
-        err "  pip install --user ${PYTHON_DEPS[*]}"
-        exit 1
-    fi
-
-    ok "All dependencies present."
+    ok "Build tools present (cargo, rsvg-convert, magick)."
 
     # The tray icon needs no build package any more (ksni/D-Bus).  What is
     # worth warning about is the LADSPA set: the UI offers a strip per plugin
@@ -358,7 +317,7 @@ check_deps() {
         warn "  Fedora: dnf install ladspa-tap-plugins | Arch: AUR package tap-plugins"
     fi
 
-    # MIDI (cargo feature `midi`, also ON by default) is built against the ALSA
+    # MIDI (cargo feature `midi`, ON by default) is built against the ALSA
     # sequencer through alsa-sys, which needs the alsa .pc file.
     if ! pkg-config --exists alsa 2>/dev/null; then
         warn "alsa (ALSA dev headers) not found — the Rust UI cannot be built with MIDI."
@@ -381,7 +340,7 @@ check_deps() {
 }
 
 build_icons() {
-    hdr "Step 1/4 — Building icon set"
+    hdr "Step 1/3 — Building icon set"
     if [[ -x "$ROOT_DIR/assets/icons/build_icons.sh" ]]; then
         "$ROOT_DIR/assets/icons/build_icons.sh"
     else
@@ -391,25 +350,20 @@ build_icons() {
     ok "Icons ready in $DIST_DIR/icons/"
 }
 
-build_rust_binaries() {
+build_binaries() {
     # ========================================================================
-    #  Rust UI + daemon/CLI (holaf-ui, holafd, holafctl) — BEFORE PyInstaller
+    #  Release binaries: holaf-ui (the app) + holafd + holafctl
     # ========================================================================
-    #  Since migration B1 the app's window IS the Rust UI: `main.py` locates
-    #  `holaf-ui` and runs it (the Qt interface is only the `HOLAF_UI=python`
-    #  escape hatch).  packaging/holaf-mix.spec embeds all three binaries as
-    #  data files, so they must exist *before* PyInstaller runs.
-    #
-    #  Therefore this step stays strictly best-effort: a machine without a Rust
-    #  toolchain keeps producing a working Python+Qt build exactly like before
-    #  (the launcher then logs that holaf-ui is missing and starts Qt).
+    #  There is nothing else in the product: no launcher, no bundle, no
+    #  interpreter.  `holaf-ui` is the entry point, `holafd` an alternative/
+    #  automation backend and `holafctl` its CLI.
     # ========================================================================
-    hdr "Step 2/4 — Building Rust UI + daemon + CLI"
+    hdr "Step 2/3 — Building holaf-ui + holafd + holafctl (release)"
 
     # The system-tray icon (cargo feature `tray`) is ON BY DEFAULT here: it is
     # part of the packaged app.  HOLAF_NO_TRAY=1 (or the legacy HOLAF_TRAY=0)
-    # removes it; the env is inherited by scripts/build_rust.sh, which also
-    # falls back to a tray-less build if the feature fails to compile.
+    # removes it; the env is inherited by scripts/build_rust.sh, which falls
+    # back to a tray-less build if the feature fails to compile.
     # The backend is ksni (D-Bus), so no GTK3/appindicator package is involved.
     if [[ "${HOLAF_NO_TRAY:-0}" == "1" || "${HOLAF_TRAY:-1}" == "0" ]]; then
         log "Tray icon DISABLED (HOLAF_NO_TRAY/HOLAF_TRAY=0)"
@@ -419,14 +373,8 @@ build_rust_binaries() {
 
     local script="$ROOT_DIR/scripts/build_rust.sh"
     if [[ ! -x "$script" ]]; then
-        warn "scripts/build_rust.sh not found/executable — Python+Qt build"
-        warn "  (main.py will fall back to the Qt UI: holaf-ui is not built)"
-        return 0
-    fi
-    if ! has cargo; then
-        warn "cargo not found on PATH — Python+Qt build."
-        warn "  Install Rust (rustup or your distro's package) to embed holaf-ui."
-        return 0
+        err "scripts/build_rust.sh not found or not executable"
+        exit 1
     fi
 
     # bindgen (libspa-sys) needs libclang; on Arch it lives in /usr/lib with
@@ -436,142 +384,121 @@ build_rust_binaries() {
         export LIBCLANG_PATH=/usr/lib
     fi
 
-    if "$script" "$DIST_DIR"; then
-        ok "Rust binaries published to $DIST_DIR :"
-        # Say plainly what got embedded, with sizes: the UI is the binary a user
-        # notices (it is the window), and a missing one is the difference
-        # between the Rust UI and the Qt fallback.
-        local b
-        for b in holaf-ui holafd holafctl; do
-            if [[ -x "$DIST_DIR/$b" ]]; then
-                ok "  $b ($(du -h --apparent-size "$DIST_DIR/$b" | cut -f1))"
-            elif [[ "$b" == "holaf-ui" ]]; then
-                warn "  holaf-ui MISSING — the bundle will start the Qt UI instead"
-            else
-                warn "  $b missing"
-            fi
-        done
-    else
-        warn "Rust build failed — continuing with a Python+Qt bundle"
-        warn "  (main.py will fall back to the Qt UI: see the log above)"
-    fi
-    return 0
-}
-
-build_executable() {
-    local mode="${1:-onefile}"
-    hdr "Step 3/4 — Building $mode executable with PyInstaller"
-
-    if [[ ! -f "$SPEC_FILE" ]]; then
-        err "Spec file not found: $SPEC_FILE"
-        err "Did you run ./build.sh from the project root?"
+    # A Rust build failure is FATAL now: a product without holaf-ui does not
+    # exist any more (the Python build used to be the fallback).
+    if ! "$script" "$DIST_DIR"; then
+        err "cargo build failed — nothing to package."
         exit 1
     fi
 
-    # Build mode is selected through the environment so the spec has a single,
-    # always-valid source: no sed-patching (which silently produced an invalid
-    # spec whenever the EXE/COLLECT layout changed).
-    case "$mode" in
-        onefile|onedir) ;;
-        *) err "Unknown build mode: $mode"; exit 1 ;;
-    esac
-    export HOLAF_BUILD_MODE="$mode"
-
-    # Clean only the pyinstaller work dir, not the whole build/
-    rm -rf "$PYI_WORK" "$PYI_DIST"
-    mkdir -p "$PYI_WORK" "$PYI_DIST"
-
-    log "Running PyInstaller ($mode, this takes 2-5 minutes the first time)..."
-    pyinstaller \
-        --noconfirm \
-        --workpath "$PYI_WORK" \
-        --distpath "$PYI_DIST" \
-        "$SPEC_FILE"
-
-    # Publish into ./dist/ for clarity
-    rm -rf "$DIST_DIR/holaf-mix" "$DIST_DIR/holaf-mix.bin"
-    if [[ -f "$PYI_DIST/holaf-mix" ]]; then
-        cp "$PYI_DIST/holaf-mix" "$DIST_DIR/holaf-mix"
-        chmod +x "$DIST_DIR/holaf-mix"
-        ok "Onefile binary: $DIST_DIR/holaf-mix"
-    fi
-    if [[ -d "$PYI_DIST/holaf-mix" ]]; then
-        cp -r "$PYI_DIST/holaf-mix" "$DIST_DIR/"
-        ok "Onedir bundle:  $DIST_DIR/holaf-mix/"
-    fi
-
-    # Copy icons alongside so the user has them in one place
-    if [[ -d "$DIST_DIR/icons" ]]; then
-        if [[ -d "$DIST_DIR/holaf-mix" ]]; then
-            cp -r "$DIST_DIR/icons" "$DIST_DIR/holaf-mix/icons"
+    local b
+    for b in holaf-ui holafd holafctl; do
+        if [[ ! -x "$DIST_DIR/$b" ]]; then
+            err "expected binary missing after the build: $DIST_DIR/$b"
+            exit 1
         fi
-    fi
+        ok "  $b ($(du -h --apparent-size "$DIST_DIR/$b" | cut -f1))"
+    done
+}
 
-    ok "Executable built."
+# Short usage note shipped inside the tarball: the tarball is what the user
+# actually downloads, so the launch instructions must be impossible to miss.
+write_usage_note() {
+    local dest="$1/USAGE.txt"
+    cat > "$dest" <<'EOF'
+Holaf-Mix — lancement
+=====================
+
+    ./holaf-ui          # l'application (UI Rust, moteur PipeWire in-process)
+    ./holaf-mix         # même chose (petit lanceur : exec ./holaf-ui "$@")
+    ./holafd --help     # démon audio alternatif / automatisation
+    ./holafctl --help   # CLI du démon
+
+Aucun Python, aucun PyInstaller, aucun venv : ce dossier ne contient que des
+binaires Rust.
+
+Dépendances runtime (une seule fois) :
+  Arch / CachyOS :
+    sudo pacman -S pipewire pipewire-audio pipewire-pulse wireplumber \
+                   libpulse alsa-lib swh-plugins
+    yay -S tap-plugins        # optionnel : strip TUBE WARMTH (AUR)
+  Debian / Ubuntu :
+    sudo apt install pipewire pipewire-bin pipewire-pulse wireplumber \
+                     pulseaudio-utils libasound2 swh-plugins tap-plugins
+
+Configuration : config.json est cherché dans cet ordre
+  1. --config FICHIER
+  2. $HOLAF_CONFIG
+  3. à côté du binaire (./config.json du dossier décompressé), s'il existe
+  4. ./config.json du répertoire courant, s'il existe
+  5. $XDG_CONFIG_HOME/holaf-mix/config.json (~/.config/holaf-mix/config.json)
+
+Le premier lancement crée le fichier au premier emplacement inscriptible de
+cette liste ; --help liste les options (--midi, --midi-list, ...).
+Plus de détails : README.md et BUILD.md dans ce dossier.
+EOF
 }
 
 make_tarball() {
-    hdr "Step 4/4 — Building distribution tarball"
+    hdr "Step 3/3 — Building distribution tarball"
 
     local arch; arch="$(uname -m)"
     local tar_name="${APP_NAME}-${APP_VERSION}-${arch}.tar.gz"
-    local staging="$DIST_DIR/${APP_NAME}-${APP_VERSION}"
+    local staging_name="${APP_NAME}-${APP_VERSION}"
+    local staging="$DIST_DIR/$staging_name"
+
+    # The binaries are the product: refuse to ship a tarball without them.
+    local b
+    for b in holaf-ui holafd holafctl; do
+        if [[ ! -x "$DIST_DIR/$b" ]]; then
+            err "$DIST_DIR/$b is missing — run './build.sh' first."
+            exit 1
+        fi
+    done
 
     rm -rf "$staging"
     mkdir -p "$staging"
 
-    if [[ -f "$DIST_DIR/holaf-mix" ]]; then
-        cp "$DIST_DIR/holaf-mix" "$staging/"
-    fi
-    if [[ -d "$DIST_DIR/holaf-mix" ]] && [[ ! -f "$DIST_DIR/holaf-mix" ]]; then
-        cp -r "$DIST_DIR/holaf-mix" "$staging/"
-    fi
+    for b in holaf-ui holafd holafctl; do
+        cp "$DIST_DIR/$b" "$staging/"
+        chmod +x "$staging/$b"
+    done
+
+    # The `holaf-mix` habit, preserved by a 20-line shell script (no Python).
+    cp "$ROOT_DIR/packaging/holaf-mix.sh" "$staging/holaf-mix"
+    chmod +x "$staging/holaf-mix"
+
     if [[ -d "$DIST_DIR/icons" ]]; then
         cp -r "$DIST_DIR/icons" "$staging/icons"
     fi
-    [[ -f "$ROOT_DIR/README.md" ]]   && cp "$ROOT_DIR/README.md"   "$staging/"
-    [[ -f "$ROOT_DIR/ROADMAP.md" ]]  && cp "$ROOT_DIR/ROADMAP.md"  "$staging/"
-    [[ -f "$ROOT_DIR/BUILD.md" ]]    && cp "$ROOT_DIR/BUILD.md"    "$staging/"
+
+    # Docs: the released revision's own, plus the usage note above.
+    for doc in README.md BUILD.md ROADMAP.md; do
+        [[ -f "$ROOT_DIR/$doc" ]] && cp "$ROOT_DIR/$doc" "$staging/"
+    done
+    if [[ -d "$ROOT_DIR/docs" ]]; then
+        mkdir -p "$staging/docs"
+        cp -r "$ROOT_DIR/docs/." "$staging/docs/"
+    fi
     [[ -f "$ROOT_DIR/packaging/holaf-mix.desktop" ]] && \
         cp "$ROOT_DIR/packaging/holaf-mix.desktop" "$staging/"
+    write_usage_note "$staging"
 
-    # --- Rust UI + core (holaf-ui, holafd, holafctl) ----------------------
-    # `main.py` launches the Rust UI (`holaf-ui`) and the Qt fallback uses the
-    # Rust daemon (`holafd`), so build.sh builds them *before* PyInstaller and
-    # the spec embeds them inside the bundle (onefile → sys._MEIPASS, onedir →
-    # <bundle>/_internal/).  We ALSO ship the binaries at the top level of the
-    # tarball: they sit next to holaf-mix, which is the first path the launchers
-    # probe in a frozen app (no extraction, no chmod needed), and holafctl is
-    # the CLI users invoke directly.
-    # When absent (plain local build without cargo), we say so and continue:
-    # the Python+Qt bundle must keep working exactly as before.
-    local rust_bins=()
-    local b
-    for b in holaf-ui holafd holafctl; do
-        if [[ -x "$DIST_DIR/$b" ]]; then
-            cp "$DIST_DIR/$b" "$staging/"
-            chmod +x "$staging/$b"
-            rust_bins+=("$b")
-        fi
-    done
-    if ((${#rust_bins[@]})); then
-        ok "Rust binaries included: ${rust_bins[*]}"
-    else
-        warn "Rust binaries not built, skipping (run scripts/build_rust.sh first)"
-    fi
-    if [[ ! -x "$staging/holaf-ui" ]]; then
-        warn "holaf-ui is NOT in this tarball: holaf-mix will start the Qt UI"
-    fi
-
-    tar -czf "$DIST_DIR/$tar_name" -C "$DIST_DIR" "${APP_NAME}-${APP_VERSION}"
+    tar -czf "$DIST_DIR/$tar_name" -C "$DIST_DIR" "$staging_name"
     rm -rf "$staging"
 
     ok "Tarball: $DIST_DIR/$tar_name"
+    # Capture the listing first: piping `tar -t | head` under `set -o pipefail`
+    # turns a truncated listing into SIGPIPE (tar exits 141) on a big tarball.
+    local listing
+    listing=$(tar -tzf "$DIST_DIR/$tar_name")
+    ok "Contents ($(printf '%s\n' "$listing" | wc -l) entries, first 40):"
+    printf '%s\n' "$listing" | sed -n '1,40p' | sed 's|^|  |'
     ls -la "$DIST_DIR/$tar_name"
 }
 
 run_binary() {
-    local bin="$DIST_DIR/holaf-mix"
+    local bin="$DIST_DIR/holaf-ui"
     if [[ ! -x "$bin" ]]; then
         err "Binary not found at $bin. Run ./build.sh first."
         exit 1
@@ -583,14 +510,10 @@ run_binary() {
 clean() {
     hdr "Cleaning build artifacts"
     rm -rf "$BUILD_DIR" "$DIST_DIR"
-    # Clean PyInstaller cache too
-    rm -rf "$ROOT_DIR/__pycache__" "$ROOT_DIR/src/__pycache__"
-    find "$ROOT_DIR/src" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-    ok "Cleaned. (Source files untouched.)"
+    ok "Cleaned ($BUILD_DIR, $DIST_DIR). Source files untouched."
 }
 
 # --- CLI parsing -------------------------------------------------------------
-MODE="onefile"
 ACTION="build"
 RUN_AFTER=false
 while [[ $# -gt 0 ]]; do
@@ -598,11 +521,8 @@ while [[ $# -gt 0 ]]; do
         --install-deps) install_deps; exit 0 ;;
         --check)        check_deps; exit 0 ;;
         --icons-only)   ACTION="icons" ;;
-        --executable)   ACTION="exe" ;;
         --tarball)      ACTION="all-tar" ;;
         --run)          RUN_AFTER=true ;;
-        --onedir)       MODE="onedir" ;;
-        --onefile)      MODE="onefile" ;;
         --clean)        clean; exit 0 ;;
         -h|--help)      print_help; exit 0 ;;
         -V|--version)   echo "$APP_NAME $APP_VERSION"; exit 0 ;;
@@ -612,14 +532,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Main sequence -----------------------------------------------------------
-hdr "Holaf-Mix build (v$APP_VERSION, mode=$MODE)"
+hdr "Holaf-Mix build (v$APP_VERSION)"
 check_deps
 
 case "$ACTION" in
     icons)   build_icons ;;
-    exe)     build_icons; build_rust_binaries; build_executable "$MODE" ;;
-    build)   build_icons; build_rust_binaries; build_executable "$MODE" ;;
-    all-tar) build_icons; build_rust_binaries; build_executable "$MODE"; make_tarball ;;
+    build)   build_icons; build_binaries ;;
+    all-tar) build_icons; build_binaries; make_tarball ;;
 esac
 
 if $RUN_AFTER; then
@@ -627,12 +546,7 @@ if $RUN_AFTER; then
 else
     ok ""
     ok "Build complete."
-    if [[ -x "$DIST_DIR/holaf-mix" ]]; then
-        ok "  Run:   $DIST_DIR/holaf-mix"
-    fi
-    if [[ -d "$DIST_DIR/holaf-mix" ]] && [[ ! -f "$DIST_DIR/holaf-mix" ]]; then
-        ok "  Run:   $DIST_DIR/holaf-mix/holaf-mix"
-    fi
+    ok "  Run:   $DIST_DIR/holaf-ui"
     ok "  Or:    ./build.sh --run"
     ok "  Docs:  cat BUILD.md"
 fi

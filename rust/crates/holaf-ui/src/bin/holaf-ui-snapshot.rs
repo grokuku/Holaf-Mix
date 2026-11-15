@@ -99,6 +99,10 @@ struct Args {
     dialog: Option<String>,
     /// `--dialog-tab NAME`: which tab of the diagnostics window to show.
     dialog_tab: Option<String>,
+    /// `--devices N`: replace the mock engine's device list with `N` simulated
+    /// devices, so the device picker's geometry can be checked for a short and a
+    /// long list (3 devices versus 10, the two cases the user asked about).
+    devices: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -112,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
         config: None,
         dialog: None,
         dialog_tab: None,
+        devices: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -133,13 +138,22 @@ fn parse_args() -> Result<Args, String> {
             "--config" | "-c" => args.config = Some(PathBuf::from(value()?)),
             "--dialog" => args.dialog = Some(value()?),
             "--dialog-tab" => args.dialog_tab = Some(value()?),
+            "--devices" => {
+                args.devices = Some(
+                    value()?
+                        .parse::<usize>()
+                        .map_err(|e| format!("--devices: {e}"))?
+                        .max(1),
+                )
+            }
             "--help" | "-h" => {
                 return Err(
                     "usage: holaf-ui-snapshot [--out FILE.png] [--width N] [--height N] \
                      [--scale 1..4] [--time SECONDS] [--theme FILE.json] \
                      [--config CONFIG.json] [--dialog diagnostics|apps|fx|device|add|delete|\
                      menu|midi-port|midi-port-none|midi-learn|midi-menu] \
-                     [--dialog-tab summary|engine|graph|system|journal]"
+                     [--dialog-tab summary|engine|graph|system|journal] \
+                     [--devices N]"
                         .to_string(),
                 )
             }
@@ -204,6 +218,13 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    // `--devices N`: how the picker looks with a short and a long list.  The
+    // names are the ones the user's machine reports, so the rows are as wide as
+    // the real ones (a `mock-1`/`mock-2` list would prove nothing about width).
+    if let Some(count) = args.devices {
+        state.engine_devices = simulated_devices(count);
     }
 
     let size = default_size(&state);
@@ -279,6 +300,57 @@ fn main() -> ExitCode {
         state.theme.name
     );
     ExitCode::SUCCESS
+}
+
+/// `--devices N`: `N` plausible **sinks** (the picker a snapshot opens belongs
+/// to an output strip, so a source would simply not be listed).
+///
+/// The first entries are the user's own devices (a built-in HDA card, a PreSonus
+/// Studio 26c in mono and stereo profiles, a C-Media USB dongle); past those the
+/// names are generated variants of the same shape.  Deterministic, and every name
+/// is a real-looking PipeWire `node.name`, so the captured pop-up has the widths a
+/// real machine produces.
+fn simulated_devices(count: usize) -> Vec<holaf_ui::engine_json::DeviceInfo> {
+    const BASE: [(&str, Option<&str>); 4] = [
+        (
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+            Some("Built-in Audio Analog Stereo"),
+        ),
+        (
+            "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+            None,
+        ),
+        (
+            "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-1",
+            None,
+        ),
+        (
+            "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo",
+            None,
+        ),
+    ];
+    (0..count)
+        .map(|index| {
+            let (name, description) = if index < BASE.len() {
+                (BASE[index].0.to_string(), BASE[index].1.map(str::to_string))
+            } else {
+                // Same shape, numbered: the *labels* stay distinct, which is what
+                // the pop-up must guarantee (the model is the interface name).
+                (
+                    format!(
+                        "alsa_output.usb-Holaf_Test_Interface_{index:02}-00.analog-stereo"
+                    ),
+                    None,
+                )
+            };
+            holaf_ui::engine_json::DeviceInfo {
+                id: index as u32 + 1,
+                name,
+                media_class: "Audio/Sink".to_string(),
+                description,
+            }
+        })
+        .collect()
 }
 
 /// Open one dialog so the snapshot can show it.

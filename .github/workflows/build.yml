@@ -10,16 +10,19 @@
 #  Why Arch?
 #    Holaf-Mix targets CachyOS / Arch Linux (the primary target platform).
 #    Building on the same distro family as the target means the resulting
-#    binary links against the right glibc, libpipewire, libpulse, etc.
+#    binaries link against the right glibc, libpipewire, libpulse, etc.
 #
-#  How the artifacts are consumed — this is the project's delivery path, so
+#  How the artifact is consumed — this is the project's delivery path, so
 #  nothing is built on the user's machine:
 #    push → this workflow runs → download the `holaf-mix-<sha>-<arch>` artifact
 #    → install the RUNTIME dependencies (BUILD.md §1.3: pipewire,
 #    pipewire-audio, pipewire-pulse, wireplumber, libpulse, alsa-lib,
-#    swh-plugins, tap-plugins) → run ./holaf-mix.
+#    swh-plugins, tap-plugins) → unpack → run ./holaf-ui.
 #    `packaging/PKGBUILD` is an optional Arch distribution path (BUILD.md §4),
-#    not a prerequisite for either artifact, and it is not exercised here.
+#    not a prerequisite for the artifact, and it is not exercised here.
+#
+#  Holaf-Mix is a 100 % Rust product: no Python, no PyInstaller, no venv.
+#  The artifact IS the tarball of the three Rust binaries + icons + docs.
 #
 #  Why a container?
 #    - GitHub's `ubuntu-latest` runner doesn't have pacman; we use a
@@ -28,28 +31,11 @@
 #    - The container is destroyed at the end of the job. Nothing persists
 #      on GitHub's side except the uploaded artifact.
 #
-#  Output: two INDEPENDENT artifact sets
-#
-#    Python build (the launcher — WITH the Rust UI and daemon inside):
+#  Output: ONE artifact
 #      holaf-mix-{sha}-{arch}
-#        holaf-mix-{version}-{arch}.tar.gz  (the distributable bundle; it
-#                                            embeds holaf-ui/holafd/holafctl,
-#                                            see packaging/holaf-mix.spec)
+#        holaf-mix-{version}-{arch}.tar.gz  (holaf-ui + holafd + holafctl +
+#                                            icons + .desktop + docs)
 #        SHA256SUMS
-#
-#    Rust build (UI + daemon + CLI, standalone):
-#      holaf-rust-{sha}-{arch}
-#        holaf-ui, holafd, holafctl          (release binaries, stripped)
-#        holaf-rust-{arch}.tar.gz            (all three in one tarball)
-#
-#  Why the Rust build runs first (and before PyInstaller)
-#    `holaf-ui` IS the app's window and `holafd` its audio backend (for the Qt
-#    fallback), so the packaged app must contain them: build.sh
-#    builds/publishes dist/{holaf-ui,holafd,holafctl} and the PyInstaller spec
-#    embeds them.  Independence is preserved differently:
-#    build.sh treats the Rust step as best-effort (log + continue), so a cargo
-#    failure yields a Python-only bundle that falls back to the classic engine
-#    at startup, and the two upload steps stay gated independently.
 # ============================================================================
 
 name: Build Holaf-Mix
@@ -61,16 +47,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Build mode'
-        required: true
-        type: choice
-        default: 'onefile'
-        options:
-          - onefile
-          - onedir
-          - both
 
 # Avoid running two builds at once for the same ref
 concurrency:
@@ -85,20 +61,17 @@ jobs:
     container:
       image: archlinux:latest
       options: --privileged --init
-    # 45 min: PyInstaller (2 copies of Qt when mode=both) + a cold cargo
-    # build of the whole workspace + cargo test no longer fit in 30.
-    timeout-minutes: 45
+    # 40 min: a cold cargo build of the whole workspace + the icon set + the
+    # test suite + the packaging steps.
+    timeout-minutes: 40
 
     env:
-      # Skip the safety guard inside the CI container (no display, no host)
-      HOLAF_BUILD_INSTALL_DEPS: '1'
-      DEBIAN_FRONTEND: noninteractive
       # bindgen (libspa-sys / pipewire-sys) needs libclang. Arch puts
       # libclang.so in /usr/lib (no versioned subdir) and clang-sys' search
-      # order is not exhaustive, so we point at it explicitly. Job-wide on
-      # purpose: build.sh now invokes scripts/build_rust.sh itself, i.e. cargo
-      # also runs from *inside* the Python build steps.
+      # order is not exhaustive, so we point at it explicitly.
       LIBCLANG_PATH: /usr/lib
+      # Reproducible build: refuse to update Cargo.lock (see scripts/build_rust.sh)
+      HOLAF_CARGO_LOCKED: '1'
 
     steps:
       # ------------------------------------------------------------------
@@ -108,19 +81,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Display environment info
-        # Note: this is a best-effort diagnostic. The base archlinux:latest
-        # image doesn't ship python3, so we tolerate its absence here —
-        # python is installed in the next step.
         run: |
           echo "::group::Environment"
           uname -a
           cat /etc/os-release
           pacman --version | head -1 || echo "(no pacman)"
-          command -v python3 >/dev/null && python3 --version || echo "(python3 not yet installed)"
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
-      # 1. Install system dependencies (Arch inside the container)
+      # 1. Install build dependencies (Arch inside the container)
       # ------------------------------------------------------------------
       - name: Full system upgrade (align glibc with repo packages)
         # Critical: `pacman -Syu` upgrades ALL packages (including glibc)
@@ -135,14 +104,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          # --noconfirm is safe in CI: no interactive prompts
-          #
-          # python-rtmidi builds C++ bindings for JACK and ALSA, so we
-          # need the dev headers (pkg-config .pc files) for both.
-          #
-          # sounddevice links against PortAudio at *import* time (not just
-          # build time), so we need the shared lib too.
-          # base-devel pulls in gcc/g++/make/pkgconf which are also needed.
+          # --noconfirm is safe in CI: no interactive prompts.
           #
           # Rust workspace deps (rust/crates/holaf-pw):
           #   pipewire     -> ships libpipewire-0.3.pc AND libspa-0.2.pc
@@ -152,38 +114,23 @@ jobs:
           #                   (libspa-sys / pipewire-sys generate bindings)
           #   rust         -> the Arch package: prebuilt, self-consistent
           #                   toolchain with /usr/bin/cargo and /usr/bin/rustc.
-          #                   We install this rather than a version-manager
-          #                   shim: in a container job the shim has no default
-          #                   toolchain and drops its proxies into a cargo
-          #                   home that is neither on PATH nor at a
-          #                   predictable location. `rust` needs no
-          #                   CARGO_HOME/HOME/PATH juggling at all.
           #                   Requirement: this package must be >= the
           #                   rust-version pin in rust/Cargo.toml (currently
-          #                   1.98; Arch ships 1.99.x), otherwise cargo
-          #                   refuses the whole workspace.
-          # pkgconf is already in the list and is what -sys crates call.
+          #                   1.98), otherwise cargo refuses the workspace.
+          #   pkgconf      -> what the -sys crates call at build time.
           #
           # Runtime helpers the binaries EXEC (`pw-cat` for the VU meters,
           # `pactl` for app list/move) are deliberately NOT installed here:
           # they live in `pipewire-audio` / `libpulse`(+`pipewire-pulse`), and
           # only the *live* tests use them.  Those tests self-skip precisely
-          # because this job has no PipeWire daemon (`SKIP app_routing_live: no
-          # pactl (pipewire-pulse) on this machine`) — see the `cargo test` step.
-          # Enabling them later means adding, in one go:
-          #   pipewire-audio pipewire-pulse libpulse wireplumber
-          # plus a `scripts/start-pipewire-headless.sh` call before the tests.
+          # because this job has no PipeWire daemon.
           pacman -S --noconfirm --needed \
             base-devel \
             pkgconf \
             git \
             librsvg \
             imagemagick \
-            python \
-            python-pip \
-            jack2 \
             alsa-lib \
-            portaudio \
             pipewire \
             clang \
             rust \
@@ -195,10 +142,9 @@ jobs:
           # app ships) needs **no package at all**: the backend is `ksni`, a
           # pure D-Bus `org.kde.StatusNotifierItem` (see
           # docs/dependency-audit.md).  No gtk3, no libayatana-appindicator, no
-          # GMainLoop — that is why `gtk3` and `libayatana-appindicator` are no
-          # longer in this list.  libxdo is not needed either: `tray-icon` is
-          # declared with default-features = false.
-
+          # GMainLoop.  libxdo is not needed either: `tray-icon` is declared
+          # with default-features = false.
+          #
           # Window backend of holaf-ui: **Wayland** (eframe/winit, feature
           # `wayland`; X11 is opt-in via `--features x11` and never in the
           # packaged build, so a Wayland regression cannot go unnoticed).
@@ -220,17 +166,6 @@ jobs:
           ls /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml >/dev/null || {
             echo "::error::wayland-protocols XMLs missing (pacman: wayland-protocols)"; exit 1;
           }
-
-          # Arch's `python` package provides /usr/bin/python3; verify
-          # before continuing, otherwise the next step fails with a
-          # confusing "command not found".
-          if ! command -v python3 >/dev/null; then
-            echo "::error::python3 not found after installing 'python' package."
-            echo "::error::Check that pacman succeeded and PATH includes /usr/bin."
-            ls -la /usr/bin/python* 2>/dev/null || true
-            exit 1
-          fi
-          python3 --version
 
           # Verify the PipeWire / SPA pkg-config files really landed. If this
           # fails, `cargo build -p holaf-pw` will fail later with an opaque
@@ -256,8 +191,7 @@ jobs:
         #
         # This step only fails fast when the package is missing. The MSRV is
         # NOT re-checked by hand: cargo enforces rust-version itself with an
-        # explicit message ("package ... requires rustc 1.98 or newer"), so a
-        # duplicate shell comparison would only add a way to get it wrong.
+        # explicit message ("package ... requires rustc 1.98 or newer").
         run: |
           set -euo pipefail
           command -v cargo || { echo "::error::cargo not found in PATH (pacman 'rust' missing?)"; exit 1; }
@@ -265,67 +199,17 @@ jobs:
           cargo --version
           rustc --version
 
-      - name: Install Python build dependencies
-        # Use a venv instead of --break-system-packages. On Arch, the
-        # system `python3` and the system `pip` (from python-pip) can
-        # drift apart in subtle ways; a venv guarantees that imports
-        # work in the same interpreter that pip wrote to.
-        run: |
-          set -e
-          python3 -m venv /opt/holaf-venv
-          # shellcheck disable=SC1091
-          source /opt/holaf-venv/bin/activate
-
-          # Sanity: venv python should be the one we're using
-          echo "Using: $(which python3) ($(python3 --version))"
-          echo "Site-packages: $(python3 -c 'import site; print(site.getsitepackages())')"
-
-          python3 -m pip install --no-cache-dir --upgrade pip
-          python3 -m pip install --no-cache-dir \
-            pyinstaller \
-            PySide6 \
-            sounddevice \
-            numpy \
-            mido \
-            python-rtmidi
-
-          # Verify all packages import in THIS venv. If this passes,
-          # build.sh's check_deps will pass too.
-          echo "::group::Verifying imports"
-          python3 -c "
-          import importlib
-          for mod in ('PySide6', 'sounddevice', 'numpy', 'mido', 'rtmidi', 'PyInstaller'):
-              try:
-                  importlib.import_module(mod)
-                  print(f'  OK   {mod}')
-              except ImportError as e:
-                  print(f'  FAIL {mod}: {e}')
-                  raise SystemExit(1)
-          "
-          echo "::endgroup::"
-
-      # ------------------------------------------------------------------
-      # 2. Rust build (daemon + CLI)
-      #    Runs BEFORE the PyInstaller steps on purpose: the Rust daemon is the
-      #    app's DEFAULT audio backend, and packaging/holaf-mix.spec embeds
-      #    holafd/holafctl into the bundle, so the binaries must already exist
-      #    in dist/.  build.sh also invokes scripts/build_rust.sh itself and
-      #    tolerates a failure (Python-only bundle), so a Rust breakage still
-      #    cannot cost us the Python artifact — see the upload steps.
-      #    Each toolchain gets its own shell/env from here on.
-      # ------------------------------------------------------------------
       - name: Diagnose Rust build toolchain (PipeWire / libclang / bindgen)
         # Cheap, best-effort one-stop diagnostic for the *whole* FFI chain, run
         # BEFORE the cargo build so its output sits right next to any failure.
         #
         # Motivation: an Arch-only compile error of the form
         #   no field `data` on type `spa_pod_builder`
-        # came from libspa-sys 0.8.0 (bindgen 0.69.5), whose libclang
-        # invocation silently degraded some structs to a fake `_address: u8`
-        # field with recent libclang versions (upstream pipewire-rs issue
-        # #112). Nothing in the old log said which bindgen/libclang pair was
-        # in play, so the failure looked like a PipeWire ABI break. One glance
-        # at this group answers that question.
+        # came from libspa-sys (bindgen), whose libclang invocation silently
+        # degraded some structs to a fake `_address: u8` field with recent
+        # libclang versions (upstream pipewire-rs issue #112). Nothing in the
+        # old log said which bindgen/libclang pair was in play, so the failure
+        # looked like a PipeWire ABI break.
         continue-on-error: true
         run: |
           set -uo pipefail
@@ -350,7 +234,6 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::bindgen version resolved for this lockfile"
-          # `-i` inverts the tree: who depends on bindgen, and which version won.
           (cd rust && cargo tree -i bindgen --locked 2>/dev/null | head -15) \
             || echo "  (bindgen not in the dependency graph yet — first build?)"
           echo "::endgroup::"
@@ -359,10 +242,9 @@ jobs:
         uses: actions/cache@v4
         with:
           # CARGO_HOME is unset in this container, so cargo falls back to
-          # its default ($HOME/.cargo): the Arch `rust` package changes
-          # nothing here. Only the registry/git caches are worth keeping
-          # (rust/target is cached too — it makes the cold build fast on a
-          # lockfile-identical rerun, at the cost of a fatter cache entry).
+          # its default ($HOME/.cargo). Only the registry/git caches are worth
+          # keeping (rust/target is cached too — it makes the cold build fast
+          # on a lockfile-identical rerun, at the cost of a fatter cache entry).
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -371,76 +253,36 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build Rust UI + daemon + CLI (release)
+      # ------------------------------------------------------------------
+      # 2. Tests (gate) — they need no PipeWire daemon
+      # ------------------------------------------------------------------
+      - name: cargo test (workspace)
+        # The live tests in holaf-pw/tests/*_live.rs self-skip (stderr
+        # "SKIP …: no headless PipeWire configured") unless XDG_RUNTIME_DIR
+        # points at a headless runtime or HOLAF_PW_LIVE=1 is set. Nothing here
+        # sets those, so the job stays hermetic on a stock Arch container.
+        #
+        # The Rust test suite is the ONLY test suite: the 207 Python tests are
+        # gone with the Python layer (docs/python-removal.md).
+        run: |
+          set -euo pipefail
+          cd rust
+          cargo test --locked --workspace
+
+      # ------------------------------------------------------------------
+      # 3. Build + package (icons + the three release binaries + tarball)
+      # ------------------------------------------------------------------
+      - name: Build and package (./build.sh --tarball)
         # PATH: `cargo` is /usr/bin/cargo (Arch `rust` package), so it
         # resolves in this fresh shell with no export and no $GITHUB_PATH
         # entry. Never prepend a custom PATH before this step: it could
         # shadow /usr/bin/cargo with a stale/partial toolchain.
-        # LIBCLANG_PATH comes from the job env (see top of the job).
+        # LIBCLANG_PATH / HOLAF_CARGO_LOCKED come from the job env.
         run: |
           set -euo pipefail
-          cd rust
-          # --locked is intentional and must NOT be dropped if it fails:
-          # a lockfile out of sync with the manifests is a real repository
-          # bug (non-reproducible builds). Let the step fail visibly and fix
-          # Cargo.lock with `cargo update` locally — do not "repair" it here.
-          # holaf-ui is the app's window (main.py launches it), holafd the
-          # audio backend of the Qt fallback, holafctl the CLI.  One invocation:
-          # they share every dependency (holaf-pw, egui…).
-          #
-          # --features tray: THE SHIPPED BINARY HAS THE TRAY ICON. It is the
-          # default of scripts/build_rust.sh (and therefore of build.sh), and
-          # this step must match, otherwise the artifact the CI uploads (and
-          # the bundle embedded by the PyInstaller steps below) would silently
-          # differ from what that script produces. The tray needs no system
-          # package (ksni/D-Bus); the `cargo check` step further down re-proves
-          # the feature compiles on its own.
-          cargo build --release --locked --features tray \
-            -p holaf-ui -p holafd -p holafctl
-          cd ..
-          mkdir -p dist
-          cp rust/target/release/holaf-ui \
-             rust/target/release/holafd \
-             rust/target/release/holafctl dist/
-          chmod +x dist/holaf-ui dist/holafd dist/holafctl
-          strip dist/holaf-ui dist/holafd dist/holafctl || true
-          file dist/holaf-ui dist/holafd dist/holafctl
-          ls -lh dist/holaf-ui dist/holafd dist/holafctl
-
-          # Bundle the three binaries for users who want a single download.
-          arch="$(uname -m)"
-          tar -czf "dist/holaf-rust-${arch}.tar.gz" \
-            -C dist holaf-ui holafd holafctl
-          ls -lh "dist/holaf-rust-${arch}.tar.gz"
-
-          # holaf-ui must at least start: `--help` is parsed before any window,
-          # so this proves the ELF loads and its libraries resolve, without an
-          # X server.
-          help_out="$(timeout 20 dist/holaf-ui --help 2>&1 || true)"
-          if grep -q "usage: holaf-ui" <<<"$help_out"; then
-            echo "  OK   holaf-ui runs (--help)"
-          else
-            echo "::error::dist/holaf-ui did not run:"
-            echo "$help_out"
-            exit 1
-          fi
-
-          # Runtime linkage sanity: catches a binary linked against
-          # libpipewire/libspa versions that are not actually installed.
-          # Warning-level on purpose (the Rust core is still experimental and
-          # must not block the Python artifact).
-          for bin in dist/holaf-ui dist/holafd dist/holafctl; do
-            if ldd "$bin" 2>/dev/null | grep -q "not found"; then
-              echo "::warning::missing shared libraries for $bin:"
-              ldd "$bin" | grep "not found" || true
-            else
-              echo "  OK   dynamic dependencies resolve for $bin"
-            fi
-            # The loader running at all proves the ELF is loadable.
-            # `timeout` guards against a future change where --help stops
-            # being a pure parse-and-exit (e.g. it starts a backend).
-            timeout 10 "$bin" --help >/dev/null 2>&1 || true
-          done
+          chmod +x build.sh assets/icons/build_icons.sh scripts/build_rust.sh
+          ./build.sh --tarball
+          ls -lh dist/
 
       - name: Build Rust UI with the tray feature (ksni, no GTK)
         # Redundant on purpose with the release build above (which already
@@ -448,22 +290,17 @@ jobs:
         # tray feature alone compiles — the release build could be "fixed" by
         # dropping the feature and still pass.
         #
-        # Two guards, both cheap and both aimed at the migration of 2026-11-15:
-        #   1. `cargo check --features tray` must pass (continue-on-error: false
-        #      on purpose — if the tray stops compiling we WANT the job red);
+        # Two guards:
+        #   1. `cargo check --features tray` must pass (if the tray stops
+        #      compiling we WANT the job red);
         #   2. the tray build must pull **zero GTK/GLib** crates: the whole point
         #      of ksni is that `gtk 0.18` (closed, unmaintained, RUSTSEC-2024-0370
         #      via proc-macro-error) is gone.  A silent re-introduction is exactly
         #      the kind of regression nobody notices.
-        #
-        # `cargo check`, not `build`: it type-checks the crate without paying for
-        # a second codegen of the whole egui stack.
-        continue-on-error: false
         run: |
           set -euo pipefail
 
           cd rust
-          # --locked: same reproducibility rule as the release build above.
           cargo check --locked -p holaf-ui --features tray
           echo "  OK   holaf-ui compiles with --features tray (ksni)"
 
@@ -477,37 +314,11 @@ jobs:
 
       - name: Verify the Wayland window backend (and the optional X11 one)
         # `holaf-ui` is a **Wayland** client: eframe is compiled with the
-        # `wayland` feature and *without* `x11`.  That is exactly what the user
-        # asked for (their desktop was showing the binary with the "X11" icon and
-        # demanding an X server under Wayland), so it needs a guard of its own —
-        # a stray `x11` in a dependency's defaults would silently bring XWayland
-        # back.
-        #
-        # WHAT THE GUARD MEANS (it used to be « no crate matching `x11*` »,
-        # which is no longer achievable nor desirable):
-        #
-        #   * FORBIDDEN: eframe's `x11` feature, winit's `x11` backend, and any
-        #     X11 *C client* crate (`x11-dl`, `xcb`, `libxcb`,
-        #     `as-raw-xcb-connection`).  Those are what make the binary show up
-        #     as an X11/XWayland application — the actual bug.
-        #   * ALLOWED, but only from the clipboard: `x11rb`/`x11rb-protocol`.
-        #     `arboard` (eframe's `clipboard` feature, i.e. « Copy report »)
-        #     declares `x11rb` as a NON-optional Linux dependency, with no
-        #     feature to switch it off (`default-features = false` +
-        #     `wayland-data-control` — already what egui-winit asks for — still
-        #     pulls it).  `x11rb` is a pure-Rust X11 protocol implementation: it
-        #     is never used under Wayland (`arboard` picks its
-        #     `wl-clipboard-rs` path as soon as `WAYLAND_DISPLAY` is set) and it
-        #     links no C library (`ldd` shows no libX11/libxcb).
-        #     This is why the guard checks the *origin* of every X11 crate in
-        #     the graph (`cargo tree -i`) instead of their mere presence.
-        #
-        # X11 stays available as an opt-in feature (`--features x11`) for an
-        # X11-only machine; this step checks both, so neither can rot.
-        #
-        # The checks live in `scripts/check-wayland-guard.sh` so they can be run
-        # locally (`./scripts/check-wayland-guard.sh`) with the exact same rules.
-        continue-on-error: false
+        # `wayland` feature and *without* `x11`.  A stray `x11` in a
+        # dependency's defaults would silently bring XWayland back (the binary
+        # then shows up as an X11 application).  The checks live in
+        # `scripts/check-wayland-guard.sh` so they can be run locally with the
+        # exact same rules.
         run: |
           set -euo pipefail
           ./scripts/check-wayland-guard.sh
@@ -557,331 +368,110 @@ jobs:
           echo "::endgroup::"
 
       # ------------------------------------------------------------------
-      # 3. Build (using the project's own build.sh, with safety bypass)
+      # 4. Smoke tests on the tarball itself (what the user downloads)
       # ------------------------------------------------------------------
-      - name: Build (onefile)
-        if: ${{ github.event.inputs.mode != 'onedir' && github.event.inputs.mode != 'both' || github.event.inputs.mode == '' }}
-        run: |
-          # Activate the venv so the same python3 that has the packages
-          # is the one build.sh calls.
-          # shellcheck disable=SC1091
-          source /opt/holaf-venv/bin/activate
-          chmod +x build.sh assets/icons/build_icons.sh
-          ./build.sh --tarball
-        env:
-          # Build inside the CI container: bypass the host-install guards.
-          HOLAF_BUILD_INSTALL_DEPS: '1'
-
-      - name: Build (onedir, fast launch)
-        if: ${{ github.event.inputs.mode == 'onedir' || github.event.inputs.mode == 'both' }}
-        run: |
-          # Activate the venv too: each `run:` is a fresh shell, so the
-          # activation done in the onefile step does NOT carry over. Without
-          # this, `pyinstaller` is not found when mode=onedir/both.
-          # shellcheck disable=SC1091
-          source /opt/holaf-venv/bin/activate
-          chmod +x build.sh assets/icons/build_icons.sh
-          ./build.sh --onedir --tarball
-        env:
-          HOLAF_BUILD_INSTALL_DEPS: '1'
-
-
-      - name: cargo test (workspace)
-        # No PipeWire daemon is required: the live tests in
-        # holaf-pw/tests/backend_live.rs self-skip (stderr "SKIP backend_live:
-        # no headless PipeWire configured") unless XDG_RUNTIME_DIR points at a
-        # headless runtime or HOLAF_PW_LIVE=1 is set. Nothing here sets those,
-        # so the job stays hermetic on a stock Arch container.
+      - name: Smoke test — unpack the tarball, no Python, binaries run
         run: |
           set -euo pipefail
-          cd rust
-          cargo test --locked --workspace
 
-      # ------------------------------------------------------------------
-      # 4. Verify the Python binary actually runs (smoke test)
-      # ------------------------------------------------------------------
-      - name: Smoke test — binary well-formed
-        run: |
-          chmod +x dist/holaf-mix || true
-          # Verify it's a valid ELF executable
-          file dist/holaf-mix
-          ls -lh dist/holaf-mix
-          # Strip the binary to shave off ~30% on a real release
-          strip dist/holaf-mix 2>/dev/null || true
+          tarball="$(ls dist/holaf-mix-*.tar.gz | head -1)"
+          echo "tarball: $tarball ($(du -h "$tarball" | cut -f1))"
 
-      - name: Smoke test — the bundled Rust UI is embedded and runs
-        # The point of migration B1: `holaf-mix` is a *launcher* whose job is to
-        # start `holaf-ui` from inside the bundle.  A bundle that silently lost
-        # it would still "work" (Qt fallback), so this is the only check that
-        # catches the regression.
-        #
-        # No X server here, which is exactly what makes it a good probe: the Rust
-        # UI parses its config, attaches the engine, then fails to open a window
-        # and says so on stderr — and the child inherits the real stderr (the
-        # windowed bootloader only silences *Python's* stdio).
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          out="$(timeout 90 ./dist/holaf-mix 2>&1 || true)"
-          echo "$out"
-          if grep -qE "holaf-ui: (no display server|cannot open a window)" <<<"$out"; then
-            echo "  OK   the bundled holaf-ui ran (headless: eframe reported no display)"
-          elif grep -qE "holaf-ui resolved from the PyInstaller bundle" <<<"$out"; then
-            echo "  OK   the launcher found holaf-ui inside the bundle"
-          else
-            echo "::warning::holaf-mix did not reach holaf-ui — the bundle fell back to the Qt UI"
-          fi
+          work="$(mktemp -d)"
+          tar -xzf "$tarball" -C "$work"
+          root="$(find "$work" -maxdepth 1 -mindepth 1 -type d | head -1)"
+          root="$(cd "$root" && pwd)"
+          echo "unpacked: $root"
+          ls -l "$root"
 
-      - name: Smoke test — bundled modules present in binary
-        # Best-effort sanity check. We can't actually RUN the binary
-        # (no X11 in CI, no PipeWire, no audio device), so this just
-        # verifies the ELF is valid and the bundle size is sensible.
-        # Hidden-import issues will surface when the user actually runs
-        # the binary on their desktop.
-        continue-on-error: true
-        run: |
-          # 1. The binary is a valid ELF
-          file dist/holaf-mix
-
-          # 2. Size sanity check (PyInstaller + PySide6 should be 50-150 MB)
-          size_bytes=$(stat -c%s dist/holaf-mix)
-          size_mb=$((size_bytes / 1024 / 1024))
-          echo "Binary size: ${size_mb} MB"
-          if [[ $size_mb -lt 30 ]]; then
-            echo "::warning::Binary is suspiciously small (<30 MB). Hidden imports might be missing."
-          fi
-          if [[ $size_mb -gt 300 ]]; then
-            echo "::warning::Binary is suspiciously large (>300 MB). Bundling might be excessive."
-          fi
-
-          # 3. Check that the binary embeds Python + PyInstaller markers
-          if strings dist/holaf-mix | grep -q "PyInstaller"; then
-            echo "  OK   PyInstaller bootloader present"
-          else
-            echo "  FAIL PyInstaller bootloader not found"
-          fi
-          if strings dist/holaf-mix | grep -q "PySide6"; then
-            echo "  OK   PySide6 strings present in bundle"
-          else
-            echo "  WARN PySide6 strings not found (may be compressed)"
-          fi
-
-      - name: Inspect bundled email modules
-        # Diagnose whether the `email` stdlib package and its submodules
-        # are actually present in the bundle. This was the root cause of
-        # a runtime ModuleNotFoundError on Python 3.12+ — PyInstaller's
-        # static analysis misses the lazy-imported submodules.
-        # Output is preserved in the workflow log for inspection.
-        #
-        # PATH FIX: this step used to read $PYI_DIST, which is a *local*
-        # variable inside build.sh (PYI_DIST="$BUILD_DIR/dist") and is
-        # therefore EMPTY in the workflow env — every branch fell into
-        # "no _internal dir" and the diagnostic printed nothing. The real
-        # layout, straight from build.sh:
-        #   workpath  = build/pyinstaller     (TOC + warn files, per spec)
-        #   distpath  = build/dist            (raw PyInstaller output)
-        #   published = dist/holaf-mix        (file if onefile, dir if onedir)
-        # Note: build.sh wipes the workpath before each mode, so with
-        # mode=both only the last mode's TOCs survive — the published
-        # on-disk layout check below covers the other mode.
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          echo "::group::Email module introspection"
-
-          PYI_WORK="build/pyinstaller"
-          PYI_OUT="build/dist"
-          PUBLISHED="dist/holaf-mix"
-
-          toc_files=()
-          while IFS= read -r f; do toc_files+=("$f"); done \
-            < <(find "$PYI_WORK" -maxdepth 2 -name '*.toc' 2>/dev/null)
-
-          # Real onedir layout, whichever path PyInstaller used
-          internal_dir=""
-          if [[ -d "$PUBLISHED/_internal" ]]; then
-            internal_dir="$PUBLISHED/_internal"
-          elif [[ -d "$PYI_OUT/holaf-mix/_internal" ]]; then
-            internal_dir="$PYI_OUT/holaf-mix/_internal"
-          fi
-
-          echo "TOC files found:    ${#toc_files[@]} under $PYI_WORK"
-          echo "_internal dir:      ${internal_dir:-<none — onefile mode>}"
-
-          # 1. Authoritative check: PyInstaller TOCs enumerate every
-          #    collected module (Python modules show up as 'email.foo').
-          if ((${#toc_files[@]})); then
-            echo "--- email* entries in PyInstaller TOCs ---"
-            grep -ho "'email[^']*'" "${toc_files[@]}" 2>/dev/null | sort -u | head -40 || true
-            n=$(grep -ho "'email[^']*'" "${toc_files[@]}" 2>/dev/null | sort -u | wc -l)
-            echo "  -> $n distinct email* entries"
-            if [[ "$n" -eq 0 ]]; then
-              echo "::warning::No email* module collected — the bundled app will fail to import email."
-            elif [[ "$n" -lt 5 ]]; then
-              echo "::warning::Only $n email* module(s) collected — submodules are likely missing."
-            else
-              echo "  OK   $n email* entries collected"
-            fi
-          else
-            echo "::warning::$PYI_WORK/*.toc not found — did a build step run?"
-          fi
-
-          # 2. Onedir mode only: the module files are physically on disk
-          if [[ -n "$internal_dir" ]]; then
-            files_n=$(find "$internal_dir" -path '*email*' 2>/dev/null | wc -l)
-            echo "--- email* paths on disk in _internal: $files_n ---"
-            find "$internal_dir" -path '*email*' 2>/dev/null | head -20 || true
-          fi
-
-          # 3. Sanity: something was actually published to dist/
-          if [[ -e "$PUBLISHED" ]]; then
-            ls -ld "$PUBLISHED"
-          else
-            echo "::warning::$PUBLISHED missing — nothing published to dist/."
-          fi
-          echo "::endgroup::"
-
-      - name: Verify the bundle does NOT embed the GTK3/GLib stack
-        # Regression guard for the bug packaging/holaf-mix.spec fixes: PySide6
-        # ships plugins/platformthemes/libqgtk3.so (and libQt6Core NEEDs
-        # libglib-2.0), so PyInstaller happily freezes the whole GTK3 + GLib
-        # stack.  NB: `holaf-ui` itself no longer links any GTK — the tray is a
-        # D-Bus StatusNotifierItem since the ksni migration — so this guard now
-        # protects the **Qt fallback** only.  The bootloader prepends sys._MEIPASS to
-        # LD_LIBRARY_PATH, so a frozen GTK3 wins over the user's: mismatched
-        # themes, GSettings schemas, dlopened theme engines and an appindicator
-        # the panel's libayatana may reject (same class of bug as the frozen
-        # libpipewire client).  The spec drops those libs from `a.binaries`;
-        # this step fails the job if they ever come back.
-        #
-        # Authoritative source: PyInstaller's own TOC (onefile) or the on-disk
-        # _internal/ (onedir).  Nothing to check when no build ran → notice.
-        continue-on-error: false
-        run: |
-          set -uo pipefail
-          echo "::group::GTK3/GLib frozen in the bundle?"
-
-          forbidden='libgtk-3\.so|libgdk-3\.so|libgdk_pixbuf-2\.0\.so|libpango|libcairo|libatk|libepoxy|libharfbuzz|libglib-2\.0\.so|libgobject-2\.0\.so|libgio-2\.0\.so|libgmodule-2\.0\.so|libgthread-2\.0\.so'
-
-          hits=0
-          shopt -s nullglob
-          # Only the FINAL trees: Analysis-00.toc keeps what the analysis
-          # collected *before* the spec dropped the GTK/GLib entries from
-          # a.binaries, so it would always "find" them.
-          tocs=(build/pyinstaller/*/EXE-*.toc build/pyinstaller/*/COLLECT-*.toc)
-          if ((${#tocs[@]})); then
-            for f in "${tocs[@]}"; do
-              # No trailing quote in the pattern: TOC entries are
-              #   ('libgtk-3.so.0', '/lib/x86_64-linux-gnu/libgtk-3.so.0', 'BINARY')
-              # so the soname carries a version suffix.
-              if grep -qE "$forbidden" "$f"; then
-                echo "  FROZEN in $f:"
-                grep -oE "($forbidden)[^',]*" "$f" | sort -u | sed 's/^/    /'
-                hits=$((hits + 1))
-              fi
-            done
-            echo "  checked ${#tocs[@]} TOC file(s)"
-          else
-            echo "::notice::no PyInstaller TOC under build/pyinstaller — build skipped?"
-          fi
-
-          for d in dist/holaf-mix/_internal build/dist/holaf-mix/_internal; do
-            if [[ -d "$d" ]]; then
-              found=$(ls "$d" 2>/dev/null | grep -cE "^($forbidden)" || true)
-              echo "  $d: $found forbidden librar(y|ies) on disk"
-              ((found == 0)) || hits=$((hits + 1))
-            fi
-          done
-
-          if ((hits > 0)); then
-            echo "::error::the bundle contains the GTK3/GLib stack — the Qt GTK platform theme would use a FROZEN GTK3 instead of the system one. Fix packaging/holaf-mix.spec (_GTK_SYSTEM_LIBS)."
+          # 1. The product contains NO Python at all — this is the whole point
+          #    of the Python removal (docs/python-removal.md).
+          if tar -tzf "$tarball" | grep -qE '\.py$|\.pyc$|(^|/)__pycache__/'; then
+            echo "::error::the tarball still contains Python files:"
+            tar -tzf "$tarball" | grep -E '\.py$|\.pyc$|__pycache__' | head
             exit 1
           fi
-          echo "  OK   no GTK3/GLib library in the bundle (the system provides them)"
-          echo "::endgroup::"
+          echo "  OK   no Python file in the tarball"
+
+          # 2. The four executables the user is told about are there.
+          for bin in holaf-ui holafd holafctl holaf-mix; do
+            if [[ ! -x "$root/$bin" ]]; then
+              echo "::error::$bin missing or not executable in the tarball"
+              exit 1
+            fi
+            echo "  OK   $bin is executable"
+          done
+
+          # 3. `--help` is parsed before any window: proves the ELF loads and
+          #    its libraries resolve, without a display server.
+          out="$(timeout 30 "$root/holaf-ui" --help 2>&1 || true)"
+          if ! grep -q "usage: holaf-ui" <<<"$out"; then
+            echo "::error::$root/holaf-ui --help failed:"
+            echo "$out"
+            exit 1
+          fi
+          echo "  OK   holaf-ui runs (--help)"
+
+          # 4. The `holaf-mix` shell launcher must reach the same binary.
+          out="$(timeout 30 "$root/holaf-mix" --help 2>&1 || true)"
+          if ! grep -q "usage: holaf-ui" <<<"$out"; then
+            echo "::error::holaf-mix did not hand over to holaf-ui:"
+            echo "$out"
+            exit 1
+          fi
+          echo "  OK   holaf-mix execs holaf-ui"
+
+          # 5. Runtime linkage sanity: catches a binary linked against
+          #    libpipewire/libspa versions that are not installed.
+          for bin in holaf-ui holafd holafctl; do
+            if ldd "$root/$bin" 2>/dev/null | grep -q "not found"; then
+              echo "::error::missing shared libraries for $bin:"
+              ldd "$root/$bin" | grep "not found" || true
+              exit 1
+            fi
+            echo "  OK   dynamic dependencies resolve for $bin"
+          done
+
+          # 6. Config resolution, headless: with no --config, no $HOLAF_CONFIG,
+          #    no config next to the binary and none in the CWD, the binary must
+          #    fall back to $XDG_CONFIG_HOME/holaf-mix/config.json (the new
+          #    first-run location, see holaf_core::config::default_config_path).
+          scratch="$(mktemp -d)"
+          out="$(cd "$scratch" && HOME="$scratch/home" timeout 60 "$root/holaf-ui" 2>&1 || true)"
+          expected="config: $scratch/home/.config/holaf-mix/config.json"
+          if ! grep -qF "$expected" <<<"$out"; then
+            echo "::error::config resolution did not fall back to XDG (expected '$expected'):"
+            echo "$out" | head -20
+            exit 1
+          fi
+          echo "  OK   config resolves to $expected"
+          if ! grep -qE "no display server|cannot open a window" <<<"$out"; then
+            echo "::warning::holaf-ui did not report the missing display server:"
+            echo "$out" | head -20
+          else
+            echo "  OK   headless run reports no display server"
+          fi
 
       # ------------------------------------------------------------------
       # 5. Compute checksums
       # ------------------------------------------------------------------
       - name: Generate checksums
-        # Tolerant loop: the Rust binaries (and their tarball) only exist if
-        # the Rust build ran, so a missing file must not fail this step
-        # (`sha256sum: holafd: No such file or directory` + exit 1 used to
-        # abort the whole job — and with it both artifact uploads — whenever
-        # the Rust step was skipped or broken).
-        # `!cancelled()` (instead of the implicit success()): we want the
-        # checksums even if a later Rust step failed, as long as a tarball
-        # was produced.
-        if: ${{ !cancelled() && hashFiles('dist/*.tar.gz') != '' }}
         run: |
-          set -uo pipefail
-          if ! cd dist; then
-            echo "::warning::dist/ does not exist — no checksums to generate"
-            exit 0
-          fi
-          # nullglob: the *.tar.gz glob simply disappears when nothing
-          # matched. The literal Rust binary names stay in the array on
-          # purpose, so the -f test below can report them as missing instead
-          # of letting sha256sum abort the step.
-          shopt -s nullglob
-          files=(*.tar.gz holaf-ui holafd holafctl)
-          present=()
-          for f in "${files[@]}"; do
-            if [[ -f "$f" ]]; then
-              present+=("$f")
-            else
-              echo "::notice::$f is absent (Rust build skipped or failed) — not checksummed"
-            fi
-          done
-          if ((${#present[@]})); then
-            sha256sum "${present[@]}" > SHA256SUMS
-          else
-            echo "::warning::nothing to checksum in dist/ — writing an empty SHA256SUMS"
-            : > SHA256SUMS
-          fi
-          echo "SHA256SUMS (${#present[@]} file(s)):"
+          set -euo pipefail
+          cd dist
+          sha256sum holaf-mix-*.tar.gz > SHA256SUMS
+          echo "SHA256SUMS:"
           cat SHA256SUMS
 
       # ------------------------------------------------------------------
-      # 6. Upload artifacts — two INDEPENDENT sets
+      # 6. Upload the artifact (the delivery path)
       # ------------------------------------------------------------------
-      - name: Upload Python tarball
-        # `!cancelled()` + hashFiles guard = the Python artifact is published
-        # even when a *later* step (the Rust build, smoke tests, …) failed.
-        # That is what makes the two artifact sets truly independent.
-        if: ${{ !cancelled() && hashFiles('dist/holaf-mix-*.tar.gz') != '' }}
+      - name: Upload Holaf-Mix tarball
         uses: actions/upload-artifact@v4
         with:
           name: holaf-mix-${{ github.sha }}-${{ runner.arch }}
-          # Narrow glob (holaf-mix-*): build.sh names its tarball
-          # holaf-mix-<version>-<arch>.tar.gz, so this avoids also grabbing
-          # dist/holaf-rust-<arch>.tar.gz, which belongs to the other
-          # artifact below.
           path: |
             dist/holaf-mix-*.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
-
-      - name: Upload Rust binaries
-        # Kept separate on purpose: if the Rust build breaks, the Python
-        # bundle above is still published (and vice-versa: a PyInstaller
-        # failure leaves the Rust artifact downloadable if cargo succeeded).
-        # Content: holaf-ui + holafd + holafctl + a tarball of them + checksums.
-        if: ${{ !cancelled() && hashFiles('dist/holafd') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: holaf-rust-${{ github.sha }}-${{ runner.arch }}
-          path: |
-            dist/holaf-ui
-            dist/holafd
-            dist/holafctl
-            dist/holaf-rust-*.tar.gz
-            dist/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 30
-
-  # ======================================================================
-  # Optional: build a .deb / .rpm in a second job (skipped for now, kept
-  # as a placeholder for when the user wants Linux distro packages).
-  # ======================================================================

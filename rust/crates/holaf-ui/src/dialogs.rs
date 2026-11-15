@@ -96,8 +96,13 @@ pub struct DevicePicker {
 /// One line of the device pop-up.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceChoice {
-    /// The text the user sees (`Analog Stereo  (alsa_output.…)`).
+    /// The text the user sees, on **one** line (`PreSonus Studio 26c ·
+    /// pro-output-0`).  The pop-up never wraps it: one device = one row.
     pub label: String,
+    /// The full `node.name` this row stands for — the hover text, so an elided
+    /// label can always be resolved to the real node (empty for the "no device"
+    /// entry).
+    pub detail: String,
     /// The node name to bind, or `None` for the "no device" entry.
     pub device: Option<String>,
 }
@@ -137,20 +142,33 @@ impl DevicePicker {
     /// The lines the pop-up lists: the unbind entry first, then every device the
     /// engine reported whose media class matches this strip.
     ///
-    /// Pure on purpose: the filtering (`accepts`) and the ordering are what a
-    /// reviewer wants to check, and they are testable without painting a single
-    /// pixel.
+    /// Pure on purpose: the filtering (`accepts`), the labels and the ordering
+    /// are what a reviewer wants to check, and they are testable without painting
+    /// a single pixel.
+    ///
+    /// The label is [`crate::devices::readable_label`] — the *model* of the card
+    /// (`PreSonus Studio 26c · pro-output-0`), never the bare profile the old
+    /// rule kept (`analog-stereo` read the same for the C-Media **and** the
+    /// built-in card).  When two devices of one family produce the same label
+    /// (two identical USB interfaces with different serials) the instance
+    /// segment is appended, so no two rows are ever identical: picking the wrong
+    /// speakers is worse than a slightly longer label.
     pub fn entries(&self, devices: &[crate::engine_json::DeviceInfo]) -> Vec<DeviceChoice> {
+        let accepted: Vec<&crate::engine_json::DeviceInfo> =
+            devices.iter().filter(|d| self.accepts(d)).collect();
+        let labels = distinct_labels(&accepted);
         let mut entries = vec![DeviceChoice {
             label: self.unbind_label().to_string(),
+            detail: String::new(),
             device: None,
         }];
         entries.extend(
-            devices
+            accepted
                 .iter()
-                .filter(|d| self.accepts(d))
-                .map(|device| DeviceChoice {
-                    label: format!("{}  ({})", device.display(), device.name),
+                .zip(labels)
+                .map(|(device, label)| DeviceChoice {
+                    label,
+                    detail: device.name.clone(),
                     device: Some(device.name.clone()),
                 }),
         );
@@ -161,6 +179,39 @@ impl DevicePicker {
     pub fn is_current(&self, choice: &DeviceChoice) -> bool {
         self.current == choice.device
     }
+}
+
+/// Readable labels for a device list, guaranteed to be **unique**: a label that
+/// appears twice gets its instance segment appended (`PreSonus Studio 26c ·
+/// analog-stereo (usb-PreSonus_Studio_26c_01424548-00)`).
+///
+/// Two identical USB interfaces with different serials produce the same model
+/// label; a list where both rows read the same is exactly the unusable menu the
+/// user reported, with the extra hazard that one of the two cards is the wrong
+/// choice.
+pub fn distinct_labels(devices: &[&crate::engine_json::DeviceInfo]) -> Vec<String> {
+    let labels: Vec<String> = devices
+        .iter()
+        .map(|device| device.label())
+        .collect();
+    labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let duplicated = labels
+                .iter()
+                .enumerate()
+                .any(|(other, candidate)| other != index && candidate == label);
+            if !duplicated {
+                return label.clone();
+            }
+            let parts = crate::devices::name_parts(&devices[index].name);
+            match parts.instance {
+                Some(instance) => format!("{label}  ({instance})"),
+                None => format!("{label}  ({})", devices[index].name),
+            }
+        })
+        .collect()
 }
 
 /// Draw every open dialog.  Called once per frame by [`crate::render`].
@@ -760,6 +811,102 @@ fn draw_delete_confirm(state: &mut AppState, ui: &mut Ui) {
     }
 }
 
+/// Device pop-up geometry.  The list is a **vertical** list of one-line rows:
+/// it must be wide enough for the device names and tall enough to show several
+/// of them at once.  Measured on the user's report: the old pop-up was
+/// 240 × ~70 px for the whole list, so every name was cut mid-word and two
+/// devices fit — “le menu de selection est tout petit”.
+mod picker_geometry {
+    /// Smallest pop-up width: a device name (`PreSonus Studio 26c ·
+    /// pro-output-0`) needs roughly this much at 13 px.
+    pub const MIN_WIDTH: f32 = 380.0;
+    /// Widest the pop-up may get; beyond that the label is elided and the full
+    /// `node.name` is in the tooltip.
+    pub const MAX_WIDTH: f32 = 560.0;
+    /// A pop-up with two or three devices still gets a breathing height (no
+    /// scroll, but not a postage stamp either).
+    pub const MIN_HEIGHT: f32 = 240.0;
+    /// Tallest the pop-up may get before the list scrolls.
+    pub const MAX_HEIGHT: f32 = 420.0;
+    /// Height of one row: one device = one line, never a wrapped paragraph.
+    pub const ROW_HEIGHT: f32 = 24.0;
+    /// Row label font size.
+    pub const ROW_FONT: f32 = 13.0;
+    /// Space the frame margins, the row inset and the scrollbar take.
+    pub const CHROME_WIDTH: f32 = 30.0;
+    /// Frame margins (4 px top + 4 px bottom) plus the breathing room a short
+    /// list gets on top of its rows.
+    pub const CHROME_HEIGHT: f32 = 24.0;
+    /// Space the pop-up keeps from the screen edge.
+    pub const SCREEN_MARGIN: f32 = 4.0;
+    /// Gap between the combo and the pop-up.
+    pub const ANCHOR_GAP: f32 = 2.0;
+}
+
+/// Where the device pop-up opens and how big it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PopupGeometry {
+    pub pos: egui::Pos2,
+    pub size: egui::Vec2,
+}
+
+/// Size and position of the device pop-up — pure, so the geometry is unit-tested
+/// without painting a pixel.
+///
+/// * **width** — as wide as the widest row (`widest_label` is already measured
+///   with egui's font layout), clamped to 380–560 px, never narrower than the
+///   combo that opened it;
+/// * **height** — one row per device, floored at 240 px (a two-device list must
+///   not be a postage stamp) and capped at 420 px, past which the list scrolls;
+/// * **position** — under the combo, flipped above it when that side has more
+///   room (a strip near the bottom of the window).
+///
+/// `anchor` is the combo's rect (published by `views::strip`); with no anchor the
+/// pop-up opens near the top-left of the window so a headless draw still shows
+/// something sane.
+pub fn popup_geometry(
+    anchor: Option<egui::Rect>,
+    screen: egui::Rect,
+    widest_label: f32,
+    rows: usize,
+) -> PopupGeometry {
+    use picker_geometry as geo;
+
+    let width = (widest_label + geo::CHROME_WIDTH)
+        .clamp(geo::MIN_WIDTH, geo::MAX_WIDTH)
+        .max(anchor.map_or(0.0, |rect| rect.width().min(geo::MAX_WIDTH)));
+
+    let rows = rows.max(1) as f32;
+    let content_height = rows * geo::ROW_HEIGHT + (rows - 1.0) * 2.0 + geo::CHROME_HEIGHT;
+    let wanted_height = content_height.clamp(geo::MIN_HEIGHT, geo::MAX_HEIGHT);
+
+    let Some(rect) = anchor else {
+        return PopupGeometry {
+            pos: egui::pos2(screen.left() + 20.0, screen.top() + 60.0),
+            size: egui::vec2(width, wanted_height),
+        };
+    };
+    let below = (screen.bottom() - rect.bottom() - geo::ANCHOR_GAP - geo::SCREEN_MARGIN).max(0.0);
+    let above = (rect.top() - screen.top() - geo::ANCHOR_GAP - geo::SCREEN_MARGIN).max(0.0);
+    // Drop below the combo; flip above it only when the list cannot fit below
+    // and there is more room up there (the last strips of the window).
+    let can_fit_below = below >= wanted_height.min(geo::MIN_HEIGHT);
+    let use_above = !can_fit_below && above > below;
+    let room = if use_above { above } else { below };
+    // Never taller than the screen allows: with neither side able to hold the
+    // list, it takes the roomier side and scrolls.
+    let height = wanted_height.min(room).max(geo::ROW_HEIGHT);
+    let pos = if use_above {
+        egui::pos2(rect.left(), rect.top() - geo::ANCHOR_GAP - height)
+    } else {
+        egui::pos2(rect.left(), rect.bottom() + geo::ANCHOR_GAP)
+    };
+    PopupGeometry {
+        pos,
+        size: egui::vec2(width, height),
+    }
+}
+
 /// The device binding pop-up — a drop-down under the strip's combo button.
 ///
 /// Anchoring: the strip view stores the combo's rect in egui memory
@@ -769,10 +916,23 @@ fn draw_delete_confirm(state: &mut AppState, ui: &mut Ui) {
 /// from code, a headless test that draws only the dialog) it opens near the
 /// top-left of the window instead of at (0, 0).
 ///
+/// Geometry (see [`picker_geometry`]): the pop-up is sized from its **content**
+/// — as wide as the longest label (clamped to 380–560 px), as tall as the rows
+/// need (clamped to 240–420 px, scrolling past that) — and it drops **below**
+/// the combo, flipping above it when there is more room there.  It used to be
+/// 240 px wide and content-height, which is what made the device names break
+/// mid-word on the user's screen.
+///
+/// Every row is one line: the label is elided with `…` inside the row, and the
+/// full `node.name` is the hover text.  No wrapping, ever — a wrapped row makes
+/// the list unreadable (and it looks like two devices).
+///
 /// Dismissal mirrors [`crate::menus::draw`]: a click outside, Escape, or a
 /// selection.  It is deliberately **non-modal** — nothing is dimmed, the strips
 /// stay usable, and the choice costs one click instead of three.
 fn draw_device_picker(state: &mut AppState, ui: &mut Ui) {
+    use picker_geometry as geo;
+
     let Some(dialog) = state.device_picker.clone() else {
         return;
     };
@@ -788,13 +948,29 @@ fn draw_device_picker(state: &mut AppState, ui: &mut Ui) {
     let anchor = ui.ctx().data(|memory| {
         memory.get_temp::<egui::Rect>(crate::views::strip::device_combo_id(&dialog.uid))
     });
-    let pos = match anchor {
-        Some(rect) => egui::pos2(rect.left(), rect.bottom() + 2.0),
-        None => egui::pos2(screen.left() + 20.0, screen.top() + 60.0),
-    };
-    // At least as wide as the button it drops from (a device list narrower than
-    // the combo that opened it looks like a bug), and never wider than a strip.
-    let width = anchor.map_or(180.0, |rect| rect.width().clamp(150.0, 320.0));
+
+    // --- width: as wide as the widest row, within bounds ----------------
+    // Measured with egui's own font layout (exact, not an estimate) so a label
+    // is only ever elided when the pop-up would otherwise leave the screen.
+    let font = egui::FontId::proportional(geo::ROW_FONT);
+    let painter = ui.painter().clone();
+    let widest = entries
+        .iter()
+        .map(|choice| choice.label.clone())
+        .chain(std::iter::once(empty_hint.clone()))
+        .map(|text| {
+            painter
+                .layout_no_wrap(text, font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+
+    // --- geometry: content-sized, floored, flipped above when needed -----
+    let geometry = popup_geometry(anchor, screen, widest, entries.len());
+    let pos = geometry.pos;
+    let width = geometry.size.x;
+    let height = geometry.size.y;
 
     let mut chosen: Option<Option<String>> = None;
     let inner = egui::Area::new(egui::Id::unique((
@@ -809,20 +985,43 @@ fn draw_device_picker(state: &mut AppState, ui: &mut Ui) {
             .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
                 ui.set_min_width(width);
+                ui.set_max_width(width);
+                ui.set_min_height(height - 8.0);
+                ui.set_max_height(height - 8.0);
                 ui.spacing_mut().item_spacing.y = 2.0;
+                // One device = one line.  `Truncate` keeps a long label from
+                // wrapping into a paragraph that reads like several devices.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                let row_width = width - 8.0;
                 egui::ScrollArea::vertical()
-                    .max_height(280.0)
+                    .max_height(height - 8.0)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for choice in &entries {
                             let selected = dialog.is_current(choice);
-                            if ui.selectable_label(selected, &choice.label).clicked() {
+                            let row = egui::Button::selectable(
+                                selected,
+                                egui::RichText::new(choice.label.clone()).size(geo::ROW_FONT),
+                            );
+                            let response = ui.add_sized([row_width, geo::ROW_HEIGHT], row);
+                            // The full node name, one hover away: the label is a
+                            // shortened form by construction.
+                            let response = if choice.detail.is_empty() {
+                                response
+                            } else {
+                                response.on_hover_text(choice.detail.clone())
+                            };
+                            if response.clicked() {
                                 chosen = Some(choice.device.clone());
                             }
                         }
                         if !devices_listed {
-                            // Same wording as before: never an empty box, the
-                            // reason the list is empty is the payload.
-                            ui.label(egui::RichText::new(empty_hint.clone()).size(10.0).weak());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(empty_hint.clone()).size(11.0).weak(),
+                                )
+                                .wrap(),
+                            );
                         }
                     });
             });
@@ -974,6 +1173,268 @@ mod tests {
         assert_eq!(entries[1].device.as_deref(), Some("alsa_input.mic"));
         // An empty engine answer still offers the way back to a virtual bus.
         assert_eq!(input.entries(&[]).len(), 1);
+    }
+
+    /// The labels of the pop-up are the user's own devices: the model of the
+    /// card, never the bare profile the old rule kept (`analog-stereo` read the
+    /// same for the C-Media **and** the built-in card).
+    #[test]
+    fn the_popup_labels_name_the_card_not_its_profile() {
+        let devices = vec![
+            sink(
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+                None,
+            ),
+            sink(
+                "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo",
+                None,
+            ),
+            sink("alsa_output.pci-0000_00_1f.3.analog-stereo", None),
+        ];
+        let picker = DevicePicker {
+            uid: "out-1".into(),
+            kind: StripType::Output,
+            current: None,
+            opened_at: 0.0,
+        };
+        let entries = picker.entries(&devices);
+        assert_eq!(
+            entries[1].label, "PreSonus Studio 26c · pro-output-0",
+            "{entries:?}"
+        );
+        assert_eq!(
+            entries[2].label,
+            "C-Media Electronics Inc. USB Audio Device · analog-stereo"
+        );
+        assert_eq!(entries[3].label, "alsa_output · analog-stereo");
+        // One row = one device: no label is a wrapped paragraph and none carries
+        // the raw node name inline any more (that is the tooltip's job).
+        for entry in &entries[1..] {
+            assert!(!entry.label.contains('\n'), "{entry:?}");
+            assert!(!entry.label.contains("usb-PreSonus"), "{entry:?}");
+        }
+        // The full node name — what a hover shows — is exact for every row.
+        assert_eq!(
+            entries[1].detail,
+            "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0"
+        );
+        assert!(entries[0].detail.is_empty(), "the unbind row has no node");
+        // No two rows ever read the same.
+        let unique: std::collections::HashSet<&String> =
+            entries.iter().map(|entry| &entry.label).collect();
+        assert_eq!(unique.len(), entries.len(), "{entries:?}");
+    }
+
+    /// Two identical USB interfaces (different serials) produce the same model
+    /// label; the instance segment is appended so one can still be told from the
+    /// other — picking the wrong speakers is worse than a longer label.
+    #[test]
+    fn two_identical_models_are_still_distinguishable() {
+        let devices = vec![
+            sink("alsa_output.usb-Kingston_2.analog-stereo", None),
+            sink("alsa_output.usb-Kingston_2_other_serial.analog-stereo", None),
+        ];
+        let picker = DevicePicker {
+            uid: "out-1".into(),
+            kind: StripType::Output,
+            current: None,
+            opened_at: 0.0,
+        };
+        let entries = picker.entries(&devices);
+        assert_ne!(entries[1].label, entries[2].label, "{entries:?}");
+        assert!(entries[1].label.contains("Kingston"), "{entries:?}");
+        assert!(!entries[1].label.contains('\n'));
+    }
+
+    /// The pop-up is a **vertical list**: wide enough for the names, tall enough
+    /// for several devices, capped with a scroll, and it drops below the combo
+    /// (flipping above it at the bottom of the window).
+    #[test]
+    fn the_device_popup_is_sized_for_a_vertical_list() {
+        use picker_geometry as geo;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let combo = egui::Rect::from_min_size(egui::pos2(120.0, 60.0), egui::vec2(90.0, 18.0));
+
+        // 3 devices with short names: still a generous pop-up (380 × 240), under
+        // the combo.
+        let three = popup_geometry(Some(combo), screen, 120.0, 3);
+        assert_eq!(three.size, egui::vec2(geo::MIN_WIDTH, geo::MIN_HEIGHT));
+        assert_eq!(three.pos, egui::pos2(combo.left(), combo.bottom() + 2.0));
+
+        // A long name widens it, up to the cap.
+        let wide = popup_geometry(Some(combo), screen, 300.0, 3);
+        assert_eq!(wide.size.x, 330.0_f32.max(geo::MIN_WIDTH));
+        let absurd = popup_geometry(Some(combo), screen, 1200.0, 3);
+        assert_eq!(absurd.size.x, geo::MAX_WIDTH, "the width is capped");
+
+        // 10 devices: the list grows with the content and does not scroll yet.
+        let ten = popup_geometry(Some(combo), screen, 300.0, 10);
+        assert_eq!(
+            ten.size.y,
+            10.0 * geo::ROW_HEIGHT + 9.0 * 2.0 + geo::CHROME_HEIGHT
+        );
+        assert!(ten.size.y > geo::MIN_HEIGHT && ten.size.y < geo::MAX_HEIGHT);
+
+        // 40 devices: capped, the rest is a scroll.
+        let many = popup_geometry(Some(combo), screen, 300.0, 40);
+        assert_eq!(many.size.y, geo::MAX_HEIGHT);
+
+        // A combo at the bottom of the window flips the list above it.
+        let low = egui::Rect::from_min_size(egui::pos2(120.0, 560.0), egui::vec2(90.0, 18.0));
+        let flipped = popup_geometry(Some(low), screen, 300.0, 10);
+        assert!(
+            flipped.pos.y + flipped.size.y <= low.top() + 0.5,
+            "{flipped:?} vs {low:?}"
+        );
+
+        // No anchor (drawn from code): it opens near the top-left, never at (0,0).
+        let floating = popup_geometry(None, screen, 300.0, 3);
+        assert_eq!(floating.pos, egui::pos2(20.0, 60.0));
+        assert_eq!(floating.size.x, geo::MIN_WIDTH);
+    }
+
+    /// The **rendered** pop-up is exactly what the geometry says — measured on
+    /// egui's own area rect, for the two lists the user asked about (3 devices and
+    /// 10 devices), so a drawing regression (a lost `set_min_height`, a scroll
+    /// area that shrinks) cannot hide behind a green model test.
+    #[test]
+    fn the_rendered_popup_matches_the_computed_geometry() {
+        use picker_geometry as geo;
+        let devices = |count: usize| -> Vec<DeviceInfo> {
+            (0..count)
+                .map(|index| {
+                    sink(
+                        &format!("alsa_output.usb-Holaf_Test_Interface_{index:02}-00.analog-stereo"),
+                        None,
+                    )
+                })
+                .collect()
+        };
+        let run = |count: usize| -> egui::Rect {
+            let ctx = crate::test_support::headless_context();
+            let mut state = AppState::demo();
+            state.engine_devices = devices(count);
+            let combo = egui::Rect::from_min_size(egui::pos2(60.0, 40.0), egui::vec2(90.0, 18.0));
+            ctx.data_mut(|data| {
+                data.insert_temp(crate::views::strip::device_combo_id("out-mix"), combo)
+            });
+            state.apply(UiAction::OpenDevicePicker {
+                uid: "out-mix".into(),
+            });
+            for time in [0.0, 1.0] {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    time: Some(time),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw, |ui| draw(&mut state, ui));
+                output.textures_delta.clear();
+            }
+            assert!(state.device_picker.is_some(), "the picker must stay open");
+            let id = egui::Id::unique(("holaf-device-popup", "out-mix"));
+            ctx.memory(|memory| memory.area_rect(id))
+                .expect("the pop-up is an Area: it has a rect")
+        };
+
+        let three = run(3);
+        assert!(
+            (geo::MIN_WIDTH..=geo::MAX_WIDTH).contains(&three.width()),
+            "3 devices: {} wide (between {} and {})",
+            three.width(),
+            geo::MIN_WIDTH,
+            geo::MAX_WIDTH
+        );
+        assert!(
+            (three.height() - geo::MIN_HEIGHT).abs() <= 2.0,
+            "3 devices: {} tall (a short list still breathes)",
+            three.height()
+        );
+
+        let ten = run(10);
+        // 10 devices + the "no device" row.
+        let expected = 11.0 * geo::ROW_HEIGHT + 10.0 * 2.0 + geo::CHROME_HEIGHT;
+        assert!(
+            (ten.height() - expected).abs() <= 4.0,
+            "10 devices: {} tall, expected {expected}",
+            ten.height()
+        );
+        assert!(ten.width() >= three.width(), "the list never gets narrower");
+        assert!(ten.height() > three.height(), "a longer list is taller");
+    }
+
+    /// **A real click on a row binds that device.**  The rows are `add_sized`
+    /// buttons (full-width highlight, one line each), so the hit area and the
+    /// action are worth a pointer test: an unclickable list would look right in
+    /// every snapshot and be useless.
+    #[test]
+    fn clicking_a_row_binds_that_device() {
+        let ctx = crate::test_support::headless_context();
+        let mut state = AppState::demo();
+        state.engine_devices = vec![
+            sink(
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+                None,
+            ),
+            sink("alsa_output.pci-0000_00_1f.3.analog-stereo", Some("Built-in")),
+        ];
+        let combo = egui::Rect::from_min_size(egui::pos2(60.0, 40.0), egui::vec2(90.0, 18.0));
+        ctx.data_mut(|data| {
+            data.insert_temp(crate::views::strip::device_combo_id("out-mix"), combo)
+        });
+        state.time = 5.0;
+        state.apply(UiAction::OpenDevicePicker {
+            uid: "out-mix".into(),
+        });
+        let run = |state: &mut AppState, time: f64, events: Vec<egui::Event>| {
+            state.time = time as f32;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| draw(state, ui));
+            output.textures_delta.clear();
+        };
+        // Two passes so the area exists, then aim at the **second** row (the
+        // first device; row 0 is the "no device" entry).
+        run(&mut state, 5.0, Vec::new());
+        run(&mut state, 5.1, Vec::new());
+        let area = ctx
+            .memory(|memory| {
+                memory.area_rect(egui::Id::unique(("holaf-device-popup", "out-mix")))
+            })
+            .expect("the pop-up has a rect");
+        let row = egui::pos2(
+            area.left() + area.width() / 2.0,
+            area.top() + 4.0 + picker_geometry::ROW_HEIGHT + 2.0 + picker_geometry::ROW_HEIGHT / 2.0,
+        );
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos: row,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run(&mut state, 5.2, vec![egui::Event::PointerMoved(row)]);
+        run(&mut state, 5.3, vec![button(true)]);
+        run(&mut state, 5.4, vec![button(false)]);
+        assert!(state.device_picker.is_none(), "a click must close the pop-up");
+        let strip = state
+            .strips
+            .iter()
+            .find(|strip| strip.uid == "out-mix")
+            .expect("the strip is still there");
+        assert_eq!(
+            strip.device_name.as_deref(),
+            Some("alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0"),
+            "clicking a row must bind the device of that row"
+        );
     }
 
     /// A selection in the pop-up performs the binding and closes it — the

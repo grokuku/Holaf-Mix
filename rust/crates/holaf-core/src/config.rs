@@ -1,12 +1,13 @@
 //! `config.json` I/O.
 //!
-//! Ports `src/config/settings.py` resolution + atomic-save semantics:
-//!
-//! - the config lives at `<repo-root>/config.json` (next to `main.py`);
+//! - the config path is resolved by [`default_config_path`] (see its docs for
+//!   the priority order: `$HOLAF_CONFIG`, the source tree, next to the
+//!   executable, the working directory, then XDG);
 //! - saves are atomic: write a temp file in the same directory then `rename`,
 //!   so a crash mid-write cannot corrupt the existing file;
-//! - unlike the Python `_load_raw_json` (which swallows errors and returns
-//!   `{}`), a JSON parse error here is **reported** — never silently replaced.
+//! - a missing parent directory is created on save (that is what makes a first
+//!   run in `$XDG_CONFIG_HOME/holaf-mix/` work);
+//! - a JSON parse error is **reported** — never silently replaced by `{}`.
 
 use std::fs;
 use std::io::Write;
@@ -26,23 +27,97 @@ pub enum ConfigError {
     NoProjectRoot(String),
 }
 
-/// Default `config.json` location: `<repo-root>/config.json`.
+/// Environment variable that overrides the config path outright.
+pub const CONFIG_ENV: &str = "HOLAF_CONFIG";
+
+/// Directory name used under `$XDG_CONFIG_HOME`.
+pub const XDG_APP_DIR: &str = "holaf-mix";
+
+/// Default `config.json` location, in priority order:
 ///
-/// The repo root is found by walking **up** from the current working
-/// directory until we find a directory that contains `.git/` or `src/`
-/// (the layout of this repository).  This works both from the repo root and
-/// from anywhere inside it (e.g. `rust/crates/holaf-core` while running
-/// `cargo test`).
+/// 1. **`$HOLAF_CONFIG`** — an explicit path, used as-is (the user asked for
+///    it; it does not have to exist yet).
+/// 2. **Source tree** — `<repo-root>/config.json` when the working directory is
+///    inside this repository (an ancestor holds `.git/` or `src/`).  This keeps
+///    `cargo run` / `cargo test` on the repo's own `config.json`.
+/// 3. **Next to the executable**, when that `config.json` already exists — the
+///    tarball case, and an installed `holaf-ui` started from a `.desktop` file
+///    (whose working directory is `$HOME`, not the install directory).
+/// 4. **`./config.json`** in the working directory, when it exists.
+/// 5. **`$XDG_CONFIG_HOME/holaf-mix/config.json`** (default
+///    `~/.config/holaf-mix/config.json`) — where a fresh system install
+///    creates its config.
 ///
-/// Falls back to `./config.json` (relative to the CWD) when no root is
-/// found — simple and documented, matches the task spec.
+/// `--config FILE` on the command line has always priority over all of the
+/// above: it is handled by the binary before this function is called.
 pub fn default_config_path() -> PathBuf {
-    match std::env::current_dir() {
-        Ok(cwd) => resolve_root_from(&cwd)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("config.json"),
-        Err(_) => PathBuf::from("config.json"),
+    let explicit = std::env::var_os(CONFIG_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    let exe_dir = executable_dir();
+    let xdg_dir = xdg_config_home();
+    resolve_config_path(explicit, cwd.as_deref(), exe_dir.as_deref(), xdg_dir.as_deref())
+}
+
+/// Pure resolution used by [`default_config_path`], so all five cases are
+/// unit-testable without touching the process environment.
+///
+/// `xdg_dir` is the *base* XDG directory (`~/.config`), not the app dir.
+pub fn resolve_config_path(
+    explicit: Option<PathBuf>,
+    cwd: Option<&Path>,
+    exe_dir: Option<&Path>,
+    xdg_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
     }
+
+    if let Some(cwd) = cwd {
+        if let Some(root) = resolve_root_from(cwd) {
+            return root.join("config.json");
+        }
+    }
+
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("config.json");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    if let Some(cwd) = cwd {
+        let candidate = cwd.join("config.json");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    match xdg_dir {
+        Some(dir) => dir.join(XDG_APP_DIR).join("config.json"),
+        None => PathBuf::from(XDG_APP_DIR).join("config.json"),
+    }
+}
+
+/// Directory holding the running executable, with symlinks resolved.
+///
+/// Resolving the symlink matters: `~/.local/bin/holaf-ui -> ~/apps/…/holaf-ui`
+/// must look for its config next to the *real* file, not in `~/.local/bin`.
+fn executable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent().map(Path::to_path_buf)
+}
+
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config`, else `None`.
+fn xdg_config_home() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).join(".config"))
 }
 
 /// Walk `start` (and each of its ancestors) looking for a directory that
@@ -80,6 +155,13 @@ pub fn save_config_atomic(path: &Path, value: &Value) -> Result<(), ConfigError>
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config.json");
+
+    // A first run may resolve to `$XDG_CONFIG_HOME/holaf-mix/config.json`,
+    // whose directory does not exist yet.  Creating it here (instead of in the
+    // resolver) keeps `default_config_path` free of side effects.
+    if !dir.as_os_str().is_empty() {
+        fs::create_dir_all(dir)?;
+    }
 
     // Same directory ⇒ same filesystem ⇒ rename() is atomic.  The pid keeps
     // concurrent writers from clobbering each other's temp file.
@@ -187,10 +269,89 @@ mod tests {
     #[test]
     fn default_config_path_points_at_repo_root() {
         // Tests run with CWD inside rust/crates/holaf-core; the resolver must
-        // climb up to /projects/Holaf-Mix (which has .git/ and src/).
+        // climb up to the repository root (which has .git/).
         let path = default_config_path();
         assert!(path.ends_with("config.json"));
         assert_eq!(path.file_name().unwrap().to_str(), Some("config.json"));
+    }
+
+    // --- config path resolution: the five documented cases -----------------
+
+    /// A scratch directory with no `.git`/`src` marker (i.e. not a repo).
+    fn plain_dir(tag: &str) -> PathBuf {
+        scratch(tag)
+    }
+
+    #[test]
+    fn resolved_path_case_1_explicit_override_wins() {
+        let dir = scratch("explicit");
+        let explicit = dir.join("chosen.json");
+        let path = resolve_config_path(
+            Some(explicit.clone()),
+            Some(&dir),
+            Some(&dir),
+            Some(&dir.join("xdg")),
+        );
+        // Used as-is, even though it does not exist.
+        assert_eq!(path, explicit);
+    }
+
+    #[test]
+    fn resolved_path_case_2_source_tree_wins_over_existing_neighbours() {
+        let root = scratch("tree");
+        fs::create_dir(root.join(".git")).unwrap();
+        let cwd = root.join("rust").join("crates");
+        fs::create_dir_all(&cwd).unwrap();
+        let exe_dir = plain_dir("tree-exe");
+        // An exe-adjacent config exists: the source tree must still win.
+        fs::write(exe_dir.join("config.json"), "{}").unwrap();
+
+        let path = resolve_config_path(None, Some(&cwd), Some(&exe_dir), Some(&root));
+        assert_eq!(path, root.join("config.json"));
+    }
+
+    #[test]
+    fn resolved_path_case_3_exe_adjacent_file() {
+        let cwd = plain_dir("exe-cwd");
+        let exe_dir = plain_dir("exe-dir");
+        fs::write(exe_dir.join("config.json"), "{}").unwrap();
+
+        let path = resolve_config_path(None, Some(&cwd), Some(&exe_dir), Some(&cwd.join("xdg")));
+        assert_eq!(path, exe_dir.join("config.json"));
+    }
+
+    #[test]
+    fn resolved_path_case_4_working_directory_file() {
+        let cwd = plain_dir("cwd");
+        let exe_dir = plain_dir("cwd-exe");
+        fs::write(cwd.join("config.json"), "{}").unwrap();
+
+        let path = resolve_config_path(None, Some(&cwd), Some(&exe_dir), Some(&cwd.join("xdg")));
+        assert_eq!(path, cwd.join("config.json"));
+    }
+
+    #[test]
+    fn resolved_path_case_5_falls_back_to_xdg() {
+        let cwd = plain_dir("xdg-cwd");
+        let exe_dir = plain_dir("xdg-exe");
+        let xdg = cwd.join("config-home");
+
+        let path = resolve_config_path(None, Some(&cwd), Some(&exe_dir), Some(&xdg));
+        assert_eq!(path, xdg.join(XDG_APP_DIR).join("config.json"));
+    }
+
+    #[test]
+    fn resolved_path_without_any_base_uses_a_relative_xdg_dir() {
+        let path = resolve_config_path(None, None, None, None);
+        assert_eq!(path, PathBuf::from(XDG_APP_DIR).join("config.json"));
+    }
+
+    #[test]
+    fn saving_creates_a_missing_parent_directory() {
+        let dir = scratch("mkdir");
+        let path = dir.join("holaf-mix").join("nested").join("config.json");
+        save_config_atomic(&path, &json!({ "a": 1 })).unwrap();
+        assert_eq!(load_config(&path).unwrap(), json!({ "a": 1 }));
     }
 
     #[test]

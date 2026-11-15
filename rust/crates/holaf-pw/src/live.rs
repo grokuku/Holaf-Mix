@@ -42,12 +42,100 @@ impl PortDir {
     }
 }
 
+/// How a **stereo** source feeds a **mono** target (a Pro Audio `pro-output-0`,
+/// a mono USB interface, a mono null-sink — a single `playback_MONO` port).
+///
+/// The Python engine (`_auto_link_ports`) always took the **left** channel: a
+/// listener on a mono output therefore heard the left half of the mix and
+/// nothing of the right, while the graph looked healthy (one link, no pending
+/// route).  The user has exactly this setup (a PreSonus in `pro-output-0`) and
+/// asked whether a downmix would be better; this policy makes the choice
+/// explicit and configurable (`ui_rust.mono_downmix`) instead of implicit.
+///
+/// The three realistic options, and what each one costs:
+///
+/// | policy | what reaches the mono port | gain on correlated material |
+/// |---|---|---|
+/// | [`Self::Left`] | `FL` only | 0 dB — **half the mix is lost** |
+/// | [`Self::Sum`] | `FL` + `FR`, summed by PipeWire's port mixer | **+6 dB** (clipping risk) |
+/// | [`Self::Average`] | `FL` + `FR`, summed, with the strip trimmed by −6 dB | 0 dB, nothing lost |
+///
+/// `Average` is the recommended setting for music: (L+R)/2 is what every DAW
+/// does when it collapses to mono, and the −6 dB trim is what keeps a correlated
+/// signal (a centred vocal, a mono bassline) at the same level instead of
+/// clipping the device.  A further −3 dB of headroom (the `(FL+FR)/2 × 0.707`
+/// variant) is left to the fader: baking it in would make the strip 3 dB quieter
+/// than its label says.
+///
+/// **Default: `Left`**, i.e. exactly the Python behaviour — the other two change
+/// what the user hears and must not be switched on without their consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MonoDownmix {
+    /// `FL → MONO` (Python parity, and the historical behaviour).
+    #[default]
+    Left,
+    /// `FL → MONO` and `FR → MONO`: PipeWire sums the two links (+6 dB on
+    /// correlated material, no compensation).
+    Sum,
+    /// Same two links, with the strip's own gain trimmed by −6 dB so the sum
+    /// lands at the average `(FL + FR) / 2`.  The recommended option for music.
+    Average,
+}
+
+impl MonoDownmix {
+    /// The `config.json` spelling (`ui_rust.mono_downmix`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MonoDownmix::Left => "left",
+            MonoDownmix::Sum => "sum",
+            MonoDownmix::Average => "average",
+        }
+    }
+
+    /// Tolerant parse: case and blanks are ignored, aliases accepted, an
+    /// unknown value is `None` (the caller keeps its default and logs it).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "left" | "fl" | "l" => Some(MonoDownmix::Left),
+            "sum" | "add" => Some(MonoDownmix::Sum),
+            "average" | "avg" | "mean" | "downmix" => Some(MonoDownmix::Average),
+            _ => None,
+        }
+    }
+
+    /// Does this policy link **both** channels into the mono port?
+    pub fn mixes_both(self) -> bool {
+        !matches!(self, MonoDownmix::Left)
+    }
+
+    /// Gain to apply to a strip whose routes are all mono targets so the sum is an
+    /// average instead of a ×2 addition.
+    ///
+    /// −6 dB (`0.5`) for [`Self::Average`], unity otherwise — and **only** when
+    /// every route of the strip ends on a mono target: trimming a strip that also
+    /// feeds a stereo bus would make that bus quieter for no reason.
+    pub fn gain_trim(self, mono_targets: usize, stereo_targets: usize) -> f32 {
+        if self == MonoDownmix::Average && mono_targets > 0 && stereo_targets == 0 {
+            0.5
+        } else {
+            1.0
+        }
+    }
+}
+
 /// One node global of interest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveNode {
     pub id: u32,
     pub name: String,
     pub media_class: String,
+    /// `node.description` (or `node.nick`), when the node publishes one.
+    ///
+    /// This is the **human** name of the device (`Studio 26c`, `Built-in Audio
+    /// Analog Stereo`) and it is what the device pop-up shows: the UI used to
+    /// rebuild a label from the node name alone and every analog card ended up
+    /// reading `analog-stereo`.  `None` when the node has neither property.
+    pub description: Option<String>,
     /// The `holaf.uid` property a bus node carries (see
     /// [`holaf_core::graph::UID_PROP`]) — **diagnostic only**.
     ///
@@ -126,6 +214,10 @@ pub fn collect_view(globals: &[GlobalObject<PropertiesBox>]) -> LiveView {
                     id: g.id,
                     name,
                     media_class: prop(g, "media.class").unwrap_or_default(),
+                    description: prop(g, "node.description")
+                        .or_else(|| prop(g, "node.nick"))
+                        .map(|text| text.trim().to_string())
+                        .filter(|text| !text.is_empty()),
                     uid: prop(g, holaf_core::graph::UID_PROP),
                 });
             }
@@ -276,6 +368,35 @@ impl LiveView {
         dst_right: Option<u32>,
         force_mono: bool,
     ) -> Vec<(u32, u32)> {
+        Self::port_pairs_with(
+            MonoDownmix::Left,
+            src_left,
+            src_right,
+            dst_left,
+            dst_right,
+            force_mono,
+        )
+    }
+
+    /// [`Self::port_pairs`] with an explicit [`MonoDownmix`] policy.
+    ///
+    /// Only the **stereo source → mono target** row changes:
+    ///
+    /// | policy | links |
+    /// |---|---|
+    /// | `Left` | `FL → MONO` (the historical/Python behaviour) |
+    /// | `Sum` / `Average` | `FL → MONO` **and** `FR → MONO` (PipeWire sums them; `Average` then trims the strip by −6 dB, see [`MonoDownmix::gain_trim`]) |
+    ///
+    /// The mono-source and strip-MONO rows are untouched: there the duplication
+    /// is intentional (one channel into both ports) and summing would be wrong.
+    pub fn port_pairs_with(
+        downmix: MonoDownmix,
+        src_left: Option<u32>,
+        src_right: Option<u32>,
+        dst_left: Option<u32>,
+        dst_right: Option<u32>,
+        force_mono: bool,
+    ) -> Vec<(u32, u32)> {
         // A strip in MONO, or a node that only publishes one port, feeds every
         // target port from that single channel.
         let single = src_left.or(src_right);
@@ -294,13 +415,25 @@ impl LiveView {
         let (Some(sl), Some(sr)) = (src_left, src_right) else {
             return Vec::new();
         };
+        // A mono target: one input port.  Taking only the left channel is the
+        // Python behaviour; `Sum`/`Average` also feed the right one and let the
+        // target's mixer add them.  With no left port published the right
+        // channel is the one that must reach it (never lose the signal).
+        let mono_target = match (dst_left, dst_right) {
+            (Some(dl), Some(dr)) if dl == dr => Some((dl, sl)),
+            (Some(dl), None) => Some((dl, sl)),
+            (None, Some(dr)) => Some((dr, sr)),
+            _ => None,
+        };
+        if let Some((mono, primary)) = mono_target {
+            return if downmix.mixes_both() {
+                vec![(sl, mono), (sr, mono)]
+            } else {
+                vec![(primary, mono)]
+            };
+        }
         match (dst_left, dst_right) {
-            (Some(dl), Some(dr)) if dl == dr => vec![(sl, dl)],
             (Some(dl), Some(dr)) => vec![(sl, dl), (sr, dr)],
-            // A mono target: the left channel reaches the only input port.  The
-            // right channel has nowhere to go, and must not be summed in.
-            (Some(dl), None) => vec![(sl, dl)],
-            (None, Some(dr)) => vec![(sr, dr)],
             _ => Vec::new(),
         }
     }
@@ -412,6 +545,64 @@ mod tests {
         assert_eq!(view.links_of_node(11).count(), 2);
     }
 
+    /// The device picker shows `node.description` (`Studio 26c`) — the human
+    /// name of the card.  Without it the UI could only rebuild a label from the
+    /// node name, which reads `analog-stereo` for every analog card (the
+    /// unusable device menu the user reported).
+    #[test]
+    fn a_node_description_is_collected_for_the_device_list() {
+        let described = GlobalObject {
+            id: 20,
+            permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
+            type_: ObjectType::Node,
+            version: 3,
+            props: Some(properties! {
+                "node.name" => "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+                "media.class" => "Audio/Sink",
+                "node.description" => "Studio 26c",
+            }),
+        };
+        // `node.nick` is the fallback; a blank description is the same as none.
+        let nick = GlobalObject {
+            id: 21,
+            permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
+            type_: ObjectType::Node,
+            version: 3,
+            props: Some(properties! {
+                "node.name" => "alsa_output.pci-0000_00_1f.3.analog-stereo",
+                "media.class" => "Audio/Sink",
+                "node.nick" => "Built-in Audio",
+            }),
+        };
+        let blank = GlobalObject {
+            id: 22,
+            permissions: pipewire::permissions::PermissionFlags::from_bits_retain(0),
+            type_: ObjectType::Node,
+            version: 3,
+            props: Some(properties! {
+                "node.name" => "alsa_output.usb-X-00.analog-stereo",
+                "media.class" => "Audio/Sink",
+                "node.description" => "   ",
+            }),
+        };
+        let view = collect_view(&[described, nick, blank]);
+        assert_eq!(
+            view.node_named("alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0")
+                .and_then(|node| node.description.as_deref()),
+            Some("Studio 26c")
+        );
+        assert_eq!(
+            view.node_named("alsa_output.pci-0000_00_1f.3.analog-stereo")
+                .and_then(|node| node.description.as_deref()),
+            Some("Built-in Audio")
+        );
+        assert_eq!(
+            view.node_named("alsa_output.usb-X-00.analog-stereo")
+                .and_then(|node| node.description.as_deref()),
+            None
+        );
+    }
+
     /// The `holaf.uid` marker is parsed when the registry exposes it (it is
     /// informational — see [`LiveNode::uid`]; the reconciler recognises its
     /// nodes through the naming plan of `holaf_core::graph`).
@@ -498,6 +689,96 @@ mod tests {
         assert_eq!(LiveView::port_pairs(Some(1), Some(2), Some(9), None, false), vec![(1, 9)]);
         // A target that publishes only its right port still gets a link.
         assert_eq!(LiveView::port_pairs(Some(1), Some(2), None, Some(9), false), vec![(2, 9)]);
+    }
+
+    /// **The mono downmix option.**  The user's only output is a mono PreSonus
+    /// (`pro-output-0`, one `playback_MONO` port); the historical policy sent the
+    /// left channel there and silently dropped the right one.  `Sum`/`Average`
+    /// feed both and let the target's mixer add them; `Average` additionally
+    /// trims the strip by −6 dB so a correlated signal is `(L+R)/2` and not `L+R`.
+    #[test]
+    fn a_mono_target_can_be_fed_from_both_channels() {
+        // Default (Python parity): left only.
+        assert_eq!(
+            LiveView::port_pairs_with(MonoDownmix::Left, Some(1), Some(2), Some(9), None, false),
+            vec![(1, 9)]
+        );
+        // Sum / Average: both channels, the target sums them.
+        for policy in [MonoDownmix::Sum, MonoDownmix::Average] {
+            assert_eq!(
+                LiveView::port_pairs_with(policy, Some(1), Some(2), Some(9), None, false),
+                vec![(1, 9), (2, 9)],
+                "{policy:?}"
+            );
+            // The same for a node that publishes one port twice.
+            assert_eq!(
+                LiveView::port_pairs_with(policy, Some(1), Some(2), Some(9), Some(9), false),
+                vec![(1, 9), (2, 9)],
+                "{policy:?}"
+            );
+        }
+        // A **stereo** target is untouched by any policy (no summing, ever).
+        for policy in [
+            MonoDownmix::Left,
+            MonoDownmix::Sum,
+            MonoDownmix::Average,
+        ] {
+            assert_eq!(
+                LiveView::port_pairs_with(policy, Some(1), Some(2), Some(8), Some(9), false),
+                vec![(1, 8), (2, 9)],
+                "{policy:?}"
+            );
+        }
+        // The strip-MONO row keeps duplicating the one channel, whatever the
+        // policy: summing a channel with itself would be +6 dB for free.
+        assert_eq!(
+            LiveView::port_pairs_with(MonoDownmix::Average, Some(1), Some(2), Some(8), Some(9), true),
+            vec![(1, 8), (1, 9)]
+        );
+    }
+
+    /// The −6 dB trim that turns the sum into the average, and the reason it is
+    /// **only** applied when every route of the strip ends on a mono target.
+    #[test]
+    fn the_average_downmix_trims_the_strip_by_minus_6_db() {
+        assert_eq!(MonoDownmix::Left.gain_trim(1, 0), 1.0);
+        assert_eq!(MonoDownmix::Sum.gain_trim(1, 0), 1.0);
+        assert_eq!(MonoDownmix::Average.gain_trim(1, 0), 0.5);
+        assert_eq!(MonoDownmix::Average.gain_trim(2, 0), 0.5);
+        // A strip that also feeds a stereo bus must keep its level: halving it
+        // would make that bus quieter for no reason.
+        assert_eq!(MonoDownmix::Average.gain_trim(1, 1), 1.0);
+        // Nothing routed yet: no trim (the volume is pushed on every apply).
+        assert_eq!(MonoDownmix::Average.gain_trim(0, 0), 1.0);
+        // …and 0.5 in linear gain really is −6 dB.
+        assert!(
+            (20.0 * 0.5_f32.log10() + 6.0).abs() < 0.1,
+            "halving the amplitude is −6 dB"
+        );
+    }
+
+    /// `ui_rust.mono_downmix` tolerates what a human writes in a JSON file, and
+    /// an unknown value is `None` so the caller keeps its (safe) default.
+    #[test]
+    fn the_downmix_policy_is_parsed_from_its_config_spelling() {
+        assert_eq!(MonoDownmix::parse("left"), Some(MonoDownmix::Left));
+        assert_eq!(MonoDownmix::parse(" LEFT "), Some(MonoDownmix::Left));
+        assert_eq!(MonoDownmix::parse("sum"), Some(MonoDownmix::Sum));
+        assert_eq!(MonoDownmix::parse("average"), Some(MonoDownmix::Average));
+        assert_eq!(MonoDownmix::parse("avg"), Some(MonoDownmix::Average));
+        assert_eq!(MonoDownmix::parse("downmix"), Some(MonoDownmix::Average));
+        assert_eq!(MonoDownmix::parse("mono"), None);
+        assert_eq!(MonoDownmix::parse(""), None);
+        // Round trip through the spelling written to config.json.
+        for policy in [
+            MonoDownmix::Left,
+            MonoDownmix::Sum,
+            MonoDownmix::Average,
+        ] {
+            assert_eq!(MonoDownmix::parse(policy.as_str()), Some(policy));
+        }
+        // The default is the Python behaviour, never the surprising one.
+        assert_eq!(MonoDownmix::default(), MonoDownmix::Left);
     }
 
     /// A mono source (a Pro Audio `pro-input-0` capture node, a mono device)

@@ -3,26 +3,28 @@
 **A Voicemeeter-like Audio Mixer for Linux (PipeWire) + MIDI Support.**
 
 > ⚠️ **DISCLAIMER: EXPERIMENTAL / PERSONAL PROJECT**
-> 
-> This entire codebase was **generated 100% by an AI Assistant**. 
-> It was built to solve a specific need on a specific hardware configuration. 
-> 
+>
+> This entire codebase was **generated 100% by an AI Assistant**.
+> It was built to solve a specific need on a specific hardware configuration.
+>
 > *   **NO SUPPORT** will be provided.
 > *   **NO GUARANTEE** that it will work on your machine.
 > *   Use it at your own risk.
 
 ## Overview
 
-Holaf-Mix is an audio mixer for Linux systems running **PipeWire**, written in
-Rust (interface + audio core); the original Python/PySide6 interface is still
-shipped as an escape hatch (`HOLAF_UI=python`). It mimics the workflow of software like Voicemeeter, allowing you to route applications to virtual strips, mix them, and send them to physical outputs or communication apps (Discord, TeamSpeak, etc.).
+Holaf-Mix is an audio mixer for Linux systems running **PipeWire**, written
+**entirely in Rust** — the interface (`holaf-ui`, egui/eframe), the audio core
+(`holaf-pw`) and the daemon/CLI (`holafd`, `holafctl`).  There is **no Python**
+in the product: no interpreter, no PyInstaller bundle, no venv (see
+[`docs/python-removal.md`](docs/python-removal.md)). It mimics the workflow of software like Voicemeeter, allowing you to route applications to virtual strips, mix them, and send them to physical outputs or communication apps (Discord, TeamSpeak, etc.).
 
 It features a persistent UI, robust routing logic, and full **MIDI Bidirectional Support** (specifically tested with Akai MIDImix).
 
 ## Features
 
 *   **Virtual Strips**: Create unlimited Input/Output strips.
-*   **PipeWire Routing**: 
+*   **PipeWire Routing**:
     *   Route specific apps (Firefox, Spotify, Games) to specific strips.
     *   Route virtual strips to physical hardware (Speakers, Headphones).
     *   Create Virtual Busses (B1, B2) that appear as Microphones in other apps.
@@ -31,59 +33,48 @@ It features a persistent UI, robust routing logic, and full **MIDI Bidirectional
     *   "MIDI Learn" mode for Volume faders, Mute buttons, and Mono toggles.
     *   **LED Feedback**: Updates your controller's LEDs (Mute/Mono) when changed in the UI.
 *   **System Integration**:
-    *   Minimizes to System Tray.
+    *   Minimizes to System Tray (D-Bus StatusNotifierItem, no GTK).
     *   "Always on Top" mode.
     *   Saves window position and strip configuration on exit.
 *   **Visuals**: Real-time VU Meters (20fps).
 
 ## Tech Stack
 
-*   **Language**: Rust (UI + audio core) + Python 3.10+ (fallback UI only)
-*   **GUI**: **Rust/egui** (`rust/crates/holaf-ui`, binary `holaf-ui`) —
-    PySide6 (Qt) remains as the `HOLAF_UI=python` escape hatch
-*   **Audio Backend**: the Rust UI drives PipeWire **in-process** through
-    `holaf-pw` (`PipeWireBackend`) — no daemon, no IPC.  The Qt fallback talks
-    to the Rust `holafd` daemon over a Unix-socket NDJSON protocol, or uses the
-    classic Python engine (`HOLAF_USE_PYTHON=1`).
-*   **MIDI**: `midir` (Rust UI, LED feedback included) / `mido` + `python-rtmidi`
-    (Qt fallback)
+*   **Language**: Rust only (UI + audio core + daemon + CLI).
+*   **GUI**: **Rust/egui** (`rust/crates/holaf-ui`, binary `holaf-ui`).
+*   **Audio Backend**: the UI drives PipeWire **in-process** through
+    `holaf-pw` (`PipeWireBackend`) — no daemon, no IPC.  `holafd` is an
+    alternative/automation backend, `holafctl` its CLI.
+*   **MIDI**: `midir` (ALSA sequencer, LED feedback included).
 
-## Interface Rust (mode par défaut)
-
-Depuis la bascule **B1**, la fenêtre de Holaf-Mix est le binaire Rust
-**`holaf-ui`** (`rust/crates/holaf-ui`, egui/eframe).  `main.py` n'ouvre plus de
-fenêtre Qt : c'est un **lanceur** qui localise `holaf-ui` et l'exécute avec les
-mêmes arguments (`--config`, `--midi`, `--midi-list`, `--always-on-top`).
+## Lancer Holaf-Mix
 
 ```bash
-# build de dev : publie dist/{holaf-ui,holafd,holafctl}
-# (installation normale : télécharger l'artefact de la CI, voir §Installation)
-./scripts/build_rust.sh
-python main.py                     # → UI Rust (défaut)
+./holaf-ui                 # l'application (c'est le point d'entrée)
+./holaf-ui --help          # --config, --midi, --midi-list, --always-on-top
+./holaf-mix                # même chose : petit script shell qui exec ./holaf-ui
 ```
 
-*   **Échappatoire** — `HOLAF_UI=python python main.py` (ou
-    `HOLAF_USE_PYTHON=1`) : ancienne UI PySide6, comportement inchangé.  Elle
-    reste dans le dépôt et testée tant que la bascule n'est pas validée.
-*   **Repli** — si `holaf-ui` est introuvable ou ne peut pas s'exécuter, le
-    lanceur **logue un WARNING** avec la raison et démarre l'UI Qt : jamais
-    d'échec silencieux.  Un binaire qui *démarre* n'est jamais doublé : son code
-    de sortie est propagé (c'est ce qui fait qu'un lancement sans écran affiche
-    le message d'eframe au lieu d'ouvrir Qt).
-*   **Un seul `config.json`** — le lanceur passe `--config` avec le fichier
-    qu'utilisait l'UI Qt (à côté de l'exécutable en build packagé), donc les deux
-    interfaces partagent la même configuration.
-*   **Moteur audio** — l'UI Rust parle à PipeWire **dans son propre processus**
-    (`holaf-pw::PipeWireBackend`) : ni `holafd`, ni socket, ni lanceur.
-*   **Packagé** — les bundles PyInstaller embarquent `holaf-ui`, `holafd` et
-    `holafctl` (résolus dans le dossier de l'app ou dans `sys._MEIPASS`) : le
-    tarball fonctionne sans Rust installé.
+Le chemin normal est l'**artefact CI** (§Installation) : rien n'est compilé sur
+la machine de l'utilisateur.  Pour un build local :
+[`BUILD.md`](BUILD.md) §5 (`./build.sh --run`).
 
-Le cœur audio Rust (`holafd` + `holafctl`) reste le backend de l'UI Qt.  État
-détaillé des jalons et commandes de test :
-[`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md), spec dans
-[`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md), plan de suppression du
-Python dans [`docs/migration-to-pure-rust.md`](docs/migration-to-pure-rust.md).
+### Configuration
+
+`config.json` est cherché dans cet ordre (documenté dans
+`holaf_core::config::default_config_path`) :
+
+1.  `--config FICHIER` (priorité absolue) ;
+2.  `$HOLAF_CONFIG` ;
+3.  à côté du binaire (`<dossier de holaf-ui>/config.json`), s'il existe ;
+4.  `./config.json` du répertoire courant, s'il existe ;
+5.  `$XDG_CONFIG_HOME/holaf-mix/config.json` (défaut
+    `~/.config/holaf-mix/config.json`) — créé au premier lancement.
+
+Conséquence : lancer `./holaf-ui` depuis le dossier du tarball ouvre le
+`config.json` de ce dossier s'il existe (sinon `~/.config/holaf-mix/`), et une
+entrée de menu (dont le répertoire courant est `$HOME`) ne crée pas un fichier
+au hasard : elle utilise celui installé/XDG.
 
 ## Installation
 
@@ -97,8 +88,8 @@ Python dans [`docs/migration-to-pure-rust.md`](docs/migration-to-pure-rust.md).
 1.  **Télécharger l'artefact** : GitHub → **Actions** → workflow
     **Build Holaf-Mix** → le run du commit voulu → **Artifacts** →
     `holaf-mix-<sha>-<arch>`.  Il contient
-    `holaf-mix-<version>-<arch>.tar.gz` (le lanceur avec `holaf-ui`, `holafd` et
-    `holafctl` embarqués) et `SHA256SUMS`.
+    `holaf-mix-<version>-<arch>.tar.gz` (les trois binaires Rust + icônes +
+    docs) et `SHA256SUMS`.
 2.  **Installer les dépendances runtime** — c'est tout ce que le binaire
     demande, rien n'est à compiler :
     ```bash
@@ -116,14 +107,14 @@ Python dans [`docs/migration-to-pure-rust.md`](docs/migration-to-pure-rust.md).
 3.  **Décompresser et lancer** :
     ```bash
     tar xzf holaf-mix-<version>-<arch>.tar.gz -C ~/apps/
-    ~/apps/holaf-mix-<version>/holaf-mix
+    ~/apps/holaf-mix-<version>/holaf-ui
     ```
 
 Le détail (contenu du tarball, `SHA256SUMS`, installation dans
 `/usr/local/bin` + entrée de menu, dépendances optionnelles, dépannage) est dans
 [`BUILD.md`](BUILD.md) §1 et §3.  `packaging/PKGBUILD` reste disponible comme
 **option de distribution Arch** maintenue (paquet géré par `pacman`) : ce n'est
-pas le chemin par lequel l'application est livrée, qui passe par les artefacts
+pas le chemin par lequel l'application est livrée, qui passe par l'artefact
 ci-dessus — voir `BUILD.md` §4.
 
 ### Depuis les sources (développement)
@@ -134,21 +125,20 @@ ci-dessus — voir `BUILD.md` §4.
     cd holaf-mix
     ```
 
-2.  **Installer les dépendances** :
+2.  **Installer les dépendances de build** (toolchain Rust + en-têtes
+    PipeWire/ALSA — la liste exacte par distro est dans `BUILD.md` §5.1) :
     ```bash
-    pip install -r requirements.txt
-    ```
-    La compilation depuis les sources demande en plus un toolchain Rust (et les
-    en-têtes PipeWire pour `bindgen`) :
-    ```bash
-    ./build.sh --tarball        # construit holaf-ui + holafd + le bundle PyInstaller
+    sudo pacman -S --needed base-devel pkgconf clang rust \
+        librsvg imagemagick pipewire alsa-lib \
+        wayland wayland-protocols libxkbcommon
     ```
 
-3.  **Lancer l'application** :
+3.  **Construire et lancer** :
     ```bash
-    python main.py             # UI Rust par défaut (lance holaf-ui)
-    # ou l'ancienne interface Qt, inchangée :
-    HOLAF_UI=python python main.py
+    ./build.sh --run           # icônes + cargo build + lancement de dist/holaf-ui
+    # ou :
+    ./build.sh --tarball       # produit dist/holaf-mix-<version>-<arch>.tar.gz
+    ./dist/holaf-ui
     ```
 
 ## Usage
@@ -173,7 +163,7 @@ Un **clic droit n'importe où** dans Holaf-Mix ouvre le menu de l'application
 
 | Entrée | Effet |
 | --- | --- |
-| **Restart audio engine** | Réinitialise complètement le moteur audio (arrêt du graphe puis reconstruction, avec un daemon `holafd` neuf quand c'est Holaf-Mix qui l'a lancé) **sans quitter l'application**. La barre de statut affiche « Audio engine restarting… » puis « Audio engine restarted » ; un second clic pendant l'opération est ignoré (un seul redémarrage à la fois). En cas d'échec, un message explicite s'affiche et l'app continue de tourner. |
+| **Restart audio engine** | Réinitialise complètement le moteur audio (arrêt du graphe puis reconstruction) **sans quitter l'application**. La barre de statut affiche « Audio engine restarting… » puis « Audio engine restarted » ; un second clic pendant l'opération est ignoré (un seul redémarrage à la fois). En cas d'échec, un message explicite s'affiche et l'app continue de tourner. |
 | **Debug window** | Ouvre la fenêtre de diagnostic (voir ci-dessous). Remplace l'ancien raccourci `Ctrl+Shift+D`, qui n'existe plus. |
 | **Open project page** | Ouvre <https://github.com/grokuku/Holaf-Mix> dans le navigateur par défaut. |
 
@@ -195,13 +185,13 @@ commandes shell (`pactl`, `pw-cli`, `pw-link`, `pw-top`, `holafctl status`) :
 | **Summary** | Les constats automatiques, colorés par sévérité (erreur / avertissement / info), avec l'action suggérée sous chacun |
 | **Engine** | État du moteur (`running`, `degraded`, `pending`, `fx_host`, strips avec leur bus et leurs effets actifs, routes) + métrage (niveaux, sources écoutées) |
 | **Graph** | Nœuds `Holaf_*` et devices physiques (id, classe, état, quantum, rate, ports) et liens qui touchent le mix |
-| **System** | Versions (app, `holafd`, PipeWire, kernel, Python), socket, `config.json`, PID, CPU/mémoire, et **tous** les processus `holafd` vivants |
+| **System** | Versions (app, `holafd`, PipeWire, kernel), `config.json`, PID, CPU/mémoire, et **tous** les processus `holafd` vivants |
 | **Journal** | Les 200 dernières lignes de log de l'app (buffer mémoire) |
 
 Boutons :
 
 *   **Refresh** (`F5` / `Ctrl+R`) — relance la collecte **en arrière-plan** (l'UI
-    ne gèle jamais, même si le daemon ou PipeWire ne répond pas).
+    ne gèle jamais, même si PipeWire ne répond pas).
 *   **Copy report** — copie un rapport texte complet dans le presse-papiers :
     c'est **ce bloc** qu'il faut coller pour demander de l'aide (il commence
     par les constats).
@@ -210,18 +200,18 @@ Boutons :
     (moteur + métrage), sans relancer `pw-dump`.
 
 Ce que la fenêtre sait détecter toute seule : graphe dégradé ou `pending` non
-vide, daemon injoignable, chaînes FX hébergées en mode `inprocess` (risque de
-hachage) ou FX host qui redémarre en boucle, noms de bus legacy
-`Holaf_Strip_*` (binaire `holafd` périmé → `scripts/build_rust.sh`), plusieurs
-daemons `holafd` vivants (orphelins d'une session précédente), strip dont le bus
-ou le device a disparu du graphe, quantum trop petit (< 256 → craquements),
-`ERR` dans `pw-top`, volumes non appliqués (écart entre la config et le graphe),
-effets actifs sans chaîne FX, erreurs dans le log.
+vide, chaînes FX hébergées en mode `inprocess` (risque de hachage) ou FX host qui
+redémarre en boucle, noms de bus legacy `Holaf_Strip_*` (binaire `holafd` périmé →
+`scripts/build_rust.sh`), plusieurs daemons `holafd` vivants (orphelins d'une
+session précédente), strip dont le bus ou le device a disparu du graphe, quantum
+trop petit (< 256 → craquements), `ERR` dans `pw-top`, volumes non appliqués
+(écart entre la config et le graphe), effets actifs sans chaîne FX, erreurs dans
+le log.
 
-Fonctionne avec **les deux moteurs** (daemon Rust par défaut, moteur Python via
-`HOLAF_USE_PYTHON=1`) : avec le moteur Python, l'état est reconstruit depuis ses
-registres et la liste des strips de l'UI, et les champs indisponibles sont
-signalés `?` au lieu d'être inventés.
+État détaillé des jalons et commandes de test :
+[`docs/rust-rewrite-status.md`](docs/rust-rewrite-status.md), spec dans
+[`docs/rust-rewrite-spec.md`](docs/rust-rewrite-spec.md), et l'inventaire de la
+suppression du Python dans [`docs/python-removal.md`](docs/python-removal.md).
 
 ## License
 

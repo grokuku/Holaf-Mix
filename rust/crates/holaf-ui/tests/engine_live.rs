@@ -288,7 +288,7 @@ fn the_ui_drives_a_real_pipewire_graph() {
     let out_index = state.strip_index("out-bus").unwrap();
 
     // --- (b) attach the real engine: the snapshot is pushed -------------
-    state.attach_engine(EngineBridge::spawn_pipewire());
+    state.attach_engine(EngineBridge::spawn_pipewire(holaf_pw::MonoDownmix::default()));
     assert!(
         wait_for(&mut state, Duration::from_secs(20), |state| state.engine
             == EngineState::Connected),
@@ -459,7 +459,7 @@ fn the_ui_survives_without_a_daemon() {
     let config_path = dir.join("config.json");
     std::fs::write(&config_path, TEST_CONFIG).unwrap();
     let mut state = AppState::from_config(&config_path);
-    state.attach_engine(EngineBridge::spawn_pipewire());
+    state.attach_engine(EngineBridge::spawn_pipewire(holaf_pw::MonoDownmix::default()));
 
     // The connection failure arrives as an engine event; the UI is not dead.
     assert!(
@@ -522,7 +522,7 @@ fn the_app_routing_and_the_diagnostics_see_the_real_engine() {
     let config_path = dir.join("config.json");
     std::fs::write(&config_path, TEST_CONFIG).unwrap();
     let mut state = AppState::from_config(&config_path);
-    state.attach_engine(EngineBridge::spawn_pipewire());
+    state.attach_engine(EngineBridge::spawn_pipewire(holaf_pw::MonoDownmix::default()));
     assert!(
         wait_for(&mut state, Duration::from_secs(30), |state| {
             state.engine == EngineState::Connected
@@ -694,4 +694,120 @@ fn the_app_routing_and_the_diagnostics_see_the_real_engine() {
         !node_id_by_name(OUT_BUS).is_some(),
         "{OUT_BUS} survived the shutdown"
     );
+}
+
+/// **The VU bar is post-fader and a normal level does not pin it.**
+///
+/// The user's report (“les vu-mètres sont toujours à fond, même quand le son est
+/// faible”) had two candidate causes; both are measured here, through the *whole*
+/// production chain — `pw-cat` capture → `MeterBoard` → decay envelope → the
+/// number the fader widget draws:
+///
+/// * the old scale (`min(1, rms × 5)`) saturated at −14 dBFS, so a −9 dBFS tone
+///   pinned the bar at 1.0 → this test asserts it stays **below** full;
+/// * the capture tap must be post-fader → moving the fader to 0.3
+///   (`pulse_linear_gain` = 0.027, −31 dB) must drop the bar, not leave it
+///   where it was.
+#[test]
+fn the_vu_bar_is_post_fader_and_not_pinned_by_a_normal_level() {
+    const CONFIG: &str = r#"{
+        "strips": [
+            {
+                "uid": "vu-bar",
+                "label": "VU Bar",
+                "kind": "output",
+                "volume": 1.0,
+                "device_name": null,
+                "effects": {}
+            }
+        ]
+    }"#;
+    const BUS: &str = "Holaf_Bus_VU_Bar";
+
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!(
+            "SKIP engine_live: no headless PipeWire configured \
+             (run: eval \"$(./scripts/start-pipewire-headless.sh --export)\")"
+        );
+        return;
+    }
+    fresh_sandbox_daemon();
+
+    let dir = scratch("vu");
+    let config_path = dir.join("config.json");
+    std::fs::write(&config_path, CONFIG).unwrap();
+    let mut state = AppState::from_config(&config_path);
+    let index = state.strip_index("vu-bar").expect("the strip is loaded");
+    state.attach_engine(EngineBridge::spawn_pipewire(holaf_pw::MonoDownmix::default()));
+    assert!(
+        wait_for(&mut state, Duration::from_secs(20), |state| state.engine
+            == EngineState::Connected),
+        "the engine never reported Ready ({:?})",
+        state.engine
+    );
+    assert!(
+        wait_for_node(BUS, Duration::from_secs(20)),
+        "the bus node {BUS} was never published; nodes: {:?}",
+        node_names()
+    );
+
+    // A −6 dBFS sine: RMS ≈ 0.354 → −9 dBFS, i.e. exactly the level the old
+    // scale turned into a pinned bar.
+    let wav = dir.join("vu-sine.wav");
+    write_sine_wav(&wav, 20.0, 0.5);
+    let mut playback = Command::new("pw-cat")
+        .args(["--playback", "--target", BUS])
+        .arg(&wav)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("pw-cat --playback");
+    assert!(
+        wait_for(&mut state, Duration::from_secs(15), |state| state
+            .levels_for(index)[0]
+            > 0.3),
+        "the VU never moved (level {:?})",
+        state.levels_for(index)
+    );
+    // Let the envelope settle on the real level before reading it.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut loud = 0.0_f32;
+    while Instant::now() < deadline {
+        state.tick(Instant::now());
+        loud = loud.max(state.levels_for(index)[0]);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        (0.5..0.95).contains(&loud),
+        "a −9 dBFS tone must be a *high* bar, not a pinned one (level {loud})"
+    );
+
+    // Fader down to 0.3 → `pulse_linear_gain(0.3)` = 0.027 → −31 dB on the
+    // monitor.  A pre-fader meter would read exactly the same as before.
+    let now = Instant::now();
+    state.set_clock(now);
+    state.apply(UiAction::Volume {
+        uid: "vu-bar".to_string(),
+        volume: 0.3,
+    });
+    state.flush_engine(now + Duration::from_millis(120));
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut quiet = 1.0_f32;
+    while Instant::now() < deadline {
+        state.tick(Instant::now());
+        quiet = quiet.min(state.levels_for(index)[0]);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        quiet < loud - 0.3,
+        "the VU is PRE-fader: {loud} at volume 1.0 vs {quiet} at 0.3"
+    );
+    assert!(quiet > 0.0, "the fader attenuates, it does not mute: {quiet}");
+
+    let _ = playback.kill();
+    let _ = playback.wait();
+    state.shutdown();
 }

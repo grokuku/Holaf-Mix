@@ -1,17 +1,6 @@
-# Python runtime cache
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual Environments (Conda/Venv)
-env/
-venv/
-.venv/
-
-# Distribution / Builds
+# Distribution / build output
 build/
 dist/
-*.egg-info/
 
 # IDE settings (optional but recommended)
 .idea/
@@ -20,5 +9,6 @@ dist/
 # OS generated files
 .DS_Store
 Thumbs.db
+
 # Rust workspace build artifacts
 rust/target/

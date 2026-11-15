@@ -1,36 +1,36 @@
-# Migration vers un produit 100 % Rust — inventaire et plan de suppression
+# Migration vers un produit 100 % Rust — plan de suppression (archive)
 
-> **Statut : PRÉPARATION. Rien n'est supprimé.**
-> Ce document décrit *ce qui* sera supprimé, *dans quel ordre*, *ce qui casse*
-> si on le fait maintenant, et *à quelle condition* on peut le faire.  Il est
-> écrit pour être exécuté plus tard, bloc par bloc, sans relecture du code.
+> **Statut : TERMINÉ (2026-11-15).  Le dépôt ne contient plus une ligne de
+> Python.**  L'inventaire de ce qui a été supprimé/gardé, les preuves et le
+> nouveau mode de lancement sont dans
+> [`python-removal.md`](python-removal.md) ; `README.md`/`BUILD.md` décrivent le
+> produit tel qu'il est aujourd'hui.
+>
+> Ce document est conservé comme **archive du plan** (écrit avant l'exécution,
+> bloc par bloc).  Les tableaux de §3 décrivent *ce qui aurait cassé* ; les
+> lignes marquées « résolu » ont été traitées avec la suppression
+> (blocs B10–B13).
 
-La bascule est faite (bloc **B1**) : `main.py` est un **lanceur** qui démarre le
-binaire Rust `holaf-ui`, et l'UI PySide6 n'est plus qu'une échappatoire
-(`HOLAF_UI=python`).  La suppression du Python est donc une opération de
-*nettoyage*, pas de portage : tout ce qui disparaît a déjà un équivalent Rust en
-production.
-
----
-
-## 0. Prérequis avant de supprimer quoi que ce soit
-
-| # | Prérequis | Pourquoi | Comment le vérifier |
-|---|---|---|---|
-| 1 | **B1 validé par l'utilisateur sur sa machine** (pas seulement en CI) | une régression de layout, de routage ou de MIDI ne se voit pas dans un conteneur sans écran ni carte son | une session complète : 7 strips, faders, FX, routage, apps, MIDI Mix, diagnostic, config conservée |
-| 2 | **Le tray est tranché** (B2) | c'était la seule fonction Qt encore sans équivalent ; supprimer `src/ui/**` supprime aussi la seule implémentation de tray existante | **fait (2026-11-14, backend `ksni`/D-Bus depuis le 2026-11-15 — sans GTK)** : tray Rust (icône générée en RGBA donc **sans dépendance fichier**), politique (menu, « fermer = cacher seulement si un tray existe ») toujours compilée et testée ; **activé par défaut au build** (`scripts/build_rust.sh` ; `HOLAF_NO_TRAY=1` pour l'enlever, repli automatique sans la feature si elle ne compile pas), et depuis la migration ksni il n'y a **plus de dépendance GTK au build** (la pile GTK3/GLib encore retirée du bundle PyInstaller ne vient plus que du fallback Qt).  Le repli (pas de display, pas de bus, pas d'hôte StatusNotifier) est testé : `available() == false` ⇒ fermer quitte | `cargo test -p holaf-ui --features tray` (dont `install_without_a_display_degrades_to_no_tray_instead_of_panicking` et `tests/tray_live.rs`) + `cargo build --features tray` en CI |
-| 3 | **Le bundle packagé démarre l'UI Rust** | le lanceur se rabat sur Qt quand `holaf-ui` manque, donc un bundle cassé *fonctionne* — en Qt | `dist/holaf-mix` sans `HOLAF_UI=python` doit afficher la fenêtre Rust (`smoke test` CI + un lancement réel) |
-| 4 | **`config.json` partagé vérifié** | le lanceur passe `--config` avec le fichier de l'UI Qt ; si ce chemin change, l'utilisateur perd ses réglages | lancer l'UI Rust puis l'UI Qt : même fichier, mêmes valeurs |
-| 5 | **Le MIDI réel validé** | `midir` (Rust) remplace `mido`/`rtmidi` ; en conteneur il n'y a pas de séquenceur ALSA | AKAI MIDI Mix : learn volume/mute/mono, LEDs, reconnexion |
-| 6 | **Décision sur `tools/`** | `tools/audio_bench.py` et `tools/export_fixtures.py` sont des outils de *développement* (bench audio, génération de fixtures pour les tests Rust) | garder (hors produit) ou réécrire en Rust ; les supprimer casserait les procédures de mesure |
-
-Tant que 1, 2 et 3 ne sont pas cochés, **ne rien supprimer** : le coût de garder
-le Python est de ~10 k lignes ; le coût d'une régression non détectée est la
-confiance de l'utilisateur.
+La bascule (bloc **B1**) avait fait de `main.py` un **lanceur** de `holaf-ui` :
+la suppression du Python était donc un *nettoyage*, pas un portage — tout ce
+qui a disparu avait déjà un équivalent Rust en production.
 
 ---
 
-## 1. Inventaire de ce qui sera supprimé
+## 0. Prérequis avant de supprimer quoi que ce soit (tous satisfaits, 2026-11-15)
+
+| # | Prérequis | État |
+|---|---|---|
+| 1 | **B1 validé par l'utilisateur sur sa machine** (pas seulement en CI) | ✔ l'utilisateur a confirmé que le son fonctionne avec l'UI Rust |
+| 2 | **Le tray est tranché** (B2) | ✔ tray Rust `ksni`/D-Bus sans GTK, activé par défaut au build (voir §4) |
+| 3 | **Le tarball démarre l'UI Rust** | ✔ le point d'entrée du produit **est** `holaf-ui` (plus de lanceur) |
+| 4 | **`config.json` partagé vérifié** | ✔ règle portée dans `holaf_core::config::default_config_path()` (5 niveaux, `--config` en premier) |
+| 5 | **Le MIDI réel validé** | ✔ `midir`, LED, reconnexion (voir `docs/rust-rewrite-status.md`) |
+| 6 | **Décision sur `tools/`** | ✔ tout supprimé : la fixture golden est committée, le diagnostic vit dans l'UI Rust (voir `python-removal.md` §1.4) |
+
+---
+
+## 1. Inventaire de ce qui a été supprimé
 
 ### 1.1 Moteur et IPC Python — bloc **B10** (~4 400 lignes)
 
@@ -121,10 +121,10 @@ régression.
 | **Tray** | ~~suppression de `src/ui/main_window.py`~~ | **résolu** (2026-11-14) : l'icône Rust existe derrière la feature `tray` (`holaf-ui/src/tray.rs`, GTK3 + libappindicator, icône **générée** en code) ; menu `Show/Hide`/`Restart audio engine`/`Quit`, et « fermer = cacher » uniquement quand un tray est réellement là.  Sans la feature (défaut) ou sans hôte appindicator, fermer quitte | — (reste à activer la feature dans le packaging si on veut l'icône par défaut) |
 | **Routage applicatif** | ~~`holaf-pw::app_list`/`app_move` encore en **stub**~~ | **résolu** (2026-11-14) : `app_list` liste les flux externes, `app_move` les déplace sur le bus du strip avec read-back ; l'UI Rust (`apps.rs` plan + `enforce_applications` 5 s) fonctionne de bout en bout | — |
 | **Diagnostic : collecte** | `src/diagnostics/collector.py` est la seule collecte « live » testée (`pw-dump`, `pactl`, `holafctl`) | onglets vides/partiels côté Rust si un constat n'a pas été porté | comparer les deux rapports sur la même machine avant suppression |
-| **Résolution du `config.json`** | `holaf_core::config::default_config_path()` part du **répertoire courant**, l'UI Qt de son propre chemin | lancé depuis un `.desktop` (cwd = `$HOME`), le Rust créerait `$HOME/config.json` et paraîtrait « avoir perdu » les réglages | déjà réglé par le lanceur (`--config`) : **ne pas** supprimer `src/launcher.py` avant d'avoir porté cette règle dans `main.rs` |
+| **Résolution du `config.json`** | ~~`holaf_core::config::default_config_path()` part du répertoire courant, l'UI Qt de son propre chemin~~ | **résolu** : la règle vit maintenant dans `default_config_path()` (5 niveaux : `--config`, `$HOLAF_CONFIG`, à côté de l'exécutable, CWD, XDG), testée dans `holaf-core` | — (le lanceur Python n'existe plus) |
 | **Raccourcis / comportements Qt** | suppression de `src/ui/**` | plus de référence pour comparer (thème, géométrie) | garder `docs/ui-inventory.md` + les captures (`docs/ui-rust-snapshot*.png`) et `holaf-ui-snapshot` |
-| **Outils de mesure** | suppression de `sounddevice`/`numpy` de `requirements.txt` | `tools/audio_bench.py` (banc audio) ne tourne plus | garder un `requirements-dev.txt` pour `tools/` |
-| **CI** | suppression des étapes PyInstaller | l'artefact `holaf-mix-*.tar.gz` disparaît ; les utilisateurs qui le téléchargeaient doivent recevoir un `tar.gz` de binaires Rust | produire `holaf-ui-{version}-{arch}.tar.gz` (binaires + `.desktop` + icônes) avant de retirer l'ancien artefact |
+| **Outils de mesure** | suppression de `sounddevice`/`numpy` | `tools/audio_bench.py` (banc audio) ne tourne plus | **supprimés** : la fixture golden est committée, le diagnostic est dans l'UI Rust ; les procédures de `docs/fx-host.md` sont archivées |
+| **CI** | suppression des étapes PyInstaller | l'ancien artefact `holaf-mix-*.tar.gz` (bundle) disparaît | **résolu** : l'artefact CI est maintenant le tarball des binaires Rust (`holaf-ui`+`holafd`+`holafctl`+icônes+docs) |
 
 ### 3.3 Dépendances à retirer (une fois B10/B11 faits)
 

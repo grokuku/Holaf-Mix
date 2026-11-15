@@ -1,40 +1,31 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  scripts/build_rust.sh — Build the Rust `holafd` daemon + `holafctl` CLI and
-#  publish them next to the Python build output.
+#  scripts/build_rust.sh — Build `holaf-ui` + `holafd` + `holafctl` (release)
+#  and publish the three binaries to a destination directory (default: dist/).
 # ============================================================================
 #
 #  Purpose
 #  -------
-#  Le backend Rust est le mode **par défaut** de Holaf-Mix, et depuis la bascule
-#  B1 l'**interface** aussi : `main.py` lance le binaire `holaf-ui` (UI
-#  egui/eframe) et l'UI Qt n'est plus qu'une échappatoire (`HOLAF_UI=python`).
-#  Ce script compile donc trois binaires en release et les copie à un
-#  emplacement prévu — `dist/` à la racine du dépôt, côte à côte avec la sortie
-#  de `build.sh` (dist/holaf-mix, dist/icons/, …) :
+#  Holaf-Mix is a 100 % Rust product: there is no Python launcher and no
+#  PyInstaller bundle any more.  This script compiles the three bins that make
+#  the whole product and copies them where the packager expects them (`dist/`
+#  by default, alongside the icon set):
 #
-#      holaf-ui   l'interface (fenêtre, strips, FX, MIDI, diagnostic)
-#      holafd     le daemon audio (backend PipeWire)
-#      holafctl   la CLI
+#      holaf-ui   the application (window, strips, FX, MIDI, diagnostics)
+#      holafd     the audio daemon (alternative backend + automation)
+#      holafctl   the CLI
 #
-#  `build.sh` appelle ce script (étape « Build Rust daemon + CLI ») **avant**
-#  PyInstaller, et `packaging/holaf-mix.spec` embarque ensuite les trois
-#  binaires dans le bundle.  L'appel est best-effort côté build.sh : sans cargo,
-#  ou si la compilation échoue, le build continue en Python+Qt seul (le lanceur
-#  se rabat sur l'UI Qt au démarrage).
+#  `build.sh` calls it as its "Step 2/3" and FAILS if it fails: a build without
+#  `holaf-ui` is not a product.
 #
-#  L'interface est une cliente **Wayland** (feature cargo `wayland` de `eframe`,
-#  sans X11 : c'est ce qui évite l'icône « X11 » et la demande de serveur X sous
-#  Wayland).  Dépendances de build/runtime :
+#  The UI is a **Wayland** client (eframe's `wayland` feature, no X11: that is
+#  what avoids the "X11" icon and the X-server demand under Wayland).
+#  Build/runtime dependencies:
 #      Arch   : wayland, wayland-protocols, libxkbcommon
 #      Debian : libwayland-dev, wayland-protocols, libwayland-bin,
 #               libxkbcommon-dev
-#  Elles sont `dlopen`ées au run (invisibles dans `ldd`).  Une machine X11-only
-#  doit compiler avec `--features x11` (HOLAF_UI_X11=1 ci-dessous).
-#
-#  Si `holaf-ui` ne compile pas (libpipewire/wayland absentes de la machine de
-#  build), le script retombe sur holafd+holafctl afin de ne pas perdre le
-#  daemon : c'est un warning, pas une erreur.
+#  They are `dlopen`ed at run time (invisible in `ldd`).  An X11-only machine
+#  needs `--features x11` (HOLAF_UI_X11=1 below).
 #
 #  Usage
 #  -----
@@ -43,6 +34,7 @@
 #      HOLAFD_BIN_OUT=dist ./scripts/build_rust.sh
 #      HOLAF_NO_TRAY=1 ./scripts/build_rust.sh # SANS l'icône de tray
 #      HOLAF_UI_X11=1 ./scripts/build_rust.sh  # + backend X11 (session X11-only)
+#      HOLAF_CARGO_LOCKED=1 ./scripts/build_rust.sh  # refuse de toucher Cargo.lock (CI)
 #
 #  L'icône de zone de notification (feature cargo `tray`) est **activée par
 #  défaut** : c'est ce que le paquet distribué doit contenir (décision du
@@ -53,11 +45,12 @@
 #  gnome-shell-extension-appindicator).  `HOLAF_NO_TRAY=1` (ou `HOLAF_TRAY=0`)
 #  reste là pour livrer un binaire sans icône.
 #
-#  Dans TOUS les cas, si la compilation avec `--features tray` échoue, le script
-#  réessaie **sans** la feature (on garde holaf-ui, on perd juste l'icône) et
-#  affiche un WARNING ; si même là ça échoue, il retombe sur holafd+holafctl.
+#  Si la compilation avec `--features tray` échoue, le script réessaie **sans**
+#  la feature (on garde holaf-ui, on perd juste l'icône) et affiche un WARNING.
+#  Si même là ça échoue, c'est une erreur : plus de Python pour reprendre le
+#  relais.
 #
-#  Sortie : exit 0 si holafd/holafctl ont été copiés, non-zéro sinon.
+#  Sortie : exit 0 si les trois binaires ont été publiés, non-zéro sinon.
 # ============================================================================
 
 set -euo pipefail
@@ -67,8 +60,8 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 ROOT_DIR="$( cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd )"
 RUST_DIR="$ROOT_DIR/rust"
 
-# Default destination: alongside the Python build output.  Override with the
-# first CLI arg or $HOLAFD_BIN_OUT.
+# Default destination: dist/ at the repo root (next to dist/icons/).  Override
+# with the first CLI arg or $HOLAFD_BIN_OUT.
 DEST_DIR="${HOLAFD_BIN_OUT:-}"
 if [[ -z "$DEST_DIR" ]]; then
     DEST_DIR="${1:-$ROOT_DIR/dist}"
@@ -91,7 +84,7 @@ if [[ ! -f "$RUST_DIR/Cargo.toml" ]]; then
 fi
 
 # --- Build -------------------------------------------------------------------
-# holaf-ui : l'interface (UI Rust — c'est elle que `main.py` lance)
+# holaf-ui : l'interface (l'application — point d'entrée du produit)
 # holafd   : le daemon audio (backend par défaut : PipeWire)
 # holafctl : la CLI (status / apply-snapshot / volume / meter-sources …)
 #
@@ -131,11 +124,19 @@ if [[ "${HOLAF_UI_X11:-0}" == "1" ]]; then
     fi
 fi
 
+# `HOLAF_CARGO_LOCKED=1` makes the build refuse to update Cargo.lock — the CI
+# uses it so a lockfile out of sync with the manifests fails visibly instead of
+# producing a non-reproducible binary.
+CARGO_LOCKED=()
+if [[ "${HOLAF_CARGO_LOCKED:-0}" == "1" ]]; then
+    CARGO_LOCKED=(--locked)
+fi
+
 build_all() {
     if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
-        ( cd "$RUST_DIR" && cargo build --release -p holaf-ui -p holafd -p holafctl "${UI_FEATURES[@]}" )
+        ( cd "$RUST_DIR" && cargo build --release "${CARGO_LOCKED[@]}" -p holaf-ui -p holafd -p holafctl "${UI_FEATURES[@]}" )
     else
-        ( cd "$RUST_DIR" && cargo build --release -p holaf-ui -p holafd -p holafctl )
+        ( cd "$RUST_DIR" && cargo build --release "${CARGO_LOCKED[@]}" -p holaf-ui -p holafd -p holafctl )
     fi
 }
 
@@ -156,24 +157,19 @@ if ! build_all; then
         UI_FEATURES=()
     fi
     if ! build_all; then
-        warn "full build failed — retrying without holaf-ui (Qt UI kept as the app's UI)"
-        if ! ( cd "$RUST_DIR" && cargo build --release -p holafd -p holafctl ); then
-            err "cargo build failed for holafd/holafctl too — nothing to publish"
-            exit 1
-        fi
+        warn "build failed — there is no Python fallback any more."
+        warn "Fix the build (see BUILD.md §5) and re-run."
+        exit 1
     fi
 fi
 
 # --- Publish ----------------------------------------------------------------
-# holafd/holafctl sont obligatoires ; holaf-ui est optionnel (bundle Qt seul).
+# All three are required: the product is the Rust binaries, there is no Python
+# bundle to fall back to.
 mkdir -p "$DEST_DIR"
 for bin in holaf-ui holafd holafctl; do
     src="$RUST_DIR/target/release/$bin"
     if [[ ! -x "$src" ]]; then
-        if [[ "$bin" == "holaf-ui" ]]; then
-            warn "$src missing — the bundle will have NO Rust UI (Qt fallback)"
-            continue
-        fi
         err "expected binary not found after build: $src"
         exit 1
     fi
@@ -191,10 +187,7 @@ for bin in holaf-ui holafd holafctl; do
 done
 
 if [[ -x "$DEST_DIR/holaf-ui" ]]; then
-    log "Rust UI published: $DEST_DIR/holaf-ui (main.py launches it by default)"
+    log "Rust UI published: $DEST_DIR/holaf-ui (the app's entry point)"
 fi
 
-log "Done. The app's launcher finds holaf-ui / holafd automatically: in a"
-log "packaged build it looks next to the executable / in the PyInstaller bundle"
-log "first, then rust/target/{release,debug}, then \$PATH (\$HOLAF_UI_BIN and"
-log "\$HOLAFD_BIN override all)."
+log "Done. Run '$DEST_DIR/holaf-ui' (or package it with './build.sh --tarball')."

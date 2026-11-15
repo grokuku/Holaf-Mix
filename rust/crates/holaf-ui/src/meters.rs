@@ -17,13 +17,35 @@
 //! VU bars ([`crate::widgets::fader`])
 //! ```
 //!
-//! The two scaling rules are the Qt ones, and they matter for the picture:
+//! The **level scale** is the one thing the port deliberately changed.
 //!
-//! * a block's **RMS** is scaled ×5 and clamped to 1.0
-//!   (`min(1.0, rms[0] * 5)` in `metering.py`) — an RMS of 0.2 already pins the
-//!   VU, which is why the Python meters look "hot";
-//! * the **peak** is kept alongside (it is what catches a transient the RMS
-//!   averages away) and is what [`MeterSample::peak_level`] exposes.
+//! `metering.py` scaled a block's RMS by 5 and clipped (`min(1.0, rms * 5)`),
+//! which **saturates at an RMS of 0.2 — i.e. −14 dBFS**.  Every ordinary music or
+//! voice signal is above that, so both bars sat pinned at full height: “les
+//! vu-mètres sont toujours à fond, même quand le son est faible” (user report).
+//! The mapping is now a plain dBFS scale — [`LEVEL_FLOOR_DB`] (−60 dBFS) → 0,
+//! 0 dBFS → 1 — so the bar follows the level over the whole usable range:
+//!
+//! | RMS | dBFS | level |
+//! |---|---|---|
+//! | 1.0 (square) | 0 | 1.00 |
+//! | 0.354 (a −6 dBFS sine) | −9 | 0.85 |
+//! | 0.2 (the old saturation point) | −14 | 0.77 |
+//! | 0.1 | −20 | 0.67 |
+//! | 0.0316 | −30 | 0.50 |
+//! | 0.00316 | −50 | 0.17 |
+//! | 0 | −∞ | 0.00 |
+//!
+//! The **capture is post-fader**, and that was measured rather than assumed: the
+//! engine writes `Props.monitorVolumes` together with `channelVolumes` on a
+//! strip's master node, and a tone played into a bus reads 0.3535 at volume 1.0,
+//! 0.0096 at 0.3 and 0.0004 at 0.1 — exactly `pulse_linear_gain(volume)` (the
+//! PulseAudio cubic curve).  A bare `adapter`/`null-audio-sink` whose
+//! `monitor.channel-volumes` is left at its default is **pre**-fader (measured:
+//! identical RMS at every gain), which is why the engine sets `monitorVolumes`
+//! explicitly.  Turning `monitor.channel-volumes` on **as well** doubles the
+//! attenuation (measured: 0.3 → 0.032 instead of 0.106), so the UI must *not*
+//! multiply the level by the strip volume again — that was the trap.
 //!
 //! Everything except [`MeterBoard`] is a pure function of its inputs, so the
 //! DSP is verified with synthetic buffers (sine, silence, clipped saturation)
@@ -45,8 +67,15 @@ pub const DECAY_PER_INTERVAL: f32 = 0.85;
 /// Frames per published block in the capture path: 480 frames at 48 kHz = 10 ms.
 pub const BLOCK_FRAMES: usize = 480;
 
-/// RMS scaling of the Python engine (`min(1.0, rms * 5)`).
-pub const RMS_TO_LEVEL: f32 = 5.0;
+/// Bottom of the level scale: this many dB below full scale maps to 0.
+///
+/// −60 dBFS is the usual bottom of a digital meter: quiet material still moves
+/// the bar, and everything a listener calls “loud” lands in the top third
+/// instead of pinning it.
+pub const LEVEL_FLOOR_DB: f32 = -60.0;
+
+/// Top of the level scale (0 dBFS = 1.0 on the bar).
+pub const LEVEL_CEILING_DB: f32 = 0.0;
 
 /// Channels every capture stream is opened with (`pw-cat --channels 2`).
 pub const METER_CHANNELS: usize = 2;
@@ -70,25 +99,53 @@ pub struct MeterSample {
 }
 
 impl MeterSample {
-    /// The level a VU bar shows: the Qt rule — RMS × 5, clipped to 1.0.
+    /// The level a VU bar shows: the RMS on the dBFS scale
+    /// ([`level_from_amplitude`]).
+    ///
+    /// This used to be the Qt rule — `min(1.0, rms * 5)` — which saturates at
+    /// −14 dBFS, so the bars of a normal mix sat pinned at the top whatever the
+    /// fader did.
     pub fn level(&self) -> [f32; 2] {
         [
-            (self.rms[0] * RMS_TO_LEVEL).min(1.0),
-            (self.rms[1] * RMS_TO_LEVEL).min(1.0),
+            level_from_amplitude(self.rms[0]),
+            level_from_amplitude(self.rms[1]),
         ]
     }
 
-    /// The same rule applied to the peak (transient-accurate).
+    /// The same scale applied to the peak (transient-accurate).
     pub fn peak_level(&self) -> [f32; 2] {
         [
-            (self.peak[0] * RMS_TO_LEVEL).min(1.0),
-            (self.peak[1] * RMS_TO_LEVEL).min(1.0),
+            level_from_amplitude(self.peak[0]),
+            level_from_amplitude(self.peak[1]),
         ]
     }
 
+    /// The `[level, level]` an amplitude (RMS or peak) maps to.
     pub fn is_silent(&self) -> bool {
         self.peak == [0.0, 0.0]
     }
+}
+
+/// Amplitude (0.0–1.0 linear, RMS or peak) → bar height (0.0–1.0).
+///
+/// Linear in **decibels** between [`LEVEL_FLOOR_DB`] and [`LEVEL_CEILING_DB`],
+/// which is what a meter is for: a 6 dB drop moves the bar by a fixed amount
+/// wherever it happens, and the top of the scale is reserved for material that
+/// really is near full scale instead of being reached at −14 dBFS.
+pub fn level_from_amplitude(amplitude: f32) -> f32 {
+    let db = amplitude_to_db(amplitude);
+    if !db.is_finite() {
+        return 0.0;
+    }
+    ((db - LEVEL_FLOOR_DB) / (LEVEL_CEILING_DB - LEVEL_FLOOR_DB)).clamp(0.0, 1.0)
+}
+
+/// Linear amplitude → dBFS (`-inf` for silence, `0` for full scale).
+pub fn amplitude_to_db(amplitude: f32) -> f32 {
+    if amplitude.is_nan() || amplitude <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    20.0 * amplitude.log10()
 }
 
 /// RMS + peak of an interleaved stereo f32 block.
@@ -324,18 +381,94 @@ mod tests {
             sample.rms[0]
         );
         assert!((sample.rms[1] - expected).abs() < 1e-3);
-        // 1/√2 × 5 clipped to 1.0 → the Qt meter is pinned.
-        assert_eq!(sample.level(), [1.0, 1.0]);
+        // A −3 dBFS sine sits just under the top instead of pinning the bar.
+        assert!(
+            (sample.level()[0] - 0.95).abs() < 0.01,
+            "{:?}",
+            sample.level()
+        );
+        // Its *peak* is full scale, so that bar does reach 1.0.
         assert!((sample.peak[0] - 1.0).abs() < 1e-3);
+        assert!((sample.peak_level()[0] - 1.0).abs() < 1e-3);
     }
 
+    /// The old rule (`min(1, rms × 5)`) saturated at RMS 0.2 = −14 dBFS: every
+    /// ordinary mix pinned both bars — “les vu-mètres sont toujours à fond, même
+    /// quand le son est faible”.  The dB scale must keep the whole range usable.
+    #[test]
+    fn the_level_scale_is_in_decibels_and_does_not_saturate_at_minus_14() {
+        let cases = [
+            (1.0_f32, 1.0_f32),
+            (0.5, 0.90),     // −6 dBFS
+            (0.354, 0.85),   // −9 dBFS (a −6 dBFS sine)
+            (0.2, 0.77),     // −14 dBFS — the old saturation point
+            (0.1, 0.67),     // −20 dBFS
+            (0.0316, 0.50),  // −30 dBFS
+            (0.00316, 0.166),// −50 dBFS
+        ];
+        for (amplitude, expected) in cases {
+            let level = level_from_amplitude(amplitude);
+            assert!(
+                (level - expected).abs() < 0.01,
+                "{amplitude} → {level}, expected {expected}"
+            );
+            assert!(level < 1.0 || amplitude >= 1.0, "{amplitude} must not pin");
+        }
+        // Monotonic, so a louder signal never draws a shorter bar.
+        let mut previous = -1.0_f32;
+        for step in (0..=60).rev() {
+            let amplitude = 10.0_f32.powf(-(step as f32) / 20.0);
+            let level = level_from_amplitude(amplitude);
+            assert!(level >= previous, "{amplitude} → {level} < {previous}");
+            previous = level;
+        }
+        // Silence and non-finite input are dark, never garbage.
+        assert_eq!(level_from_amplitude(0.0), 0.0);
+        assert_eq!(level_from_amplitude(-1.0), 0.0);
+        assert_eq!(level_from_amplitude(f32::NAN), 0.0);
+        assert_eq!(level_from_amplitude(f32::INFINITY), 0.0);
+        assert_eq!(amplitude_to_db(1.0), 0.0);
+        assert!(amplitude_to_db(0.0).is_infinite());
+    }
+
+    /// A quiet signal must be a **short** bar: the whole complaint was a meter
+    /// that stayed at the top whatever the level.
     #[test]
     fn a_quiet_sine_is_not_pinned() {
-        // 0.02 amplitude → RMS ≈ 0.0141 → level ≈ 0.071.
+        // 0.02 amplitude → RMS ≈ 0.0141 → −37 dBFS → level ≈ 0.38.
         let block = sine(METER_RATE as usize / 10, 0.02, 1000.0);
         let sample = analyse_block(&block, 2);
-        assert!(sample.level()[0] < 0.1, "{:?}", sample.level());
-        assert!(sample.level()[0] > 0.0);
+        let level = sample.level()[0];
+        assert!((0.3..0.45).contains(&level), "{level}");
+        // Ten times quieter is ten times lower on the scale (÷20 dB → −1/3).
+        let quieter = analyse_block(&sine(METER_RATE as usize / 10, 0.002, 1000.0), 2);
+        assert!(
+            quieter.level()[0] < level - 0.3,
+            "{:?} vs {level}",
+            quieter.level()
+        );
+    }
+
+    /// **The VU is post-fader.**  The engine applies a strip's volume to its
+    /// master node (`channelVolumes` *and* `monitorVolumes`), so what a capture
+    /// records — and therefore what this scale turns into a bar — follows the
+    /// fader.  The gain is the PulseAudio cubic one (`pulse_linear_gain`), which
+    /// is what the engine really writes; measured live on the headless sandbox:
+    /// 0.3535 at volume 1.0, 0.0096 at 0.3, 0.0004 at 0.1.
+    #[test]
+    fn the_level_follows_the_fader_because_the_capture_is_post_fader() {
+        use holaf_core::model::pulse_linear_gain;
+        let tone = 0.3535_f32;
+        let full = level_from_amplitude(tone);
+        let half = level_from_amplitude(tone * pulse_linear_gain(0.5));
+        let low = level_from_amplitude(tone * pulse_linear_gain(0.3));
+        assert!(full > half && half > low, "{full} {half} {low}");
+        // A −9 dBFS tone at fader 0.5 (gain 0.125 = −18 dB) is 27 dB lower: the
+        // bar loses almost half its height instead of staying pinned.
+        assert!(half < full - 0.25, "{full} vs {half}");
+        assert!(low < half, "{half} vs {low}");
+        // Muting really is silence (the engine also writes `monitorMute`).
+        assert_eq!(level_from_amplitude(0.0), 0.0);
     }
 
     #[test]

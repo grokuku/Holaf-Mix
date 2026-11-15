@@ -1,98 +1,97 @@
 # PROJECT CONTEXT - HOLAF MIX
 
-    ## 1. Project Overview
-    - **Goal**: Linux audio mixer (Voicemeeter-like) using PipeWire and PySide6.
-    - **Target Platform**: CachyOS / Arch Linux.
-    - **Current Phase**: **STABILIZATION & TUNING**.
-    - **Status**: 
-        - **Core Audio**: Functional (Virtual Strips, Physical Routing, Exclusive Source Logic).
-        - **UI**: Functional (VU Meters, Faders, Buttons, Right-Click FX Settings).
-        - **FX Engine**: **FUNCTIONAL**. Node creation works, parameters are dynamic, specific effects (RNNoise) confirmed working.
-        - **Discovery**: `pw-dump` via `pipewire_utils.py` (Stable).
+> Mémo de contexte du dépôt.  Depuis le 2026-11-15 le produit est **100 %
+> Rust** : il n'y a plus de Python, de PySide6, de PyInstaller ni de venv
+> (voir `docs/python-removal.md`).  L'UI Qt décrite dans les versions
+> précédentes de ce fichier n'existe plus.
 
-    ## 2. Architecture (Hybrid MVC)
-    - **Model**: `Strip` class.
-        - **Update**: Effects are now stored as dictionaries `{'active': bool, 'params': {key: value}}` instead of simple booleans.
-        - **Migration**: `from_dict` automatically converts old config files.
-    - **Controller**: `AudioEngine` (Backend).
-        - **FX Hosting**: Uses a persistent `subprocess.Popen(['pw-cli'], stdin=PIPE)`.
-        - **Routing**: **Exclusive Source Strategy**. When switching between Raw and FX sources, the engine explicitly disconnects (`_unlink_nodes`) the unused source to prevent signal doubling (Anti-Gate issue).
-        - **Param Parsing**: Converts Model parameters into SPA-JSON for `filter-chain`.
-    - **View**: `MainWindow` -> `StripWidget`.
-        - **New**: `EffectSettingsDialog` (Dynamic slider generation based on effect type).
+## 1. Project Overview
+- **Goal**: Linux audio mixer (Voicemeeter-like) on PipeWire, written entirely in
+  Rust.
+- **Target Platform**: CachyOS / Arch Linux (Wayland).
+- **Current Phase**: **STABILIZATION & TUNING**.
+- **Status**:
+    - **Core Audio**: functional (virtual strips, physical routing, exclusive
+      source logic) — `rust/crates/holaf-pw`.
+    - **UI**: functional (VU meters, faders, buttons, right-click FX settings) —
+      `rust/crates/holaf-ui` (egui/eframe).
+    - **FX Engine**: functional (filter-chain, dynamic parameters, RNNoise
+      confirmed working).
+    - **Discovery**: `pactl -f json` / `pw-dump` through `holaf-pw`, in-process.
 
-    ## 3. Project File Structure
-    ```text
-    Holaf_Mix/
-    ├── main.py                     # [ENTRY POINT] lanceur : résout puis exécute
-    │                               #   le binaire Rust `holaf-ui` (l'UI est Rust
-    │                               #   depuis B1 ; `HOLAF_UI=python` = UI Qt)
-    ├── src/launcher.py             # [LAUNCHER] résolution de holaf-ui + repli Qt
-    ├── config.json                 # [PERSISTENCE]
-    ├── project_context.md          # [MEMORY]
-    ├── requirements.txt            # [DEPENDENCIES]
-    │
-    ├── src/
-    │   ├── backend/
-    │   │   ├── audio_engine.py     # [CORE] Routing Logic, FX Graph Generation (SPA-JSON).
-    │   │   ├── midi_engine.py      # [MIDI] Hardware integration.
-    │   │   ├── metering.py         # [METERING] Threaded peak detection.
-    │   │   └── pipewire_utils.py   # [LOW-LEVEL] `pw-dump` wrapper & regex parsing.
-    │   │
-    │   ├── config/
-    │   │   └── settings.py         # [IO]
-    │   │
-    │   ├── models/
-    │   │   └── strip_model.py      # [MODEL] Includes new Effect Parameter structure.
-    │   │
-    │   └── ui/
-    │       ├── main_window.py      # [VIEW] Main container.
-    │       ├── dialogs/
-    │       │   └── effect_settings_dialog.py # [VIEW] Dynamic sliders for FX parameters.
-    │       └── widgets/
-    │           └── strip_widget.py # [VIEW] Strip controls & Right-click context menu.
-    ```
+## 2. Architecture (Rust workspace)
+- **Model**: `holaf_core::model::Strip` (`rust/crates/holaf-core/src/model.rs`).
+    - Effects are stored as `{'active': bool, 'params': {key: value}}`; the
+      legacy boolean form is migrated by `holaf_core::migration`.
+- **Controller**: `holaf_pw::PipeWireBackend` (`rust/crates/holaf-pw`), driven
+    **in-process** by the UI (no daemon, no IPC for the window).
+    - **FX Hosting**: `holafd --fx-host` hosts the filter-chain out of the audio
+      callback (see `docs/fx-host.md`).
+    - **Routing**: exclusive source strategy — the unused path is unlinked
+      before the new one is created (anti-gate).
+    - **Param Parsing**: `holaf_core::spa` builds the SPA-JSON, golden-tested
+      against `rust/crates/holaf-core/tests/fixtures/spa_builders_golden.json`.
+- **View**: `holaf_ui` (egui): `views/`, `widgets/`, `dialogs.rs`, `fx_ui.rs`,
+  `theme/`.
+- **Daemon / CLI**: `holafd` + `holafctl` (`rust/crates/holafd`,
+  `rust/crates/holafctl`, protocol in `holaf-ipc`) — automation and
+  diagnostics; the UI does not need them.
 
-    ## 4. Technical Implementation Details
+## 3. Project File Structure
+```text
+Holaf-Mix/
+├── rust/                         # THE product (100 % Rust)
+│   ├── crates/holaf-core/        # model, migrations, SPA-JSON, config I/O
+│   ├── crates/holaf-pw/          # PipeWire backend, FX host, routing
+│   ├── crates/holaf-ipc/         # NDJSON protocol of the daemon
+│   ├── crates/holafd/            # audio daemon (alternative backend)
+│   ├── crates/holafctl/          # CLI (status, apply-snapshot, meter-sources)
+│   └── crates/holaf-ui/          # the app: egui views, MIDI, tray, diagnostics
+├── build.sh                      # icons + cargo build + tarball (no Python)
+├── scripts/
+│   ├── build_rust.sh             # cargo build --release, publishes the 3 bins
+│   ├── check-wayland-guard.sh    # no X11 backend in the shipped binary
+│   └── start-pipewire-headless.sh# harness for the live Rust tests
+├── packaging/
+│   ├── PKGBUILD                  # optional Arch package
+│   ├── holaf-mix.sh              # `holaf-mix` → exec holaf-ui (shell, no Python)
+│   └── holaf-mix.desktop         # Exec=holaf-ui
+├── config.json                   # reference config (tests + dev)
+├── docs/                         # design, migration history, python-removal
+└── .github/workflows/build.yml   # CI: cargo test + tarball artefact
+```
 
-    ### Native Effect Engine
-    - **Method**: "Persistent Host" (pw-cli).
-    - **Format**: SPA-JSON generated dynamically from Python dictionaries.
-    - **Graph**: Stereo (Dual Mono). Creates `Node_L` and `Node_R` for each LADSPA plugin.
-    - **Parameter Handling**:
-        - **Gate**: Threshold, Attack, Release, Hold.
-        - **Compressor**: Threshold, Ratio, Attack, Release, Makeup Gain.
-        - **EQ**: 15-Band Graphic EQ (mbeq).
-        - **RNNoise**: VAD Threshold (Placeholder).
+## 4. Technical Implementation Details
 
-    ### Audio Routing Strategy (Refined)
-    - **Virtual Strips**: `module-null-sink`.
-    - **Exclusive Linking**: 
-        - Before connecting `FX_Output -> Bus`, the engine **MUST** disconnect `Physical_Source -> Bus`.
-        - Before connecting `Physical_Source -> Bus`, the engine **MUST** disconnect `FX_Output -> Bus`.
-    - **Mono**: 
-        - Uses `_unlink_nodes` to clear Stereo links before applying Mono logic (`L->L, L->R`).
-        - Robust Regex `r"(?:[\d]+:\s*)?(?:[\|\-><\s]+)?(" + re.escape(node_name) + r":\S+)"` handles `pw-link` tree output.
+### Native Effect Engine
+- **Method**: PipeWire `filter-chain` (hosted by `holafd --fx-host`).
+- **Format**: SPA-JSON built by `holaf_core::spa` from the model.
+- **Graph**: stereo (dual mono) — `Node_L` and `Node_R` per LADSPA plugin.
+- **Parameter Handling**:
+    - **Gate**: Threshold, Attack, Release, Hold.
+    - **Compressor**: Threshold, Ratio, Attack, Release, Makeup Gain.
+    - **EQ**: 15-band graphic EQ (mbeq).
+    - **RNNoise**: VAD threshold.
 
-    ## 5. Resolved Issues (History)
+### Audio Routing Strategy (Refined)
+- **Virtual Strips**: null sinks / `Holaf_*` nodes.
+- **Exclusive linking**: before connecting `FX_Output -> Bus`, disconnect
+  `Physical_Source -> Bus`; before connecting `Physical_Source -> Bus`,
+  disconnect `FX_Output -> Bus`.
+- **Mono**: unlink stereo ports before applying `L->L, L->R`.
+- **App routing**: `holaf_pw::sink_inputs` (`pactl -f json` + read-back), see
+  `holaf-pw/tests/app_routing_live.rs`.
 
-    ### A. The "Anti-Gate" (RESOLVED)
-    - **Symptom**: Dry signal persisted when Gate was ON.
-    - **Fix**: Implemented `_unlink_nodes` in `_create_link` to enforce exclusive signal path (Dry OR Wet, never both).
+## 5. Resolved Issues (History)
+- **Anti-gate**: dry signal persisted when the gate was active → exclusive
+  linking (unlink the unused path first).
+- **Mono "left only"**: stale stereo links → unlink before re-linking.
+- **Link detection false negatives**: locale-dependent `pw-link` errors → the
+  Rust backend parses the graph instead of error strings.
+- **Effects loaded while disabled**: truthiness bug in the Python engine →
+  `active` is an explicit `bool` in the Rust model.
 
-    ### B. Mono Behavior (RESOLVED)
-    - **Symptom**: "Left Only" sound when Mono enabled on FX.
-    - **Fix**: Improved `_auto_link_ports` regex to detect non-standard port names and force cleanup of old links.
-
-    ### C. Link Detection False Negatives (RESOLVED)
-    - **Symptom**: Engine retrying links endlessly.
-    - **Fix**: Added support for French locale error message ("Le fichier existe") in `_pw_link`.
-
-    ### D. Effect Logic Crash (RESOLVED)
-    - **Symptom**: All effects trying to load simultaneously even if disabled.
-    - **Fix**: Corrected Python "Truthiness" check. `if strip.effects['gate']` became `if strip.effects['gate']['active']`.
-
-    ## 6. Next Steps / TODO
-    - **Parameter Tuning**: Default values for EQ and Compressor need testing to avoid saturation (Current defaults set to safe values: EQ Flat, Gain 0dB).
-    - **Real-time Updates**: Currently, changing a parameter requires reloading the FX chain (Logic pending in `update_fx_params`).
-    - **Visual Feedback**: Add Gain Reduction metering for Compressor/Gate (Advanced).
+## 6. Next Steps / TODO
+- **Parameter tuning**: EQ/compressor defaults still need testing.
+- **Real-time updates**: parameter changes currently reload the FX chain.
+- **Visual feedback**: gain-reduction metering for compressor/gate.

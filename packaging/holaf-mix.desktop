@@ -3,8 +3,12 @@
 #  holaf-mix.desktop — KDE / XDG launcher entry
 # ============================================================================
 #  Install:
-#    User:   cp holaf-mix.desktop ~/.local/share/applications/
-#    System: sudo cp holaf-mix.desktop /usr/local/share/applications/
+#    From the tarball: substitute the two placeholders, then
+#      sed -e "s|__EXEC_PATH__|$PWD|g" \
+#          -e "s|__ICON_PATH__|$PWD/icons|g" holaf-mix.desktop \
+#        > ~/.local/share/applications/holaf-mix.desktop
+#    System-wide: /usr/local/share/applications/ (the PKGBUILD does the same
+#    substitution with /usr/bin and /usr/share/holaf-mix/icons).
 #    Then:   update-desktop-database ~/.local/share/applications/
 # ============================================================================
 
@@ -20,36 +24,22 @@ Comment=Voicemeeter-like audio mixer for PipeWire with MIDI control
 Categories=AudioVideo;Audio;Mixer;
 Keywords=audio;mixer;pipewire;midi;ladspa;fader;volume;
 
-# Path to the binary. %k expands to the location of this .desktop file
-# so the launcher works whether installed system-wide or in the user's
-# home directory. Update Exec if you install the binary elsewhere.
-#
-# Since migration B1 the app's window is the Rust/egui binary `holaf-ui`:
-# it *is* the UI (the Qt interface only survives as the `HOLAF_UI=python`
-# escape hatch).  `__EXEC_PATH__` is replaced at install time by the
-# PKGBUILD / install script.
+# The app IS the Rust binary `holaf-ui` (there is no launcher script and no
+# Python any more).  `__EXEC_PATH__` is replaced at install time by the
+# PKGBUILD / the command above.
 Exec=__EXEC_PATH__/holaf-ui %U
 
-# Fallback (kept documented on purpose — uncomment ONE of them and comment the
-# Exec above if holaf-ui is not installed):
-#   # the holaf-mix launcher resolves holaf-ui itself and falls back to the Qt
-#   # UI when the Rust binary is missing or cannot start:
+# Fallback if you prefer the `holaf-mix` command (a 20-line shell script that
+# only execs holaf-ui from the same directory):
 #   Exec=__EXEC_PATH__/holaf-mix %U
-#   # the Qt UI, explicitly (temporary escape hatch while the port is
-#   # validated; the Rust UI is the default):
-#   Exec=env HOLAF_UI=python __EXEC_PATH__/holaf-mix %U
 
 # Same substitution as Exec: lets the desktop environment grey the entry out
 # when the app is not installed at the expected place.
 TryExec=__EXEC_PATH__/holaf-ui
 
-# NOTE (Rust core): `holaf-ui` drives the PipeWire backend IN-PROCESS (no
-# daemon, no IPC), so nothing has to be started alongside it.  The Qt fallback
-# starts the `holafd` daemon itself; packages install holafd/holafctl NEXT TO
-# the executables (/usr/bin), which is the first path src/launcher.py and
-# src/backend/rust_launcher.py probe, so no extra Exec/Path entry or env var is
-# needed.  If holafd is missing the Qt UI logs a warning and keeps running with
-# the classic Python engine.
+# NOTE: `holaf-ui` drives the PipeWire backend IN-PROCESS (no daemon, no IPC),
+# so nothing has to be started alongside it.  `holafd`/`holafctl` are installed
+# in the same directory for automation and diagnostics, not for the window.
 
 # Icon — KDE will pick the largest size it finds; we ship 16-512
 Icon=__ICON_PATH__/holaf-mix
@@ -58,9 +48,6 @@ Icon=__ICON_PATH__/holaf-mix
 StartupNotify=true
 StartupWMClass=Holaf-Mix
 Terminal=false
-
-# Show in the audio/multimedia submenu
-Categories=AudioVideo;
 
 # Mime types for "open with" support
 MimeType=application/json;

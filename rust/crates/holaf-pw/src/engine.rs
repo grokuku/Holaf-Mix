@@ -73,7 +73,7 @@ use holaf_core::spa;
 use holaf_core::fx::PluginSet;
 
 use crate::chainhost::{ChainHost, FxHostMode};
-use crate::live::{collect_view, LiveNode, LiveView, PortDir};
+use crate::live::{collect_view, LiveNode, LiveView, MonoDownmix, PortDir};
 use crate::sink_inputs;
 use crate::spa_config;
 
@@ -472,6 +472,10 @@ pub struct Engine {
     repair_attempts: u32,
     /// Earliest instant of the next automatic repair pass.
     next_repair_at: Instant,
+    /// How a stereo source is wired into a **mono** target (see
+    /// [`MonoDownmix`]): `Left` by default — the Python behaviour — and set by
+    /// the UI from `ui_rust.mono_downmix` (`EngineOp::SetMonoDownmix`).
+    downmix: MonoDownmix,
     /// Mainloop iterations performed while no order was in flight.
     ///
     /// Diagnostics only (reported by `status`): a daemon that hosts filter
@@ -523,6 +527,7 @@ impl Engine {
             names: graph::NodeNames::default(),
             host,
             routes: HashSet::new(),
+            downmix: MonoDownmix::default(),
             default_sink: None,
             running: false,
             pending: IndexMap::new(),
@@ -567,6 +572,7 @@ impl Engine {
             EngineOp::SetVolume { uid, value } => self.set_volume(&uid, value),
             EngineOp::SetMute { uid, muted } => self.set_mute(&uid, muted),
             EngineOp::SetMono { uid, mono } => self.set_mono(&uid, mono),
+            EngineOp::SetMonoDownmix { policy } => self.set_mono_downmix(policy),
             EngineOp::FxSetActive { uid, effect, active } => {
                 self.fx_set_active(&uid, effect, active)
             }
@@ -1289,16 +1295,20 @@ impl Engine {
     /// free by calling `pactl` after the node existed.
     fn sync_strip_volume(&mut self, strip: &Strip) {
         let master = self.names.master_node(strip);
+        // A mono downmix that sums both channels needs −6 dB on the strip (see
+        // `MonoDownmix::gain_trim`); every other case gets unity, i.e. the pod
+        // written here is byte-identical to the historical one.
+        let trim = self.downmix_trim(&strip.uid);
         match self.session.bind_node_by_name(&master) {
             Ok(Some(node)) => {
-                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute) {
+                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute, trim) {
                     log::warn!("strip '{}': volume push failed: {}", strip.label, e.message);
                 }
                 // Flush the outbound set_param (delivered on mainloop iterate).
                 self.session.roundtrip();
                 self.session
                     .sleep_pumping(Duration::from_millis(VOLUME_SETTLE_MS));
-                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute) {
+                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute, trim) {
                     log::warn!("strip '{}': volume re-push failed: {}", strip.label, e.message);
                 }
                 self.session.roundtrip();
@@ -1574,6 +1584,74 @@ impl Engine {
         self.strips.get(uid).map(|s| self.names.master_node(s))
     }
 
+    /// How many of this strip's routes end on a **mono** target (a node with a
+    /// single input port) and how many on a stereo one.
+    ///
+    /// Read from the live registry at volume time, because the port shape of a
+    /// device is only known there (a Pro Audio node publishes `playback_MONO`,
+    /// a stereo card `playback_FL`/`playback_FR`).
+    fn mono_route_counts(&self, source_uid: &str) -> (usize, usize) {
+        let mut mono = 0;
+        let mut stereo = 0;
+        if self.routes.is_empty() {
+            return (mono, stereo);
+        }
+        let view = self.session.view();
+        for (src, dst) in &self.routes {
+            if src != source_uid {
+                continue;
+            }
+            let Some(target) = self.strips.get(dst) else {
+                continue;
+            };
+            let Some(name) = self.effective_target_name(target) else {
+                continue;
+            };
+            let Some(node) = view.node_named(&name) else {
+                continue;
+            };
+            if view.port_fr(node.id, PortDir::In).is_none() {
+                mono += 1;
+            } else {
+                stereo += 1;
+            }
+        }
+        (mono, stereo)
+    }
+
+    /// The gain trim the strip's volume needs (see [`MonoDownmix::gain_trim`]).
+    /// Unity for every policy except `Average` on an all-mono strip.
+    fn downmix_trim(&self, source_uid: &str) -> f32 {
+        if self.downmix == MonoDownmix::Left {
+            return 1.0;
+        }
+        let (mono, stereo) = self.mono_route_counts(source_uid);
+        self.downmix.gain_trim(mono, stereo)
+    }
+
+    /// Choose the mono downmix policy and make the live graph agree with it.
+    ///
+    /// Every route is re-derived (the link *shape* changes: one link becomes
+    /// two) and every strip's volume is re-pushed (the −6 dB trim of `Average`
+    /// lives in the node's gain).  Off by default, so this only ever runs when a
+    /// user asked for it in `ui_rust.mono_downmix`.
+    fn set_mono_downmix(&mut self, policy: MonoDownmix) -> Result<JsonValue, BackendError> {
+        if policy == self.downmix {
+            return Ok(json!({ "ok": true, "mono_downmix": policy.as_str(), "changed": false }));
+        }
+        self.downmix = policy;
+        log::info!("downmix: stereo → mono now uses '{}'", policy.as_str());
+        if self.running {
+            let wanted = self.routes.clone();
+            self.reconcile_routes(&wanted);
+            let strips: Vec<Strip> = self.strips.values().cloned().collect();
+            for strip in &strips {
+                self.sync_strip_volume(strip);
+            }
+        }
+        Ok(json!({ "ok": true, "mono_downmix": policy.as_str(), "changed": true }))
+    }
+
     fn set_volume(&mut self, uid: &str, value: f32) -> Result<JsonValue, BackendError> {
         let mute = {
             let strip = self
@@ -1583,10 +1661,11 @@ impl Engine {
             strip.volume = value;
             strip.mute
         };
+        let trim = self.downmix_trim(uid);
         let master = self.strip_master_node_name(uid);
         if let Some(name) = master {
             if let Some(node) = self.session.bind_node_by_name(&name)? {
-                push_volume_mute_pod(&node, value, mute)?;
+                push_volume_mute_pod(&node, value, mute, trim)?;
                 self.session.roundtrip();
             }
         }
@@ -1602,10 +1681,11 @@ impl Engine {
             strip.mute = muted;
             strip.volume
         };
+        let trim = self.downmix_trim(uid);
         let master = self.strip_master_node_name(uid);
         if let Some(name) = master {
             if let Some(node) = self.session.bind_node_by_name(&name)? {
-                push_volume_mute_pod(&node, volume, muted)?;
+                push_volume_mute_pod(&node, volume, muted, trim)?;
                 self.session.roundtrip();
             }
         }
@@ -1813,7 +1893,8 @@ impl Engine {
             let dst_fr = view.port_fr(target.id, PortDir::In);
             drop(view);
 
-            let pairs: Vec<(u32, u32)> = LiveView::port_pairs(src_fl, src_fr, dst_fl, dst_fr, mono);
+            let pairs: Vec<(u32, u32)> =
+                LiveView::port_pairs_with(self.downmix, src_fl, src_fr, dst_fl, dst_fr, mono);
 
             if pairs.is_empty() {
                 self.session
@@ -1995,11 +2076,19 @@ impl Engine {
                     && !is_holaf_node(n)
             })
             .map(|n| {
-                json!({
+                // `description` is the human name of the device (`Studio 26c`,
+                // `Built-in Audio Analog Stereo`).  The UI builds its device
+                // labels from it: without it every analog card read
+                // `analog-stereo` and the picker was unusable (reported).
+                let mut value = json!({
                     "id": n.id,
                     "name": n.name,
                     "media_class": n.media_class,
-                })
+                });
+                if let (Some(description), Some(object)) = (&n.description, value.as_object_mut()) {
+                    object.insert("description".into(), json!(description));
+                }
+                value
             })
             .collect();
         Ok(json!({ "devices": devices }))
@@ -2419,8 +2508,18 @@ pub(crate) fn push_params_pod(
 /// `set-source-mute`), so leaving it at unity makes every VU bar read the
 /// pre-fader level: "both output strips' meters are pinned while the sliders
 /// are low" — the other half of the same bug report.
-fn push_volume_mute_pod(node: &pw::node::Node, volume: f32, mute: bool) -> Result<(), BackendError> {
-    let gain = holaf_core::model::pulse_linear_gain(volume);
+fn push_volume_mute_pod(
+    node: &pw::node::Node,
+    volume: f32,
+    mute: bool,
+    trim: f32,
+) -> Result<(), BackendError> {
+    // `trim` is the mono-downmix compensation (`MonoDownmix::gain_trim`): 1.0
+    // unless the strip sums both channels into a mono target, in which case
+    // −6 dB turns the sum into the average.  It scales **both** gains, so the
+    // VU (which reads `monitorVolumes`) stays post-fader.
+    let trim = if trim.is_finite() && trim > 0.0 { trim } else { 1.0 };
+    let gain = holaf_core::model::pulse_linear_gain(volume) * trim;
     let object = Value::Object(pw::spa::pod::Object {
         type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
         id: pw::spa::sys::SPA_PARAM_Props,
@@ -2464,6 +2563,8 @@ pub enum EngineOp {
     SetVolume { uid: String, value: f32 },
     SetMute { uid: String, muted: bool },
     SetMono { uid: String, mono: bool },
+    /// Choose how a stereo strip feeds a **mono** target (`ui_rust.mono_downmix`).
+    SetMonoDownmix { policy: MonoDownmix },
     FxSetActive { uid: String, effect: EffectKey, active: bool },
     FxSetParams {
         uid: String,

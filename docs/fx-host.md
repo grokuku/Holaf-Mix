@@ -1,5 +1,11 @@
 # L'hôte FX dédié (`holafd --fx-host`)
 
+> **Note (2026-11-15)** : ce document est un **compte rendu historique** de la
+> mise au point de l'hôte FX.  Il cite le banc `tools/audio_bench.py` et
+> `tools/probe_node_state.py`, tous deux **supprimés** avec la couche Python :
+> les commandes de mesure ci-dessous ne sont plus exécutables telles quelles
+> (le diagnostic live vit dans *Debug window* / `holafctl` / `pw-dump`).
+
 Document de référence du correctif « hachage audio (chopping) en mode Rust
 quand une chaîne FX est active ».  Il décrit **pourquoi** la chaîne n'est plus
 hébergée dans `holafd`, **comment** elle l'est désormais, et **comment le
@@ -14,7 +20,7 @@ Code :
 | `rust/crates/holaf-pw/src/fxhost/client.rs` | côté `holafd` : spawn, requête/réponse, mort |
 | `rust/crates/holaf-pw/src/chainhost.rs` | `ChainHost` : *où* la chaîne est hébergée + respawn |
 | `rust/crates/holaf-pw/src/engine.rs` | `ChainSpec` (SPA-JSON) + `push_chain_params` |
-| `tools/audio_bench.py` | banc A/B (cas `ref`, `pwcli`, `holafd`, `fxhost`) |
+| ~~`tools/audio_bench.py`~~ | banc A/B **supprimé** le 2026-11-15 avec la couche Python (voir `python-removal.md`) |
 
 ---
 

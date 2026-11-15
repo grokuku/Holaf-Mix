@@ -268,9 +268,10 @@ pub fn strip_ui(
         },
     };
     let combo = combo_display(&mut child, &device_text, theme);
-    // The combo can only show the profile segment of the node name (see
-    // `device_display_name`): the tooltip carries the identity, so a user can
-    // always tell which node a strip is bound to and see a missing device.
+    // The combo is 90 px wide, so it shows only the head of the label (see
+    // `device_display_name`): the tooltip carries the whole `node.name`, so a
+    // user can always tell which node a strip is bound to — and see that a
+    // device is gone.
     let combo = match strip.device_name.as_deref().filter(|name| !name.is_empty()) {
         Some(name) => combo.on_hover_text(device_tooltip(name, device_presence)),
         None => combo,
@@ -607,31 +608,31 @@ pub fn device_combo_id(uid: &str) -> egui::Id {
     egui::Id::unique(("holaf-device-combo", uid))
 }
 
-/// Shorten a PipeWire node name the way the Qt combo does (`desc[:15] +
-/// "..."`), but on the most informative part:
+/// Shorten a PipeWire node name for the 90 px combo: the **distinctive** part,
+/// cut to [`COMBO_CHARS`] with an ellipsis.
 ///
-/// * `alsa_output.pci-0000_00_1f.3.analog-stereo` → `analog-stereo` (the last
-///   segment names the profile);
-/// * `bluez_output.AC_80_0B_1F_22_33_44.a2dp-sink` → `a2dp-sink`;
-/// * `bluez_output.AC_80_0B_1F_22_33_44.1` → `bluez_output` (a one-character
-///   last segment says nothing, so fall back to the head);
-/// * anything longer than 15 chars is truncated with an ellipsis.
+/// This used to keep the last dotted segment (“the profile”), which is why the
+/// user's C-Media and PreSonus cards both read `analog-stereo` and the device
+/// menu became unusable.  The combo now shows the model of the card
+/// ([`crate::devices::short_label`]):
+///
+/// ```text
+/// alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0 → "PreSonus Studi…"
+/// alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo
+///                                                              → "C-Media Electr…"
+/// alsa_output.pci-0000_00_1f.3.analog-stereo                    → "analog-stereo"
+/// ```
+///
+/// The whole `node.name` stays one hover away ([`device_tooltip`]), and the
+/// pop-up shows the untruncated label (`PreSonus Studio 26c · pro-output-0`).
 pub fn device_display_name(device_name: &str) -> String {
-    if device_name.is_empty() {
+    if device_name.trim().is_empty() {
         return String::new();
     }
-    let segments: Vec<&str> = device_name.split('.').collect();
-    let candidate = match segments.last() {
-        Some(last) if last.chars().count() >= 4 => *last,
-        _ => segments.first().copied().unwrap_or(device_name),
-    };
-    if candidate.chars().count() <= 15 {
-        candidate.to_string()
-    } else {
-        let mut short: String = candidate.chars().take(14).collect();
-        short.push('…');
-        short
-    }
+    crate::devices::elide_chars(
+        &crate::devices::short_label(device_name, None),
+        crate::engine_json::COMBO_CHARS,
+    )
 }
 
 /// Where a context menu must open: under the pointer when egui knows it (a real
@@ -647,26 +648,23 @@ pub fn pointer_pos(ui: &Ui, fallback: Rect) -> egui::Pos2 {
 ///
 /// A device that the engine does not list is prefixed with `!` instead of the
 /// Qt `<name> (Not Found)` suffix.  The reason is measurable: the combo is a
-/// fixed 90 px box and the label is elided to 15 characters, so
-/// `<full node name> (Not Found)` — which is always longer than 15 characters —
-/// lost the **whole** marker and showed a meaningless fragment
-/// (`alsa_output.go…`).  The strip looked bound while nothing was routed, and
-/// the user had no way to see that the device was gone.  The marker now comes
-/// first so it can never be elided; the exact node name is one hover away
-/// (`views::strip` puts it in the tooltip).
+/// fixed 90 px box and the label is elided to [`crate::engine_json::COMBO_CHARS`]
+/// characters, so `<full node name> (Not Found)` — which is always longer than
+/// that — lost the **whole** marker and showed a meaningless fragment.
+/// The strip looked bound while nothing was routed, and the user had no way to
+/// see that the device was gone.  The marker now comes first so it can never be
+/// elided; the exact node name is one hover away (`views::strip` puts it in the
+/// tooltip).
 ///
-/// The rest keeps the Qt `desc[:15] + "..."` rule, so a long node name cannot
-/// widen the combo.
+/// The label itself is [`device_display_name`] (the model, not the profile), so a
+/// missing C-Media card no longer reads exactly like a missing PreSonus one.
 pub fn device_combo_text(device_name: &str, presence: DevicePresence) -> String {
-    let mut text = match presence {
-        DevicePresence::Missing => format!("! {}", device_display_name(device_name)),
-        DevicePresence::Found | DevicePresence::Unknown => device_display_name(device_name),
+    let label = device_display_name(device_name);
+    let text = match presence {
+        DevicePresence::Missing => format!("! {label}"),
+        DevicePresence::Found | DevicePresence::Unknown => label,
     };
-    if text.chars().count() > 15 {
-        text = text.chars().take(14).collect();
-        text.push('…');
-    }
-    text
+    crate::devices::elide_chars(&text, crate::engine_json::COMBO_CHARS)
 }
 
 /// The hover text of the device combo: the **exact** `node.name` a strip is
@@ -709,20 +707,27 @@ mod tests {
     }
 
     #[test]
-    fn device_names_are_shortened_to_the_last_segment() {
+    fn device_names_are_shortened_to_the_distinctive_part() {
+        // The model names the card, so two cards keep two labels (the old rule
+        // kept the *profile* and gave `analog-stereo` for both).
+        assert_eq!(
+            device_display_name("alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0"),
+            "PreSonus Studi…"
+        );
+        assert_eq!(
+            device_display_name(
+                "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
+            ),
+            "C-Media Electr…"
+        );
+        // A built-in card whose instance is a PCI address has no model: the
+        // profile is the only informative part (what the old rule always gave).
         assert_eq!(
             device_display_name("alsa_output.pci-0000_00_1f.3.analog-stereo"),
             "analog-stereo"
         );
-        assert_eq!(
-            device_display_name("bluez_output.AC_80_0B_1F_22_33_44.a2dp-sink"),
-            "a2dp-sink"
-        );
-        // A useless one-character last segment falls back to the head.
-        assert_eq!(
-            device_display_name("bluez_output.AC_80_0B_1F_22_33_44.1"),
-            "bluez_output"
-        );
+        // A short name is left alone.
+        assert_eq!(device_display_name("alsa_output.hp"), "hp");
         assert_eq!(device_display_name(""), "");
         // Long single-segment names are truncated with an ellipsis.
         let long = device_display_name("a_very_long_device_name_without_dots");
@@ -737,22 +742,36 @@ mod tests {
     /// looked perfectly bound while nothing was routed to it.
     #[test]
     fn a_missing_device_is_shown_as_not_found() {
+        // The label now carries the *model*, so a missing C-Media no longer reads
+        // exactly like a missing PreSonus (the old rule showed `analog-stereo`
+        // for both).
         assert_eq!(
-            device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Missing),
-            "! analog-stereo"
+            device_combo_text(
+                "alsa_output.usb-PreSonus_Studio_26c_01424548-00.pro-output-0",
+                DevicePresence::Missing
+            ),
+            "! PreSonus Stu…"
         );
         assert_eq!(
-            device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Found),
-            "analog-stereo"
+            device_combo_text(
+                "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo",
+                DevicePresence::Found
+            ),
+            "C-Media Electr…"
+        );
+        assert_ne!(
+            device_combo_text("alsa_output.usb-PreSonus_Studio_26c-00.pro-output-0", DevicePresence::Found),
+            device_combo_text("alsa_output.pci-0000_00_1f.3.analog-stereo", DevicePresence::Found),
+            "two different cards must never share one combo label"
         );
         // Unknown (no engine answered) never claims the device is gone.
         assert_eq!(
-            device_combo_text("alsa_output.gone.analog-stereo", DevicePresence::Unknown),
-            "analog-stereo"
+            device_combo_text("alsa_output.hp", DevicePresence::Unknown),
+            "hp"
         );
-        // A long profile segment is still elided, but after the marker.
+        // A long label is still elided, but after the marker.
         let long = device_combo_text(
-            "alsa_output.usb-X-00.analog-surround-40",
+            "alsa_output.usb-A_Very_Long_Vendor_Name_Here-00.analog-surround-40",
             DevicePresence::Missing,
         );
         assert!(long.starts_with("! "), "{long}");

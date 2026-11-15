@@ -625,7 +625,10 @@ fn main() -> ExitCode {
     {
         // The backend connects (and applies the loaded snapshot) on its own
         // thread; a missing daemon becomes a visible banner, never a crash.
-        state.attach_engine(holaf_ui::bridge::EngineBridge::spawn_pipewire());
+        // `ui_rust.mono_downmix` is read once here: the engine thread owns the
+        // link policy, so the choice has to travel with its start-up.
+        let downmix = state.mono_downmix();
+        state.attach_engine(holaf_ui::bridge::EngineBridge::spawn_pipewire(downmix));
         log::info!("engine: PipeWire backend attached");
     }
     #[cfg(not(feature = "engine-pw"))]

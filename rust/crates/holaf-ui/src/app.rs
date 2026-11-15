@@ -713,6 +713,38 @@ impl AppState {
         state
     }
 
+    /// How a stereo strip feeds a **mono** target (`ui_rust.mono_downmix`).
+    ///
+    /// Read once, at start-up, and handed to the engine thread.  `left` (the
+    /// Python behaviour) is the default, because `sum`/`average` change what the
+    /// user hears on a mono output and must be an explicit choice — see
+    /// [`holaf_pw::MonoDownmix`] for the three options and their gain maths.
+    ///
+    /// ```json
+    /// { "ui_rust": { "mono_downmix": "average" } }
+    /// ```
+    pub fn mono_downmix(&self) -> holaf_pw::MonoDownmix {
+        let Some(config) = &self.config else {
+            return holaf_pw::MonoDownmix::default();
+        };
+        let Some(text) = config.ui_rust_string("mono_downmix") else {
+            return holaf_pw::MonoDownmix::default();
+        };
+        match holaf_pw::MonoDownmix::parse(&text) {
+            Some(policy) => {
+                log::info!("downmix: ui_rust.mono_downmix = '{}'", policy.as_str());
+                policy
+            }
+            None => {
+                log::warn!(
+                    "downmix: ui_rust.mono_downmix = {text:?} is not 'left', 'sum' or 'average' - \
+                     using 'left' (the Python behaviour)"
+                );
+                holaf_pw::MonoDownmix::default()
+            }
+        }
+    }
+
     /// Attach the engine and push the loaded strips to it.
     ///
     /// The initial `apply_snapshot` is only sent when we actually have a config
@@ -1571,6 +1603,16 @@ impl AppState {
         self.last_meter_tick = now;
         for index in 0..self.strips.len() {
             let uid = self.strips[index].uid.clone();
+            // A **muted** strip is dark, whatever the capture still records.  The
+            // engine mutes the monitor (`Props.monitorMute`), so a bus is silent
+            // already — but a physical strip records its *device source*, whose
+            // `monitorMute` is not ours to set, and a muted strip showing a
+            // moving bar is a lie (and the other half of “the VU never follows
+            // the fader”).
+            if self.strips[index].mute {
+                self.feed_levels(&uid, [0.0, 0.0], dt);
+                continue;
+            }
             // A strip whose device is **gone** must not show a level.  Its
             // capture cannot resolve `<device>.monitor`, and `pw-cat` does not
             // fail in that case: it silently records the *default source*
@@ -1595,6 +1637,11 @@ impl AppState {
                     self.meter_missing.remove(&uid);
                     // The envelope takes `dt` into account, so a 60 fps repaint
                     // decays exactly like a 25 Hz one.
+                    //
+                    // The level is used **as captured**: the capture is already
+                    // post-fader (the engine writes `Props.monitorVolumes` with
+                    // the strip volume — measured, see `crate::meters`), so
+                    // multiplying by the volume here would attenuate twice.
                     self.feed_levels(&uid, levels, dt);
                 }
                 None => {
@@ -2747,6 +2794,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
+    /// `ui_rust.mono_downmix` selects the mono-target policy, and anything the
+    /// engine does not recognise falls back to **`left`** — the Python
+    /// behaviour — instead of guessing.  The key is read once, at start-up, and
+    /// handed to the engine thread.
+    #[test]
+    fn the_mono_downmix_policy_comes_from_the_config_and_defaults_to_left() {
+        let path = scratch_config("downmix");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["ui_rust"] = serde_json::json!({ "mono_downmix": "average" });
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert_eq!(
+            AppState::from_config(&path).mono_downmix(),
+            holaf_pw::MonoDownmix::Average
+        );
+
+        // Absent key → the default (left).
+        let plain = scratch_config("downmix-plain");
+        assert_eq!(
+            AppState::from_config(&plain).mono_downmix(),
+            holaf_pw::MonoDownmix::Left
+        );
+
+        // A value nobody knows: left, and the state says nothing (only the log
+        // does) — an unusable mixer would be worse than ignoring the setting.
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&plain).unwrap()).unwrap();
+        raw["ui_rust"] = serde_json::json!({ "mono_downmix": "leftish" });
+        std::fs::write(&plain, raw.to_string()).unwrap();
+        assert_eq!(
+            AppState::from_config(&plain).mono_downmix(),
+            holaf_pw::MonoDownmix::Left
+        );
+
+        // No config at all (first run, `--config` on a missing file).
+        let mut state = AppState::demo();
+        state.config = None;
+        assert_eq!(state.mono_downmix(), holaf_pw::MonoDownmix::Left);
+    }
+
     #[test]
     fn a_missing_config_starts_empty_with_a_visible_warning() {
         let dir = std::env::temp_dir().join(format!(
@@ -3411,6 +3498,49 @@ mod tests {
         s.feed_from_board(&board, now + 2 * METER_INTERVAL, METER_INTERVAL);
         let after = s.levels_for(0)[0];
         assert!(after > 0.0 && after < 0.8, "{after}");
+    }
+
+    /// **A muted strip is dark.**  The engine mutes the monitor of a bus, but a
+    /// physical strip records its *device source* (not a monitor we own), and a
+    /// muted strip with a moving bar is the other half of “the VU never follows
+    /// the fader”.
+    ///
+    /// The level is used **as captured**: the capture is post-fader already (the
+    /// engine writes `Props.monitorVolumes` with the strip volume — measured:
+    /// a tone into a bus reads 0.3535 at volume 1.0 and 0.0096 at 0.3), so
+    /// multiplying it by the volume again would attenuate twice.
+    #[test]
+    fn a_muted_strip_shows_a_dark_vu_and_a_live_one_follows_the_capture() {
+        let mut s = state();
+        let board = MeterBoard::new();
+        let uid = s.strips[0].uid.clone();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        // A level the capture really produced (post-fader, so it is the truth).
+        board.publish(slots[&uid], [0.6, 0.6]);
+        let now = Instant::now();
+        s.feed_from_board(&board, now, METER_INTERVAL);
+        assert_eq!(s.levels_for(0), [0.6, 0.6], "unmuted: the level is shown");
+
+        // Mute: the bar goes dark on the next tick, and stays dark.
+        s.apply(UiAction::Mute {
+            uid: uid.clone(),
+            mute: true,
+        });
+        // The envelope slides down (15 % per tick) instead of snapping, which
+        // looks the same on screen and avoids a visual click on every mute.
+        for tick in 1..200 {
+            s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
+        }
+        let dark = s.levels_for(0);
+        assert!(dark[0] < 1e-4 && dark[1] < 1e-4, "a muted strip must be dark: {dark:?}");
+
+        // Unmute: the next reading is shown again (no stale zero).
+        s.apply(UiAction::Mute {
+            uid: uid.clone(),
+            mute: false,
+        });
+        s.feed_from_board(&board, now + METER_INTERVAL * 300, METER_INTERVAL);
+        assert_eq!(s.levels_for(0), [0.6, 0.6]);
     }
 
     /// **A gone device must not paint a level.**  `pw-cat` does not fail when
