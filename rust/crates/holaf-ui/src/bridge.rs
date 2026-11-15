@@ -66,6 +66,7 @@ use serde_json::Value;
 use holaf_core::model::{EffectKey, Strip};
 
 use crate::apps::AppList;
+use crate::diagnostics::CaptureRegistry;
 use crate::engine_json::DeviceInfo;
 use crate::meters::MeterBoard;
 
@@ -222,6 +223,9 @@ pub struct EngineBridge {
     handle: Option<JoinHandle<()>>,
     levels: Arc<Mutex<HashMap<String, [f32; 2]>>>,
     meters: Option<MeterBoard>,
+    /// The capture children's own status, shared with the diagnostic report
+    /// (`None` for the mock engine: it has no `pw-cat` child at all).
+    captures: Option<CaptureRegistry>,
     status: Arc<EngineStatus>,
 }
 
@@ -384,6 +388,7 @@ impl EngineBridge {
             handle: Some(handle),
             levels,
             meters: None,
+            captures: None,
             status,
         }
     }
@@ -416,6 +421,14 @@ impl EngineBridge {
     /// (`None` for the mock: its levels arrive as `Levels` events).
     pub fn meter_board(&self) -> Option<&MeterBoard> {
         self.meters.as_ref()
+    }
+
+    /// The capture children's status registry, when this bridge runs real
+    /// captures (`None` for the mock).  The diagnostics report reads it (see
+    /// [`crate::diagnostics::CaptureSummary`]): it is the only place a user can
+    /// see *why* a VU bar stays at 0.000.
+    pub fn capture_registry(&self) -> Option<&CaptureRegistry> {
+        self.captures.as_ref()
     }
 
     pub fn status(&self) -> &Arc<EngineStatus> {
@@ -584,7 +597,6 @@ mod pw {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
-    use crate::capture::MeterCapture;
     use crate::engine_json;
     use crate::meters::METER_INTERVAL;
     use holaf_core::backend::Backend;
@@ -603,9 +615,11 @@ mod pw {
         /// the UI thread and moving it would be wrong even though the type is
         /// `Send`.
         ///
-        /// The thread also owns the meter capture ([`MeterCapture`]): one
-        /// `pw-cat --record` child per source the engine names, publishing into
-        /// the [`MeterBoard`] the UI reads.
+        /// The thread also owns the meter capture
+        /// ([`crate::capture::MeterCapture`]): one `pw-cat --record` child per
+        /// source the engine names, publishing into the [`MeterBoard`] the UI
+        /// reads and its own status into the [`CaptureRegistry`] the diagnostic
+        /// report reads.
         /// `downmix` is the mono-target policy from `config.json`
         /// (`ui_rust.mono_downmix`, see [`holaf_pw::MonoDownmix`]).  It is sent to
         /// the engine on every (re)connect, so a restart keeps the user's choice;
@@ -617,13 +631,21 @@ mod pw {
             let thread_levels = Arc::clone(&levels);
             let board = MeterBoard::new();
             let thread_board = board.clone();
+            // The capture status registry crosses the seam on purpose: the
+            // engine thread writes it (one entry per `pw-cat` child), the UI
+            // thread reads it when the diagnostic report is built.
+            let captures = CaptureRegistry::new();
+            let thread_captures = captures.clone();
             let status = Arc::new(EngineStatus::default());
             let thread_status = Arc::clone(&status);
 
             let handle = thread::Builder::new()
                 .name("holaf-ui-engine-pw".to_string())
                 .spawn(move || {
-                    let mut capture = MeterCapture::new();
+                    let mut capture = crate::capture::MeterCapture::with_recorder_and_registry(
+                        crate::capture::default_recorder(),
+                        thread_captures.clone(),
+                    );
                     let mut snapshot: Vec<Strip> = Vec::new();
                     let mut uids: Vec<String> = Vec::new();
                     let mut next_source_refresh = Instant::now();
@@ -767,6 +789,7 @@ mod pw {
                 handle: Some(handle),
                 levels,
                 meters: Some(board),
+                captures: Some(captures),
                 status,
             }
         }
@@ -882,7 +905,7 @@ mod pw {
     /// `backend` is `None` in disconnected mode: the captures are all stopped.
     fn refresh_meters(
         backend: &mut Option<holaf_pw::PipeWireBackend>,
-        capture: &mut MeterCapture,
+        capture: &mut crate::capture::MeterCapture,
         board: &MeterBoard,
         uids: &mut Vec<String>,
     ) {

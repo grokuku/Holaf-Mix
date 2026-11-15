@@ -194,8 +194,15 @@ impl eframe::App for HolafApp {
 impl HolafApp {
     /// Turn a WM close request into the [`holaf_ui::tray::CloseAction`]: with a
     /// tray + the preference, the window is hidden (`CancelClose` + `Visible`
-    /// false) and the app keeps running; otherwise the close is allowed and
-    /// eframe runs `on_exit`/`shutdown`.
+    /// false + `Minimized`) and the app keeps running in the tray; otherwise the
+    /// close is allowed and eframe runs `on_exit`/`shutdown`.
+    ///
+    /// The preference defaults to **hide** (the Qt `closeEvent`): “la croix
+    /// quitte complètement le programme, moi je pensais que ça allait juste
+    /// fermer la fenêtre pour ne laisser que le tray icon”.  The fallback is the
+    /// safety net and is checked first by [`holaf_ui::tray::close_action`]: no
+    /// real tray icon (no StatusNotifier host) → **quit**, never hide a window
+    /// nobody could bring back.
     fn intercept_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|input| input.viewport().close_requested());
         if !requested {
@@ -207,6 +214,8 @@ impl HolafApp {
             holaf_ui::tray::CloseAction::Hide => {
                 log::info!("ui: close requested - hiding to the tray");
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                // `Visible(false)` alone is a no-op on Wayland; `send_visible`
+                // sends `Minimized` too, which both backends honour.
                 send_visible(ctx, false);
                 self.window_visible = false;
             }
@@ -215,8 +224,10 @@ impl HolafApp {
                     "ui: close requested - quitting ({})",
                     if self.quitting {
                         "tray Quit"
+                    } else if holaf_ui::tray::available() {
+                        "ui_rust.tray_hide_on_close is off"
                     } else {
-                        "no tray"
+                        "no tray icon available"
                     }
                 );
             }
@@ -334,18 +345,15 @@ impl HolafApp {
 
 /// Show or hide the window, on every backend.
 ///
-/// `ViewportCommand::Visible(false)` alone is **not** enough on Wayland: a client
-/// cannot unmap its own toplevel there (winit has no protocol for it), so the
-/// command is a silent no-op.  A close request that was cancelled in order to
-/// "hide to the tray" then leaves the window exactly where it was — the user
-/// report “la croix ne ferme plus la fenêtre”.  `Minimized` **is** supported by
-/// both backends, so the window really leaves the screen; restoring sends the
-/// mirror pair and focuses the window.
+/// The commands themselves live in [`holaf_ui::tray::visibility_commands`] so the
+/// policy is unit-tested without a window: `ViewportCommand::Visible(false)`
+/// alone is **not** enough on Wayland (a client cannot unmap its own toplevel
+/// there, winit has no protocol for it), so the hide is a *pair* with
+/// `Minimized(true)` — the user report “la croix ne ferme plus la fenêtre” was
+/// exactly that no-op.  Restoring sends the mirror pair and focuses.
 fn send_visible(ctx: &egui::Context, visible: bool) {
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(!visible));
-    if visible {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    for command in holaf_ui::tray::visibility_commands(visible) {
+        ctx.send_viewport_cmd(command);
     }
 }
 
@@ -702,15 +710,17 @@ fn main() -> ExitCode {
         }
     );
     // The invariant `close_action` encodes: hide only when a tray exists **and**
-    // the user asked for it (`ui_rust.tray_hide_on_close`, default off since the
-    // close button must close).  A build/time without a tray must quit, never
-    // hide an unreachable window.
+    // the user asked for it (`ui_rust.tray_hide_on_close`, default **on** like
+    // the Qt `closeEvent`).  A build/time without a tray must quit, never hide an
+    // unreachable window — that is the fallback, and it is checked first.
     if !holaf_ui::tray::available() {
         log::info!("ui: closing the window quits (no tray icon compiled/available)");
     } else if state.tray_hide_on_close {
-        log::info!("ui: closing the window hides it (ui_rust.tray_hide_on_close is on)");
+        log::info!(
+            "ui: closing the window hides it to the tray (ui_rust.tray_hide_on_close is on)"
+        );
     } else {
-        log::info!("ui: closing the window quits (the tray icon keeps Show/Hide)");
+        log::info!("ui: closing the window quits (ui_rust.tray_hide_on_close is off)");
     }
 
     let options = eframe::NativeOptions {

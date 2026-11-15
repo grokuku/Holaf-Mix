@@ -558,6 +558,74 @@ fn draw_diagnostics(state: &mut AppState, ui: &mut Ui) {
                             );
                         }
                         ui.separator();
+                        // CAPTURES — the VU chain's own health, i.e. the answer to
+                        // “the bars read 0.000, why?”.  Same content as the
+                        // report's CAPTURES section: one block per capture, with
+                        // the pid, the state, the block/reject counts and the
+                        // `pw-cat` stderr tail.
+                        ui.label(format!(
+                            "captures — recorder: {}",
+                            report.recorder.summary()
+                        ));
+                        if report.captures.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "(no capture is running - no source was requested)",
+                                )
+                                .weak(),
+                            );
+                        } else {
+                            let rejects = if report.captures.rejects.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " ({})",
+                                    report
+                                        .captures
+                                        .rejects
+                                        .iter()
+                                        .map(|(reason, count)| format!("{count} {reason}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
+                            let colour = if report.captures.never_streamed() {
+                                egui::Color32::from_rgb(0xd0, 0x60, 0x60)
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "blocks: {} accepted, {} rejected{rejects}",
+                                    report.captures.blocks, report.captures.rejected
+                                ))
+                                .color(colour),
+                            );
+                            for facts in &report.captures.sources {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} → {} · {}",
+                                        facts.source,
+                                        facts.target,
+                                        facts.describe()
+                                    ))
+                                    .size(10.0)
+                                    .color(if facts.dead() {
+                                        egui::Color32::from_rgb(0xd0, 0x60, 0x60)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
+                                );
+                                for line in &facts.stderr_tail {
+                                    ui.label(
+                                        egui::RichText::new(format!("    stderr: {line}"))
+                                            .size(9.0)
+                                            .weak(),
+                                    );
+                                }
+                            }
+                        }
+                        ui.separator();
                         ui.label(format!(
                             "Holaf_* nodes ({})",
                             report.engine.holaf_nodes.len()

@@ -283,10 +283,27 @@ pub fn available() -> bool {
     }
 }
 
-/// The command line the tray would use to re-show the window.  egui hides a
-/// window with `ViewportCommand::Visible`; this documents the pair.
-pub fn show_commands(visible: bool) -> [egui::ViewportCommand; 1] {
-    [egui::ViewportCommand::Visible(visible)]
+/// The viewport commands that really show or hide the window, in order.
+///
+/// `ViewportCommand::Visible(false)` **alone is a no-op on Wayland** (a client
+/// cannot unmap its own toplevel: winit has no protocol for it), so “hide to the
+/// tray” that only sent it cancelled the close request and left the window on
+/// screen — the user report “la croix ne ferme plus la fenêtre”.  `Minimized` is
+/// supported by both backends, so the pair is what actually clears the screen;
+/// restoring sends the mirror pair and then focuses, otherwise the window comes
+/// back behind whatever has focus.
+///
+/// One list, used by the shell (`main::send_visible`): a second copy of this
+/// rule is how the Wayland regression came back the first time.
+pub fn visibility_commands(visible: bool) -> Vec<egui::ViewportCommand> {
+    let mut commands = vec![
+        egui::ViewportCommand::Visible(visible),
+        egui::ViewportCommand::Minimized(!visible),
+    ];
+    if visible {
+        commands.push(egui::ViewportCommand::Focus);
+    }
+    commands
 }
 
 /// Try to start the tray icon (no-op without the `tray` feature).
@@ -796,13 +813,28 @@ mod tests {
 
     #[test]
     fn visibility_is_a_single_viewport_command() {
+        // Showing: un-minimize, un-hide, then take the focus back.
+        let shown = visibility_commands(true);
         assert!(matches!(
-            show_commands(true)[0],
+            shown[0],
             egui::ViewportCommand::Visible(true)
         ));
         assert!(matches!(
-            show_commands(false)[0],
+            shown[1],
+            egui::ViewportCommand::Minimized(false)
+        ));
+        assert!(matches!(shown[2], egui::ViewportCommand::Focus));
+        // Hiding: `Visible(false)` **and** `Minimized(true)` — the first is a
+        // no-op on Wayland, the second is what actually clears the screen.
+        let hidden = visibility_commands(false);
+        assert_eq!(hidden.len(), 2, "nothing to focus when hiding");
+        assert!(matches!(
+            hidden[0],
             egui::ViewportCommand::Visible(false)
+        ));
+        assert!(matches!(
+            hidden[1],
+            egui::ViewportCommand::Minimized(true)
         ));
     }
 

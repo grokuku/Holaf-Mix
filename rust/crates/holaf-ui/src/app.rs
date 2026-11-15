@@ -412,14 +412,19 @@ pub struct AppState {
     /// window instead of quitting, *when a tray icon is actually there* (see
     /// [`crate::tray::close_action`]).
     ///
-    /// Defaults to **`false`** — the close button quits.  Qt defaulted to "hide",
-    /// but on Wayland a client cannot hide its own toplevel (`ViewportCommand::
-    /// Visible(false)` is a no-op there, winit has no protocol for it): the close
-    /// request was cancelled and the window stayed on screen, which is exactly
-    /// the user report “la croix ne ferme plus la fenêtre”.  Hiding is now opt-in
-    /// (`"ui_rust": {"tray_hide_on_close": true}`) and is carried out with
-    /// `Minimized` as well, so it works on Wayland too.  Ignored when no tray is
-    /// available, so it can never strand the app.
+    /// Defaults to **`true`**, the Qt behaviour the user asked for: “la croix
+    /// quitte complètement le programme, moi je pensais que ça allait juste
+    /// fermer la fenêtre pour ne laisser que le tray icon”.  It was briefly
+    /// turned off because the hide silently failed on Wayland — a client cannot
+    /// unmap its own toplevel, so `ViewportCommand::Visible(false)` is a no-op
+    /// there and the close request was cancelled for nothing.  The fix is in the
+    /// shell (`send_visible`), not in the preference: it now also sends
+    /// `Minimized`, which **is** supported by both backends, and restores with
+    /// `Visible(true)` + `Minimized(false)` + `Focus`.
+    ///
+    /// The rule that keeps this safe is unchanged: hiding happens **only** when
+    /// `crate::tray::available()` is true (a real StatusNotifier host), so a
+    /// machine without a tray quits instead of hiding an unreachable window.
     pub tray_hide_on_close: bool,
     /// The open context menu, if any ([`crate::menus`]).
     pub context_menu: Option<crate::menus::ContextMenu>,
@@ -628,7 +633,7 @@ impl AppState {
             restarting: false,
             diagnostics: None,
             always_on_top: true,
-            tray_hide_on_close: false,
+            tray_hide_on_close: true,
             context_menu: None,
             applied_window_level: None,
             midi_bindings: HashMap::new(),
@@ -696,7 +701,7 @@ impl AppState {
                 state.midi_map = MidiMap::from_strips(&state.strips, &state.midi_bindings);
                 state.always_on_top = config.ui_rust_bool("always_on_top").unwrap_or(true);
                 state.tray_hide_on_close =
-                    config.ui_rust_bool("tray_hide_on_close").unwrap_or(false);
+                    config.ui_rust_bool("tray_hide_on_close").unwrap_or(true);
                 // The controller the user picked last time (`ui_rust.midi_port`).
                 // Python has no such key — it auto-opened the first port whose
                 // name contained "mix" at every start — so this is a Rust-only
@@ -1557,7 +1562,7 @@ impl AppState {
                     // The dialog is open: rebuild its report from the new
                     // payload (that is what "Refresh" does, asynchronously).
                     if self.diagnostics.is_some() {
-                        self.refresh_diagnostics();
+                        self.rebuild_diagnostics();
                     }
                 }
                 EngineEvent::Restarted(outcome) => {
@@ -2035,6 +2040,20 @@ impl AppState {
         self.send_command(EngineCommand::Status);
     }
 
+    /// Rebuild the open report from what is already known, **without** asking
+    /// the engine for a status again.
+    ///
+    /// This is what the *answer* to a `Status` command does.  Calling
+    /// [`Self::refresh_diagnostics`] there instead would loop: every answer
+    /// sent a new request, so an open dialog kept the engine thread busy (and
+    /// would now spawn the report's `pw-cat --version` probe) once per frame.
+    fn rebuild_diagnostics(&mut self) {
+        let report = self.collect_report();
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.report = report;
+        }
+    }
+
     /// Close the diagnostics window.
     pub fn close_diagnostics(&mut self) {
         self.diagnostics = None;
@@ -2082,6 +2101,15 @@ impl AppState {
             .as_ref()
             .map(|config| config.path().to_path_buf());
         let status = self.backend_status.clone();
+        // The capture children's own status: without it “every bar reads 0.000”
+        // cannot be told apart from “no `pw-cat`”, “the stream died”, “the blocks
+        // were dropped as unreadable” and “nothing is playing” (see
+        // `diagnostics::CaptureSummary`).
+        let captures = self
+            .bridge
+            .as_ref()
+            .and_then(EngineBridge::capture_registry)
+            .map(crate::diagnostics::CaptureRegistry::summary);
         Report::collect(&Inputs {
             status: status.as_ref(),
             status_error: self.status_error.as_deref(),
@@ -2091,6 +2119,7 @@ impl AppState {
             missing_devices: &missing_devices,
             meter_missing: &meter_missing,
             meter_levels: &meter_levels,
+            captures: captures.as_ref(),
             config_path: config_path.as_deref(),
             now_unix: crate::diagnostics::now_unix(),
             daemon_pids: None,
@@ -2790,28 +2819,62 @@ mod tests {
         path
     }
 
-    /// **The close button closes.**  Qt hid the window when a tray was there,
-    /// and that rule was kept as the default — but on Wayland a client cannot
-    /// hide its own toplevel (`ViewportCommand::Visible(false)` is a no-op), so
-    /// the close request was cancelled and the window stayed: “la croix ne ferme
-    /// plus la fenêtre”.  The default is now `false` (quit); hiding is opt-in via
-    /// `ui_rust.tray_hide_on_close`.
+    /// **The close button hides to the tray** (the user's request: “la croix
+    /// quitte complètement le programme, moi je pensais que ça allait juste
+    /// fermer la fenêtre pour ne laisser que le tray icon”).
+    ///
+    /// The rule is the Qt `closeEvent` one, and it has two halves that must
+    /// never be mixed up:
+    /// * **a tray icon is really there** (`tray::available()`, i.e. a
+    ///   StatusNotifier host owns `org.kde.StatusNotifierWatcher`) → hide;
+    /// * **no tray** → quit, never hide: a hidden window with no icon to bring
+    ///   it back is an unreachable process.
+    ///
+    /// The Wayland trap that made this look broken (`Visible(false)` is a no-op
+    /// on a toplevel) is handled in the shell, not here: `send_visible()` also
+    /// sends `Minimized`.
     #[test]
-    fn the_close_button_quits_by_default_even_with_a_tray() {
+    fn the_close_button_hides_to_the_tray_when_one_is_available() {
         let s = AppState::from_config(scratch_config("close"));
         assert!(
-            !s.tray_hide_on_close,
-            "hide-on-close must be opt-in (a Wayland window cannot be hidden)"
+            s.tray_hide_on_close,
+            "hide-on-close is the default again (the tray keeps the app reachable)"
         );
-        // Whatever `tray::available()` says on this machine, closing quits.
-        assert_eq!(s.close_action(false), crate::tray::CloseAction::Quit);
-        // An explicit quit also quits.
+        // The four combinations, stated once each.
+        assert_eq!(
+            s.close_action(false),
+            crate::tray::close_action_with(false, crate::tray::available(), true)
+        );
+        assert_eq!(
+            crate::tray::close_action_with(false, true, s.tray_hide_on_close),
+            crate::tray::CloseAction::Hide,
+            "a tray + the default preference hides"
+        );
+        assert_eq!(
+            crate::tray::close_action_with(false, false, s.tray_hide_on_close),
+            crate::tray::CloseAction::Quit,
+            "no tray quits, whatever the preference says"
+        );
+        // An explicit quit (the tray's Quit entry) always quits.
         assert_eq!(s.close_action(true), crate::tray::CloseAction::Quit);
-        // The opt-in path still works for whoever wants it (X11 sessions).
-        let mut opt_in = AppState::from_config(scratch_config("close-opt-in"));
-        opt_in.tray_hide_on_close = true;
-        let expected = crate::tray::close_action_with(false, crate::tray::available(), true);
-        assert_eq!(opt_in.close_action(false), expected);
+        // A user who wants the old “close = quit” behaviour sets the key to
+        // false; it is then honoured even with a tray.
+        let mut opt_out = AppState::from_config(scratch_config("close-opt-out"));
+        opt_out.tray_hide_on_close = false;
+        assert_eq!(
+            crate::tray::close_action_with(false, true, opt_out.tray_hide_on_close),
+            crate::tray::CloseAction::Quit
+        );
+        // Absent key → the default (hide), present `false` → quit.
+        let path = scratch_config("close-key");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("ui_rust");
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert!(AppState::from_config(&path).tray_hide_on_close);
+        raw["ui_rust"] = serde_json::json!({"tray_hide_on_close": false});
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert!(!AppState::from_config(&path).tray_hide_on_close);
     }
 
     #[test]
@@ -4127,6 +4190,45 @@ mod tests {
         assert!(report.text().contains("ENGINE"));
         // The report is what "Copy report" puts on the clipboard.
         assert!(report.text().contains("FINDINGS"));
+        s.shutdown();
+    }
+
+    /// The report **always** carries a CAPTURES section, and it says the truth
+    /// for the build it runs in.
+    ///
+    /// This is the section the user will paste to explain “all the VU bars read
+    /// 0.000”: with the mock engine (or no engine at all) there is no `pw-cat`
+    /// child, and the section must say so **without** claiming the metering is
+    /// broken (a `metering_dead` finding here would be a lie).
+    #[test]
+    fn every_report_carries_the_capture_section() {
+        // No engine at all (the demo/snapshot build).
+        let s = state();
+        let report = s.collect_report();
+        let text = report.text();
+        assert!(text.contains("\nCAPTURES"), "{text}");
+        assert!(text.contains("recorder        :"), "{text}");
+        assert!(
+            text.contains("(no capture is running - the engine thread has asked for no source)"),
+            "{text}"
+        );
+        assert!(report.captures.is_empty());
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.id == "metering_dead"),
+            "{:?}",
+            report.findings
+        );
+
+        // The mock engine has no capture child either (`capture_registry()` is
+        // `None`): same section, same absence of a false finding.
+        let mut s = state();
+        s.attach_engine(EngineBridge::spawn_mock());
+        let report = s.collect_report();
+        assert!(report.captures.is_empty());
+        assert!(report.text().contains("\nCAPTURES"));
         s.shutdown();
     }
 

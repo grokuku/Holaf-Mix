@@ -39,13 +39,16 @@
 //! mode (with `fx_host.mode=external` the daemon hosts no chain, so a 0 counter
 //! is normal).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use holaf_core::model::Strip;
 use serde_json::Value;
 
 use crate::engine_json::DeviceInfo;
+use crate::meters::MeterSample;
 
 /// Version of this crate (the "app version" line of the report).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -295,6 +298,62 @@ pub struct EngineFacts {
     pub timing: TimingFacts,
 }
 
+/// Environment variable overriding the recording client (`pw-cat`).
+pub const RECORDER_ENV: &str = "HOLAF_PW_CAT";
+
+/// The recording client the captures spawn when [`RECORDER_ENV`] is unset.
+pub const DEFAULT_RECORDER: &str = "pw-cat";
+
+/// Which recording client the captures really use, as resolved on this machine.
+///
+/// The whole VU chain hangs off one external binary, so a report that does not
+/// say **which** binary — and whether it exists at all — cannot explain a dark
+/// meter.  `path == None` is the “pw-cat is not installed” case (on Arch it
+/// lives in `pipewire-audio`, not in the base `pipewire` package).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecorderProbe {
+    /// `HOLAF_PW_CAT` when it is set (the effective override).
+    pub env_override: Option<String>,
+    /// The command spawned: the override, else [`DEFAULT_RECORDER`].
+    pub command: String,
+    /// Absolute path found in `PATH`; `None` = **not installed**.
+    pub path: Option<String>,
+    /// First line of `<command> --version`, when it could be read.
+    pub version: Option<String>,
+}
+
+impl RecorderProbe {
+    /// `pw-cat → /usr/bin/pw-cat (version 1.6.11)` / `pw-cat → NOT FOUND in
+    /// PATH` — the one line the CAPTURES section opens with.
+    pub fn summary(&self) -> String {
+        let command = if self.command.is_empty() {
+            DEFAULT_RECORDER
+        } else {
+            self.command.as_str()
+        };
+        let mut line = match &self.path {
+            Some(path) => format!("{command} → {path}"),
+            None => format!("{command} → NOT FOUND in PATH"),
+        };
+        if let Some(version) = &self.version {
+            line.push_str(&format!(" (version {version})"));
+        }
+        line.push_str(&format!(
+            " — {RECORDER_ENV} {}",
+            match &self.env_override {
+                Some(value) => format!("={value}"),
+                None => "unset".to_string(),
+            }
+        ));
+        line
+    }
+
+    /// Can a capture possibly start?
+    pub fn found(&self) -> bool {
+        self.path.is_some()
+    }
+}
+
 /// The system section: what the process itself knows (no `pw-dump` here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemFacts {
@@ -305,6 +364,450 @@ pub struct SystemFacts {
     pub config_path: Option<String>,
     /// Live `holafd` processes (from `/proc`), for `multiple_daemons`.
     pub daemon_pids: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Capture status — the VU chain's own health
+// ---------------------------------------------------------------------------
+//
+// The report could say *what* the bars draw but not *why* they draw 0.000: a
+// capture that never spawned (no `pw-cat`), one that died at once, one whose
+// blocks were all dropped as implausible (a stream read with the wrong sample
+// format) and a genuine silence all looked identical in the METERING section —
+// which is exactly the report that came back from the user's machine (“METERING:
+// TOUS les niveaux à 0.000”).
+//
+// So the capture children publish their own state (`crate::capture`) into the
+// shared [`CaptureRegistry`] below, and the report prints it in the CAPTURES
+// section.  Nothing in the VU chain can fail silently any more.
+
+/// How many `pw-cat` stderr lines are kept per capture.
+pub const STDERR_TAIL: usize = 5;
+
+/// Why one capture block was **not** drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RejectReason {
+    /// Decoded to a peak no audio path produces: the stream is not `f32le`.
+    Implausible,
+    /// Fewer bytes than one block arrived before the stream ended.
+    Partial,
+}
+
+impl RejectReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            RejectReason::Implausible => "implausible",
+            RejectReason::Partial => "partial",
+        }
+    }
+}
+
+/// Lifecycle of one capture child, as the report prints it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CaptureState {
+    /// Spawned, not a single block decoded yet.
+    #[default]
+    Waiting,
+    /// At least one block was decoded (and therefore drawn).
+    Streaming,
+    /// The stream ended: the child exited, or closed its stdout.
+    Ended { detail: String },
+    /// The child never started (missing binary, permission, …).
+    Failed { reason: String },
+}
+
+impl CaptureState {
+    pub fn name(&self) -> &'static str {
+        match self {
+            CaptureState::Waiting => "waiting",
+            CaptureState::Streaming => "streaming",
+            CaptureState::Ended { .. } => "ended",
+            CaptureState::Failed { .. } => "failed",
+        }
+    }
+
+    /// Is this capture definitely not feeding its bar any more?
+    pub fn dead(&self) -> bool {
+        matches!(self, CaptureState::Ended { .. } | CaptureState::Failed { .. })
+    }
+
+    /// The reason an ended/failed capture gives (`None` while it runs).
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            CaptureState::Ended { detail } => Some(detail),
+            CaptureState::Failed { reason } => Some(reason),
+            CaptureState::Waiting | CaptureState::Streaming => None,
+        }
+    }
+}
+
+/// One capture child, as the report prints it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureFacts {
+    /// Strip uid the capture feeds.
+    pub uid: String,
+    /// Source the engine named (PulseAudio vocabulary: `<node>.monitor`).
+    pub source: String,
+    /// What `pw-cat --target` really received (the node name).
+    pub target: String,
+    /// Is the target a **sink monitor** (`-P stream.capture.sink=true`)?
+    pub monitor: bool,
+    /// The child's pid, `None` when it never started.
+    pub pid: Option<u32>,
+    pub state: CaptureState,
+    /// Blocks decoded and drawn.
+    pub blocks: u64,
+    /// Blocks refused (see [`RejectReason`]).
+    pub rejected: u64,
+    pub last_rms: Option<[f32; 2]>,
+    pub last_peak: Option<[f32; 2]>,
+    /// Seconds since the last block (`None` = never).
+    pub since_last_block: Option<Duration>,
+    /// The last [`STDERR_TAIL`] non-empty lines the child wrote.
+    pub stderr_tail: Vec<String>,
+    /// Best-effort guess at the real byte format, when its blocks were refused.
+    pub format_guess: Option<String>,
+}
+
+impl CaptureFacts {
+    /// Is this capture gone (spawn failed, or the stream ended)?
+    pub fn dead(&self) -> bool {
+        self.state.dead()
+    }
+
+    /// `pid 42 · streaming · 210 block(s), 0 rejected · last rms 0.0031/0.0030
+    /// peak 0.0044/0.0044 (0.0 s ago)` — one line for the report and the Graph
+    /// tab.
+    pub fn describe(&self) -> String {
+        let pid = self
+            .pid
+            .map(|pid| format!("pid {pid}"))
+            .unwrap_or_else(|| "pid none".to_string());
+        let mut line = format!(
+            "{pid} · {} · {} block(s), {} rejected",
+            self.state.name(),
+            self.blocks,
+            self.rejected
+        );
+        if let (Some(rms), Some(peak)) = (self.last_rms, self.last_peak) {
+            line.push_str(&format!(
+                " · last rms {:.4}/{:.4} peak {:.4}/{:.4}",
+                rms[0], rms[1], peak[0], peak[1]
+            ));
+        }
+        if let Some(since) = self.since_last_block {
+            line.push_str(&format!(" ({:.1} s ago)", since.as_secs_f32()));
+        } else {
+            line.push_str(" (no block yet)");
+        }
+        if let Some(detail) = self.state.detail() {
+            line.push_str(&format!(" — {detail}"));
+        }
+        if let Some(guess) = &self.format_guess {
+            line.push_str(&format!(" — the bytes look like {guess}"));
+        }
+        line
+    }
+}
+
+/// Snapshot of every capture, for [`Report::captures`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CaptureSummary {
+    /// The recording client the captures spawn (`HOLAF_PW_CAT` or `pw-cat`).
+    pub recorder: String,
+    /// Blocks decoded **and drawn** since start-up.
+    pub blocks: u64,
+    /// Blocks refused since start-up.
+    pub rejected: u64,
+    /// `reason → count` (see [`RejectReason`]).
+    pub rejects: BTreeMap<String, u64>,
+    /// One entry per strip the engine asked for, sorted by uid.
+    pub sources: Vec<CaptureFacts>,
+}
+
+impl CaptureSummary {
+    /// No capture was ever asked for (no engine, no source, mock build).
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    /// Every capture is gone: failed to spawn, or its stream ended.
+    pub fn all_dead(&self) -> bool {
+        !self.sources.is_empty() && self.sources.iter().all(CaptureFacts::dead)
+    }
+
+    /// **No byte ever arrived**: not one block was decoded, and not one was
+    /// refused either.  That is the dead-chain case (no `pw-cat`, a refused
+    /// target, a stream that never opens) — a silent source still delivers
+    /// blocks (all zeros), and a *refused* block proves the recorder did write
+    /// something (a format mismatch, reported by `metering_implausible`).
+    pub fn never_streamed(&self) -> bool {
+        !self.sources.is_empty() && self.blocks == 0 && self.rejected == 0
+    }
+
+    /// How many captures are in `state` (`CaptureState::name`).
+    pub fn count(&self, state: &str) -> usize {
+        self.sources
+            .iter()
+            .filter(|facts| facts.state.name() == state)
+            .count()
+    }
+
+    /// Blocks refused for `reason`.
+    pub fn rejects_of(&self, reason: RejectReason) -> u64 {
+        self.rejects.get(reason.name()).copied().unwrap_or(0)
+    }
+
+    /// The capture that best explains a failure (a failed spawn first, then an
+    /// ended stream), for a finding's hint.
+    pub fn first_failure(&self) -> Option<&CaptureFacts> {
+        self.sources
+            .iter()
+            .find(|facts| matches!(facts.state, CaptureState::Failed { .. }))
+            .or_else(|| {
+                self.sources
+                    .iter()
+                    .find(|facts| matches!(facts.state, CaptureState::Ended { .. }))
+            })
+    }
+}
+
+/// The registry the capture children write into and the report reads.
+///
+/// Cheap to clone (`Arc`), never blocks the audio path for long (one `Mutex`
+/// held for a few field writes per block, no I/O under it) and independent of
+/// the `engine-pw` feature, so the report can hold an empty one when the build
+/// has no real engine.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureRegistry {
+    inner: Arc<Mutex<CaptureInner>>,
+}
+
+#[derive(Debug, Default)]
+struct CaptureInner {
+    recorder: String,
+    blocks: u64,
+    rejected: u64,
+    rejects: BTreeMap<String, u64>,
+    sources: BTreeMap<String, CaptureEntry>,
+}
+
+#[derive(Debug)]
+struct CaptureEntry {
+    facts: CaptureFacts,
+    /// When the last block arrived (`CaptureFacts` keeps the age, not the
+    /// instant, so the snapshot stays a plain value).
+    last_block_at: Option<Instant>,
+}
+
+impl CaptureRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Which command the captures spawn (recorded once, for the report).
+    pub fn set_recorder(&self, recorder: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.recorder = recorder.to_string();
+        }
+    }
+
+    pub fn recorder(&self) -> String {
+        self.inner
+            .lock()
+            .map(|inner| inner.recorder.clone())
+            .unwrap_or_default()
+    }
+
+    /// A capture child was spawned and is waiting for its first block.
+    pub fn started(
+        &self,
+        uid: &str,
+        source: &str,
+        target: &str,
+        monitor: bool,
+        pid: Option<u32>,
+    ) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.sources.insert(
+            uid.to_string(),
+            CaptureEntry {
+                facts: CaptureFacts {
+                    uid: uid.to_string(),
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    monitor,
+                    pid,
+                    state: CaptureState::Waiting,
+                    blocks: 0,
+                    rejected: 0,
+                    last_rms: None,
+                    last_peak: None,
+                    since_last_block: None,
+                    stderr_tail: Vec::new(),
+                    format_guess: None,
+                },
+                last_block_at: None,
+            },
+        );
+    }
+
+    /// The child could not be spawned at all (missing `pw-cat`, permission…).
+    ///
+    /// Its entry stays in the registry: `warned` in the capture stops the retry
+    /// loop, and this is the only place a user can see *why* the bar is dark.
+    pub fn spawn_failed(
+        &self,
+        uid: &str,
+        source: &str,
+        target: &str,
+        monitor: bool,
+        reason: &str,
+    ) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.sources.insert(
+            uid.to_string(),
+            CaptureEntry {
+                facts: CaptureFacts {
+                    uid: uid.to_string(),
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    monitor,
+                    pid: None,
+                    state: CaptureState::Failed {
+                        reason: reason.to_string(),
+                    },
+                    blocks: 0,
+                    rejected: 0,
+                    last_rms: None,
+                    last_peak: None,
+                    since_last_block: None,
+                    stderr_tail: Vec::new(),
+                    format_guess: None,
+                },
+                last_block_at: None,
+            },
+        );
+    }
+
+    /// One block was decoded **and drawn**.
+    pub fn block(&self, uid: &str, sample: &MeterSample) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.blocks += 1;
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            entry.facts.blocks += 1;
+            entry.facts.state = CaptureState::Streaming;
+            entry.facts.last_rms = Some(sample.rms);
+            entry.facts.last_peak = Some(sample.peak);
+            entry.last_block_at = Some(Instant::now());
+        }
+    }
+
+    /// One block was refused (see [`RejectReason`]).
+    ///
+    /// `format_guess` is only computed once per capture (`crate::capture`), so a
+    /// `None` must not erase the guess already recorded.
+    pub fn reject(&self, uid: &str, reason: RejectReason, format_guess: Option<String>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.rejected += 1;
+        *inner.rejects.entry(reason.name().to_string()).or_default() += 1;
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            entry.facts.rejected += 1;
+            if format_guess.is_some() {
+                entry.facts.format_guess = format_guess;
+            }
+        }
+    }
+
+    /// A line the child wrote on stderr (the last [`STDERR_TAIL`] are kept).
+    pub fn push_stderr(&self, uid: &str, line: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            entry.facts.stderr_tail.push(line.to_string());
+            let excess = entry.facts.stderr_tail.len().saturating_sub(STDERR_TAIL);
+            if excess > 0 {
+                entry.facts.stderr_tail.drain(..excess);
+            }
+        }
+    }
+
+    /// The child's stdout ended.
+    pub fn ended(&self, uid: &str, detail: impl Into<String>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            if !matches!(entry.facts.state, CaptureState::Failed { .. }) {
+                entry.facts.state = CaptureState::Ended {
+                    detail: detail.into(),
+                };
+            }
+        }
+    }
+
+    /// The child was reaped (`try_wait` on a snapshot): its exit code is more
+    /// precise than “stdout closed”, so it replaces the ended detail.
+    pub fn exited(&self, uid: &str, code: Option<i32>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            if matches!(entry.facts.state, CaptureState::Failed { .. }) {
+                return;
+            }
+            entry.facts.state = CaptureState::Ended {
+                detail: match code {
+                    Some(code) => format!("the process exited with code {code}"),
+                    None => "the process was killed by a signal".to_string(),
+                },
+            };
+        }
+    }
+
+    /// The capture was stopped on purpose (strip removed, source changed,
+    /// engine restart): the entry goes away, so a stale status cannot describe
+    /// a graph it no longer belongs to.
+    pub fn stopped(&self, uid: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sources.remove(uid);
+        }
+    }
+
+    /// Everything, as a plain value (the report never holds the mutex).
+    pub fn summary(&self) -> CaptureSummary {
+        let Ok(inner) = self.inner.lock() else {
+            return CaptureSummary::default();
+        };
+        let now = Instant::now();
+        let sources = inner
+            .sources
+            .values()
+            .map(|entry| {
+                let mut facts = entry.facts.clone();
+                facts.since_last_block = entry
+                    .last_block_at
+                    .map(|at| now.saturating_duration_since(at));
+                facts
+            })
+            .collect();
+        CaptureSummary {
+            recorder: inner.recorder.clone(),
+            blocks: inner.blocks,
+            rejected: inner.rejected,
+            rejects: inner.rejects.clone(),
+            sources,
+        }
+    }
 }
 
 /// One collected report.
@@ -327,6 +830,11 @@ pub struct Report {
     /// cannot be told apart from “the levels never arrive”.  It is the *drawn*
     /// value — envelope included — so it is exactly what is on screen.
     pub meter_levels: Vec<(String, String, [f32; 2])>,
+    /// The capture children themselves: source, pid, state, blocks, rejects,
+    /// last level and what `pw-cat` said on stderr (see [`CaptureSummary`]).
+    pub captures: CaptureSummary,
+    /// Which recorder the captures spawn, resolved on this machine.
+    pub recorder: RecorderProbe,
     pub system: SystemFacts,
     pub findings: Vec<Finding>,
 }
@@ -399,6 +907,9 @@ pub struct Inputs<'a> {
     /// `(uid, label, [left, right])` the VU bars currently draw (see
     /// [`Report::meter_levels`]).
     pub meter_levels: &'a [(String, String, [f32; 2])],
+    /// The capture children's own status (`None` = no capture instrumentation:
+    /// a mock build, or no real engine attached).
+    pub captures: Option<&'a CaptureSummary>,
     pub config_path: Option<&'a Path>,
     /// Unix seconds; `0` means "now" (a test fixes it instead).
     pub now_unix: u64,
@@ -418,6 +929,7 @@ impl<'a> Inputs<'a> {
             missing_devices: &[],
             meter_missing: &[],
             meter_levels: &[],
+            captures: None,
             config_path: None,
             now_unix: 0,
             daemon_pids: Some(Vec::new()),
@@ -440,6 +952,8 @@ impl Report {
             missing_devices: inputs.missing_devices.to_vec(),
             meter_missing: inputs.meter_missing.to_vec(),
             meter_levels: inputs.meter_levels.to_vec(),
+            captures: inputs.captures.cloned().unwrap_or_default(),
+            recorder: recorder_probe(),
             system: SystemFacts {
                 app_version: APP_VERSION.to_string(),
                 app_pid: std::process::id(),
@@ -820,6 +1334,116 @@ impl Report {
             );
         }
 
+        // --- the capture chain itself -----------------------------------------
+        //
+        // The METERING section says what the bars draw; these rules say **why**
+        // they draw nothing.  Without them a `pw-cat` that never started, one
+        // that died at once, a stream read with the wrong sample format and a
+        // genuinely silent bus produced the same report — the user's “METERING:
+        // TOUS les niveaux à 0.000”, which named no cause at all.
+        let captures = &self.captures;
+        if captures.never_streamed() {
+            let failed = captures.count("failed");
+            let ended = captures.count("ended");
+            let waiting = captures.count("waiting");
+            let total = captures.sources.len();
+            let message = format!(
+                "not one meter block was recorded for {total} source(s): every VU bar can only \
+                 read 0.000 ({failed} capture(s) failed to start, {ended} ended, {waiting} running \
+                 without data)"
+            );
+            // The hint names the *probable* cause, chosen from what the captures
+            // themselves reported: this is the line the user acts on.
+            let hint = if failed == total {
+                format!(
+                    "`{}` could not be started{}: install it (on Arch `pw-cat` ships with \
+                     `pipewire-audio`) or point {RECORDER_ENV} at a working pw-cat",
+                    self.recorder.command,
+                    captures
+                        .first_failure()
+                        .and_then(|facts| facts.state.detail())
+                        .map(|detail| format!(" ({detail})"))
+                        .unwrap_or_default()
+                )
+            } else if ended == total {
+                format!(
+                    "every capture ended as soon as it started — {}: run `{} --record --target \
+                     <node> -P '{{\"stream.capture.sink\":true}}' --format f32 -` by hand to see \
+                     what it says",
+                    captures
+                        .first_failure()
+                        .and_then(|facts| facts.state.detail())
+                        .unwrap_or("no reason given"),
+                    self.recorder.command
+                )
+            } else {
+                format!(
+                    "the captures are running but their stdout stays empty: check that the \
+                     target node exists (`pw-cli ls Node`) and that `{}` writes f32le (a WAV \
+                     header or another sample format would be counted as “partial” blocks)",
+                    self.recorder.command
+                )
+            };
+            findings.push(
+                Finding::new("metering_dead", Severity::Error, message).with_hint(hint),
+            );
+        }
+
+        // A block whose f32 reading is impossible is a **format** mismatch, not
+        // silence: name the format the bytes really look like.
+        let implausible = captures.rejects_of(RejectReason::Implausible);
+        if implausible > 0 {
+            let guess = captures
+                .sources
+                .iter()
+                .find_map(|facts| facts.format_guess.clone());
+            let mut message = format!(
+                "{implausible} metering block(s) were dropped as impossible (peak above +{:.0} \
+                 dBFS): `{}` is not writing f32le to stdout",
+                crate::meters::amplitude_to_db(crate::meters::IMPLAUSIBLE_PEAK),
+                self.recorder.command
+            );
+            if let Some(guess) = guess {
+                message.push_str(&format!(" — the bytes look like {guess}"));
+            }
+            findings.push(
+                Finding::new("metering_implausible", Severity::Error, message).with_hint(
+                    "the bars stay dark instead of pinning at full scale (that was the honest \
+                     choice); run the recorder by hand and check the sample format it really \
+                     writes — or set the recorder to a wrapper that emits f32le",
+                ),
+            );
+        }
+
+        // Blocks arrive, but every bar reads zero: the chain works and the
+        // *material* is silent (muted strips, zero faders, or a captured node
+        // that carries no signal).  An info, because it is often intentional —
+        // but it is the difference between “dead chain” and “nothing playing”.
+        if captures.blocks > 0
+            && !drawn.is_empty()
+            && drawn
+                .iter()
+                .all(|(_, _, [left, right])| *left == 0.0 && *right == 0.0)
+        {
+            findings.push(
+                Finding::new(
+                    "metering_silent",
+                    Severity::Info,
+                    format!(
+                        "the {} capture(s) do receive blocks ({} decoded) but every VU bar reads \
+                         0.000: the recorded buses carry silence right now",
+                        captures.sources.len(),
+                        captures.blocks
+                    ),
+                )
+                .with_hint(
+                    "strips muted or faders at zero, or the captured node carries no signal \
+                     (an FX-chain output instead of the bus monitor) — play something with the \
+                     strips unmuted before calling the metering broken",
+                ),
+            );
+        }
+
         // --- clock / processing errors (the crackle signature) ----------------
         //
         // Port of the Python §6 rules, fed by `status.timing` instead of a
@@ -1110,6 +1734,64 @@ impl Report {
                 crate::meters::level_from_amplitude(1.0),
                 crate::meters::OVERLOAD_HEADROOM_DB
             ));
+        }
+        lines.push(String::new());
+
+        // CAPTURES — the VU chain's own health.  The METERING section above says
+        // what is drawn; this one says whether the recorder runs at all, how many
+        // blocks it delivered, and what it said on stderr.  A report without it
+        // cannot explain a bar at 0.000 (nor a bar pinned at 1.000).
+        lines.push("CAPTURES".to_string());
+        lines.push(format!("  recorder        : {}", self.recorder.summary()));
+        if self.captures.is_empty() {
+            lines.push("  (no capture is running - the engine thread has asked for no source)".to_string());
+        } else {
+            let rejects = if self.captures.rejects.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    self.captures
+                        .rejects
+                        .iter()
+                        .map(|(reason, count)| format!("{count} {reason}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            lines.push(format!(
+                "  blocks          : {} accepted, {} rejected{rejects}",
+                self.captures.blocks, self.captures.rejected
+            ));
+            lines.push(format!("  sources ({}):", self.captures.sources.len()));
+            for facts in &self.captures.sources {
+                // The label comes from the engine's strip list (the uid is what
+                // the capture is keyed by); a strip the engine no longer shows
+                // keeps its uid, which is what a bug report needs anyway.
+                let label = self
+                    .engine
+                    .strips
+                    .iter()
+                    .find(|strip| strip.uid == facts.uid)
+                    .map(|strip| strip.label.as_str())
+                    .unwrap_or(&facts.uid);
+                lines.push(format!(
+                    "    - {:<24} uid={} source={} -> target {} ({})",
+                    label,
+                    facts.uid,
+                    facts.source,
+                    facts.target,
+                    if facts.monitor {
+                        "sink monitor"
+                    } else {
+                        "capture node"
+                    }
+                ));
+                lines.push(format!("        {}", facts.describe()));
+                for line in &facts.stderr_tail {
+                    lines.push(format!("        stderr: {line}"));
+                }
+            }
         }
         lines.push(String::new());
 
@@ -1439,6 +2121,93 @@ fn timing_facts(value: Option<&Value>) -> TimingFacts {
     }
 }
 
+/// The recording client the captures spawn: `HOLAF_PW_CAT`, else `pw-cat`.
+///
+/// A single place, because three modules need the same answer: the capture
+/// (`crate::capture`), the report and the tests.
+pub fn default_recorder() -> String {
+    std::env::var(RECORDER_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_RECORDER.to_string())
+}
+
+/// Is this path an executable file (a `which`-like check)?
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve `command` the way `execvp` does: a path with a `/` is used as is,
+/// a bare name is searched in `PATH`.
+pub fn resolve_in_path(command: &str) -> Option<std::path::PathBuf> {
+    if command.is_empty() {
+        return None;
+    }
+    if command.contains('/') {
+        let path = Path::new(command);
+        return is_executable(path).then(|| path.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// The recorder, its resolved path and its version — see [`RecorderProbe`].
+///
+/// Spawns one short process (`<recorder> --version`) when the binary exists; a
+/// failure is `None`, never an error (the version line is a convenience, the
+/// missing path is the diagnosis).
+pub fn recorder_probe() -> RecorderProbe {
+    let env_override = std::env::var(RECORDER_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let command = env_override
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RECORDER.to_string());
+    let path = resolve_in_path(&command);
+    let version = path.as_ref().and_then(|_| recorder_version(&command));
+    RecorderProbe {
+        env_override,
+        command,
+        path: path.map(|path| path.display().to_string()),
+        version,
+    }
+}
+
+/// First line of `<command> --version`, when the tool answers and succeeds.
+fn recorder_version(command: &str) -> Option<String> {
+    let output = std::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// `pkg-config --modversion libpipewire-0.3`, when the tool exists.
 ///
 /// Spawning a process from a "pure" report is not free, so it is done once per
@@ -1642,6 +2411,402 @@ mod tests {
             "{}",
             empty.text()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // CAPTURES: the VU chain's own health
+    // -----------------------------------------------------------------
+
+    /// One capture as the report sees it.
+    fn capture_facts(uid: &str, source: &str, state: CaptureState, blocks: u64) -> CaptureFacts {
+        CaptureFacts {
+            uid: uid.to_string(),
+            source: source.to_string(),
+            target: source.trim_end_matches(".monitor").to_string(),
+            monitor: source.ends_with(".monitor"),
+            pid: Some(4242),
+            state,
+            blocks,
+            rejected: 0,
+            last_rms: (blocks > 0).then_some([0.0031, 0.0030]),
+            last_peak: (blocks > 0).then_some([0.0044, 0.0044]),
+            since_last_block: (blocks > 0).then(|| std::time::Duration::from_millis(20)),
+            stderr_tail: Vec::new(),
+            format_guess: None,
+        }
+    }
+
+    fn summary_of(sources: Vec<CaptureFacts>) -> CaptureSummary {
+        let blocks = sources.iter().map(|facts| facts.blocks).sum();
+        let rejected = sources.iter().map(|facts| facts.rejected).sum();
+        CaptureSummary {
+            recorder: "pw-cat".to_string(),
+            blocks,
+            rejected,
+            rejects: BTreeMap::new(),
+            sources,
+        }
+    }
+
+    fn report_with_captures(captures: &CaptureSummary) -> Report {
+        let status = healthy_status();
+        let strips = strips();
+        let levels = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [0.0_f32, 0.0]),
+            ("out-casque".to_string(), "Casque".to_string(), [0.0, 0.0]),
+        ];
+        Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &levels,
+            captures: Some(captures),
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        })
+    }
+
+    /// **The user's report**: every bar at 0.000, and no way to tell “no
+    /// `pw-cat`” from “the stream died” or “nothing is playing”.  The capture
+    /// facts turn that into one error finding that names the cause.
+    #[test]
+    fn a_capture_chain_that_never_delivered_a_block_is_an_error() {
+        // (a) `pw-cat` is not installed: every spawn failed.
+        let mut missing = capture_facts(
+            "in-mic",
+            "Holaf_Bus_Mic.monitor",
+            CaptureState::Failed {
+                reason: "pw-cat: No such file or directory (os error 2)".to_string(),
+            },
+            0,
+        );
+        missing.pid = None;
+        let mut other = missing.clone();
+        other.uid = "out-casque".to_string();
+        other.source = "alsa_output.usb.analog-stereo.monitor".to_string();
+        let captures = summary_of(vec![missing.clone(), other]);
+        assert!(captures.never_streamed() && captures.all_dead());
+
+        let report = report_with_captures(&captures);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_dead")
+            .unwrap_or_else(|| panic!("no metering_dead in {:?}", report.findings));
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("0.000"), "{}", finding.message);
+        assert!(finding.message.contains("2 capture(s) failed"), "{}", finding.message);
+        let hint = finding.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("`pw-cat` could not be started"), "{hint}");
+        assert!(hint.contains("No such file"), "{hint}");
+        assert!(hint.contains(RECORDER_ENV) && hint.contains("pipewire-audio"), "{hint}");
+
+        // (b) every capture ended at once (a refused `--target`).
+        let mut ended = capture_facts(
+            "in-mic",
+            "Holaf_Bus_Mic.monitor",
+            CaptureState::Ended {
+                detail: "the process exited with code 1".to_string(),
+            },
+            0,
+        );
+        ended.stderr_tail = vec!["stream refused by the session manager".to_string()];
+        let report = report_with_captures(&summary_of(vec![ended]));
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_dead")
+            .expect("metering_dead");
+        let hint = finding.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("ended as soon as it started"), "{hint}");
+        assert!(hint.contains("code 1"), "{hint}");
+
+        // (c) the captures run but nothing arrives on stdout.
+        let running = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Waiting, 0);
+        let report = report_with_captures(&summary_of(vec![running]));
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_dead")
+            .expect("metering_dead");
+        assert!(
+            finding
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stdout stays empty"),
+            "{:?}",
+            finding.hint
+        );
+
+        // A stream that delivers blocks is NOT this finding — even silent ones
+        // (otherwise “the strips are muted” would read as a broken meter).
+        let streaming = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 42);
+        let report = report_with_captures(&summary_of(vec![streaming]));
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.id == "metering_dead"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// A refused block (peak over +40 dBFS) is a **format** mismatch, and the
+    /// report names the format the bytes really look like instead of leaving a
+    /// dark bar with no explanation.
+    #[test]
+    fn refused_blocks_name_the_format_the_recorder_really_writes() {
+        let mut facts = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Waiting, 0);
+        facts.rejected = 210;
+        facts.format_guess = Some("s16le (peak 0.750)".to_string());
+        let mut captures = summary_of(vec![facts]);
+        captures.rejected = 210;
+        captures.rejects.insert("implausible".to_string(), 210);
+        assert_eq!(captures.rejects_of(RejectReason::Implausible), 210);
+
+        let report = report_with_captures(&captures);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_implausible")
+            .unwrap_or_else(|| panic!("no metering_implausible in {:?}", report.findings));
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(finding.message.contains("210 metering block(s)"), "{}", finding.message);
+        assert!(finding.message.contains("+40 dBFS"), "{}", finding.message);
+        assert!(finding.message.contains("s16le"), "{}", finding.message);
+        assert!(
+            finding.message.contains("not writing f32le"),
+            "{}",
+            finding.message
+        );
+        // It does not claim the chain is dead: blocks *are* arriving.
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.id == "metering_dead"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Silent-but-alive is not a failure: blocks arrive and every bar reads
+    /// zero because nothing is playing (or the strips are muted).  It is an
+    /// **info**, the one that separates “dead chain” from “quiet material”.
+    #[test]
+    fn a_live_but_silent_capture_is_only_an_info() {
+        let streaming = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 300);
+        let report = report_with_captures(&summary_of(vec![streaming]));
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_silent")
+            .unwrap_or_else(|| panic!("no metering_silent in {:?}", report.findings));
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(finding.message.contains("300 decoded"), "{}", finding.message);
+        assert_eq!(report.errors(), 0, "{:?}", report.findings);
+
+        // Blocks + a moving bar: nothing to say.
+        let status = healthy_status();
+        let strips = strips();
+        let levels = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [0.73_f32, 0.70]),
+            ("out-casque".to_string(), "Casque".to_string(), [0.66, 0.65]),
+        ];
+        let streaming = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 300);
+        let captures = summary_of(vec![streaming]);
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &levels,
+            captures: Some(&captures),
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.id == "metering_silent"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// The CAPTURES section must be **self-explanatory**: which recorder, whether
+    /// it exists, what each capture targets, its pid/state/blocks and what
+    /// `pw-cat` said.  It is the section the user will paste.
+    #[test]
+    fn the_captures_section_names_the_recorder_and_every_source() {
+        let mut facts = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 210);
+        facts.stderr_tail = vec!["cannot open the target Holaf_Bus_Mic".to_string()];
+        let mut ended = capture_facts(
+            "out-casque",
+            "alsa_output.usb-PreSonus.analog.monitor",
+            CaptureState::Ended {
+                detail: "the process exited with code 2".to_string(),
+            },
+            0,
+        );
+        ended.pid = None;
+        let mut captures = summary_of(vec![facts, ended]);
+        captures.rejects.insert("partial".to_string(), 3);
+        captures.rejected = 3;
+        let report = report_with_captures(&captures);
+        let text = report.text();
+
+        let captures_at = text.find("\nCAPTURES").unwrap_or_else(|| panic!("{text}"));
+        let devices_at = text.find("\nDEVICES").expect("a DEVICES section");
+        assert!(captures_at < devices_at, "CAPTURES sits before DEVICES");
+
+        // The recorder line: the command, its resolved path and the env var.
+        assert!(text.contains("recorder        : pw-cat →"), "{text}");
+        assert!(text.contains(RECORDER_ENV), "{text}");
+        // Global counters, with the reject reason spelled out.
+        assert!(text.contains("210 accepted, 3 rejected (3 partial)"), "{text}");
+        // Per capture: the source, the node given to `--target`, the pid and the
+        // state, and the stderr tail.
+        assert!(
+            text.contains("source=Holaf_Bus_Mic.monitor -> target Holaf_Bus_Mic (sink monitor)"),
+            "{text}"
+        );
+        assert!(text.contains("uid=in-mic"), "{text}");
+        assert!(text.contains("pid 4242 · streaming · 210 block(s), 0 rejected"), "{text}");
+        assert!(text.contains("last rms 0.0031/0.0030"), "{text}");
+        assert!(text.contains("stderr: cannot open the target Holaf_Bus_Mic"), "{text}");
+        assert!(text.contains("pid none · ended · 0 block(s), 0 rejected"), "{text}");
+        assert!(text.contains("the process exited with code 2"), "{text}");
+        // The label of the strip comes from the engine list, not from the uid.
+        assert!(text.contains("Mic ") && text.contains("Casque"), "{text}");
+
+        // No capture at all: the section says so instead of reading like a
+        // truncated report.
+        let empty = Report::collect(&Inputs::empty(&[]));
+        assert!(
+            empty
+                .text()
+                .contains("(no capture is running - the engine thread has asked for no source)"),
+            "{}",
+            empty.text()
+        );
+    }
+
+    /// The registry is what makes the engine thread's captures visible to the UI
+    /// thread: the same facts, in the order the strips were assigned.
+    #[test]
+    fn the_capture_registry_snapshots_what_the_children_report() {
+        let registry = CaptureRegistry::new();
+        registry.set_recorder("pw-cat");
+        assert_eq!(registry.recorder(), "pw-cat");
+        registry.started("in-mic", "Holaf_Bus_Mic.monitor", "Holaf_Bus_Mic", true, Some(77));
+        registry.started("out-casque", "alsa_input.x", "alsa_input.x", false, Some(78));
+        // A block on one of them, a refused block on the other.
+        registry.block(
+            "in-mic",
+            &crate::meters::analyse_block(&[0.5_f32, -0.5, 0.5, -0.5], 2),
+        );
+        registry.reject("out-casque", RejectReason::Implausible, Some("s16le".to_string()));
+        registry.reject("out-casque", RejectReason::Implausible, None);
+        registry.push_stderr("out-casque", "boom");
+
+        let summary = registry.summary();
+        assert_eq!(summary.recorder, "pw-cat");
+        assert_eq!(summary.blocks, 1);
+        assert_eq!(summary.rejected, 2);
+        assert_eq!(summary.rejects_of(RejectReason::Implausible), 2);
+        assert_eq!(summary.sources.len(), 2);
+        // Sorted by uid, so the report is diffable between two runs.
+        assert!(summary.sources.windows(2).all(|pair| pair[0].uid < pair[1].uid));
+        let mic = summary
+            .sources
+            .iter()
+            .find(|facts| facts.uid == "in-mic")
+            .expect("in-mic");
+        assert_eq!(mic.state, CaptureState::Streaming);
+        assert_eq!(mic.pid, Some(77));
+        assert_eq!(mic.blocks, 1);
+        assert!(mic.since_last_block.is_some());
+        let casque = summary
+            .sources
+            .iter()
+            .find(|facts| facts.uid == "out-casque")
+            .expect("out-casque");
+        // A refused block does not make it "streaming" (nothing was drawn) — but
+        // it does prove the recorder wrote bytes, which is why a format
+        // mismatch is `metering_implausible` and not `metering_dead`.
+        assert_eq!(casque.state, CaptureState::Waiting);
+        assert_eq!(casque.rejected, 2);
+        assert_eq!(casque.format_guess.as_deref(), Some("s16le"), "the first guess wins");
+        assert_eq!(casque.stderr_tail, vec!["boom".to_string()]);
+
+        // Ended / exited / stopped are reflected, and a stopped capture leaves
+        // no stale entry behind.
+        registry.ended("in-mic", "the recorder closed its stdout");
+        let state = |uid: &str| {
+            registry
+                .summary()
+                .sources
+                .into_iter()
+                .find(|facts| facts.uid == uid)
+                .map(|facts| facts.state)
+        };
+        assert!(matches!(state("in-mic"), Some(CaptureState::Ended { .. })));
+        registry.exited("in-mic", Some(3));
+        assert_eq!(
+            state("in-mic"),
+            Some(CaptureState::Ended {
+                detail: "the process exited with code 3".to_string()
+            })
+        );
+        registry.spawn_failed("new", "source.x", "source.x", false, "ENOENT");
+        let summary = registry.summary();
+        assert_eq!(summary.count("failed"), 1);
+        assert!(summary.first_failure().is_some());
+        registry.stopped("in-mic");
+        assert_eq!(registry.summary().sources.len(), 2);
+        assert!(!registry.summary().sources.iter().any(|f| f.uid == "in-mic"));
+
+        // The stderr tail is bounded (a chatty pw-cat must not grow the report).
+        for index in 0..(STDERR_TAIL + 4) {
+            registry.push_stderr("new", &format!("line {index}"));
+        }
+        let tail = registry
+            .summary()
+            .sources
+            .into_iter()
+            .find(|facts| facts.uid == "new")
+            .expect("new")
+            .stderr_tail;
+        assert_eq!(tail.len(), STDERR_TAIL);
+        assert_eq!(tail.last().map(String::as_str), Some("line 8"));
+    }
+
+    /// The recorder probe must never panic and must answer the two questions a
+    /// dark meter raises: *which* binary, and does it exist?
+    #[test]
+    fn the_recorder_probe_resolves_the_command_and_its_path() {
+        // A command that certainly exists (the test binary's own executable).
+        let me = std::env::current_exe().expect("the test executable");
+        assert_eq!(resolve_in_path(&me.display().to_string()), Some(me.clone()));
+        // A bare name is looked up in PATH; `sh` is on every Unix.
+        let sh = resolve_in_path("sh").expect("sh in PATH");
+        assert!(sh.is_absolute());
+        // A name nobody has, and the empty string.
+        assert_eq!(resolve_in_path("holaf-no-such-recorder"), None);
+        assert_eq!(resolve_in_path(""), None);
+
+        let probe = recorder_probe();
+        assert!(!probe.command.is_empty());
+        assert_eq!(probe.command, default_recorder());
+        let line = probe.summary();
+        assert!(line.contains(&probe.command), "{line}");
+        assert!(line.contains(RECORDER_ENV), "{line}");
+        if probe.found() {
+            assert!(line.contains("→"), "{line}");
+        } else {
+            assert!(line.contains("NOT FOUND in PATH"), "{line}");
+        }
     }
 
     /// **Every bar glued at the top** is a diagnosis, not a mix: it means at
