@@ -57,6 +57,7 @@ mêmes arguments (`--config`, `--midi`, `--midi-list`, `--always-on-top`).
 
 ```bash
 # build de dev : publie dist/{holaf-ui,holafd,holafctl}
+# (installation normale : télécharger l'artefact de la CI, voir §Installation)
 ./scripts/build_rust.sh
 python main.py                     # → UI Rust (défaut)
 ```
@@ -86,29 +87,67 @@ Python dans [`docs/migration-to-pure-rust.md`](docs/migration-to-pure-rust.md).
 
 ## Installation
 
-**Note**: This assumes you are on Linux and have **PipeWire** installed and active.
+**Note** : suppose Linux avec **PipeWire** installé et actif.
 
-1.  **Clone the repository**:
+### Chemin normal — télécharger le build de la CI (aucune compilation)
+
+> Si vous lisez ce fichier **depuis le tarball**, les étapes 1 et 2 sont déjà
+> faites : passez à l'étape 3.
+
+1.  **Télécharger l'artefact** : GitHub → **Actions** → workflow
+    **Build Holaf-Mix** → le run du commit voulu → **Artifacts** →
+    `holaf-mix-<sha>-<arch>`.  Il contient
+    `holaf-mix-<version>-<arch>.tar.gz` (le lanceur avec `holaf-ui`, `holafd` et
+    `holafctl` embarqués) et `SHA256SUMS`.
+2.  **Installer les dépendances runtime** — c'est tout ce que le binaire
+    demande, rien n'est à compiler :
+    ```bash
+    # Arch / CachyOS
+    sudo pacman -S pipewire pipewire-audio pipewire-pulse wireplumber libpulse \
+                   alsa-lib swh-plugins
+    # Debian / Ubuntu
+    sudo apt install pipewire pipewire-bin pipewire-pulse wireplumber \
+                     pulseaudio-utils libasound2 swh-plugins tap-plugins
+    # Arch, only for the TUBE WARMTH strip (AUR-only on Arch):
+    yay -S tap-plugins
+    # No GTK3/appindicator package: the tray icon is a D-Bus
+    # StatusNotifierItem (see docs/dependency-audit.md).
+    ```
+3.  **Décompresser et lancer** :
+    ```bash
+    tar xzf holaf-mix-<version>-<arch>.tar.gz -C ~/apps/
+    ~/apps/holaf-mix-<version>/holaf-mix
+    ```
+
+Le détail (contenu du tarball, `SHA256SUMS`, installation dans
+`/usr/local/bin` + entrée de menu, dépendances optionnelles, dépannage) est dans
+[`BUILD.md`](BUILD.md) §1 et §3.  `packaging/PKGBUILD` reste disponible comme
+**option de distribution Arch** maintenue (paquet géré par `pacman`) : ce n'est
+pas le chemin par lequel l'application est livrée, qui passe par les artefacts
+ci-dessus — voir `BUILD.md` §4.
+
+### Depuis les sources (développement)
+
+1.  **Cloner le dépôt** :
     ```bash
     git clone https://github.com/your-username/holaf-mix.git
     cd holaf-mix
     ```
 
-2.  **Install dependencies**:
+2.  **Installer les dépendances** :
     ```bash
     pip install -r requirements.txt
     ```
-    The Rust UI and daemon also need a Rust toolchain (and the PipeWire dev
-    headers for `bindgen`) — or use a packaged build, which embeds all three
-    binaries:
+    La compilation depuis les sources demande en plus un toolchain Rust (et les
+    en-têtes PipeWire pour `bindgen`) :
     ```bash
-    ./build.sh --tarball        # builds holaf-ui + holafd + the PyInstaller bundle
+    ./build.sh --tarball        # construit holaf-ui + holafd + le bundle PyInstaller
     ```
 
-3.  **Run the application**:
+3.  **Lancer l'application** :
     ```bash
-    python main.py             # Rust UI by default (launches holaf-ui)
-    # or the old Qt interface, unchanged:
+    python main.py             # UI Rust par défaut (lance holaf-ui)
+    # ou l'ancienne interface Qt, inchangée :
     HOLAF_UI=python python main.py
     ```
 

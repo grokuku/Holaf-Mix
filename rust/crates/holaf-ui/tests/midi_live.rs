@@ -31,7 +31,10 @@
 //!    exactly that [`MidiMessage::Control`] — the whole device path, minus the
 //!    hardware;
 //! 4. the reconnection policy then reflects a real port: `MidiRuntime` opens it,
-//!    is not due again while it is open, and retries after `on_lost`.
+//!    is not due again while it is open, and retries after `on_lost`;
+//! 5. a message **wakes the UI thread** (`MidiPort::open_with_wake`): that is
+//!    what makes a MIDI fader follow as fast as the mouse instead of waiting for
+//!    the next 40 ms vumeter tick.
 
 use holaf_ui::midi::{MidiMessage, MidiPort, MidiRuntime, MidiVirtualSource, RETRY_INTERVAL};
 
@@ -172,4 +175,50 @@ fn a_virtual_controller_drives_the_port() {
     assert_eq!(runtime.attempt(start + RETRY_INTERVAL), None, "still open");
     runtime.on_lost("unplugged");
     assert!(runtime.attempt(start + RETRY_INTERVAL * 2).is_some());
+}
+
+/// A message must wake the window: `open_with_wake` gives the reader thread the
+/// `egui::Context`, whose `request_repaint()` schedules a frame immediately.
+/// Without it a knob sweep is only *painted* 25 times a second (the vumeter
+/// tick), which is the "saccadé" the user reported while the mouse stayed smooth.
+#[test]
+fn a_message_wakes_the_ui_thread() {
+    if !sequencer_available() {
+        return;
+    }
+    let short_name = format!("holaf-ui-wake-{}", std::process::id());
+    let mut source = match MidiVirtualSource::create(&short_name) {
+        Ok(source) => source,
+        Err(err) => {
+            eprintln!("SKIP: cannot create a virtual port ({err})");
+            return;
+        }
+    };
+    let name = source.alsa_name().to_string();
+    let ctx = egui::Context::default();
+    let port = MidiPort::open_with_wake(&name, Some(ctx.clone())).expect("the port opens");
+    // Nothing happened yet: the UI is idle.
+    assert!(!ctx.has_requested_repaint(), "no message, no wake-up");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    source
+        .send(MidiMessage::Control {
+            channel: 0,
+            control: 7,
+            value: 64,
+        })
+        .expect("the virtual write");
+    let mut woken = false;
+    for _ in 0..40 {
+        if ctx.has_requested_repaint() {
+            woken = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(woken, "a MIDI message must request a repaint");
+    // …and the message is there to be applied by that frame.
+    assert!(port.drain().iter().any(|event| matches!(
+        event,
+        holaf_ui::midi::MidiEvent::Message(MidiMessage::Control { value: 64, .. })
+    )));
 }

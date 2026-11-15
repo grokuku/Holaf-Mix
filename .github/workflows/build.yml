@@ -8,9 +8,18 @@
 #    - Tag push matching v* (creates a versioned release-ready artifact)
 #
 #  Why Arch?
-#    Holaf-Mix targets CachyOS / Arch Linux (the user's primary platform).
+#    Holaf-Mix targets CachyOS / Arch Linux (the primary target platform).
 #    Building on the same distro family as the target means the resulting
 #    binary links against the right glibc, libpipewire, libpulse, etc.
+#
+#  How the artifacts are consumed — this is the project's delivery path, so
+#  nothing is built on the user's machine:
+#    push → this workflow runs → download the `holaf-mix-<sha>-<arch>` artifact
+#    → install the RUNTIME dependencies (BUILD.md §1.3: pipewire,
+#    pipewire-audio, pipewire-pulse, wireplumber, libpulse, alsa-lib,
+#    swh-plugins, tap-plugins) → run ./holaf-mix.
+#    `packaging/PKGBUILD` is an optional Arch distribution path (BUILD.md §4),
+#    not a prerequisite for either artifact, and it is not exercised here.
 #
 #  Why a container?
 #    - GitHub's `ubuntu-latest` runner doesn't have pacman; we use a
@@ -178,25 +187,39 @@ jobs:
             pipewire \
             clang \
             rust \
-            gtk3 \
-            libayatana-appindicator
+            wayland \
+            wayland-protocols \
+            libxkbcommon
 
           # Tray (cargo feature `tray`, ON BY DEFAULT — it is what the packaged
-          # app ships) — GTK3 + an appindicator:
-          #   gtk3                      -> libgtk-3.pc / libgdk-3.pc / pango / cairo
-          #                                (the `gtk` crate builds against these).
-          #   libayatana-appindicator   -> ships libayatana-appindicator3.so.1,
-          #                                which `libappindicator-sys` dlopen()s at
-          #                                RUNTIME (no build-time pkg-config).
-          #
-          # NOTE on the package name: Arch has NO `libappindicator-gtk3`
-          # (that is AUR-only); the distro package is `libayatana-appindicator`
-          # (which replaces the original libappindicator). If it ever moves, the
-          # only thing to change is this pacman list — `libappindicator-sys`
-          # accepts either `libappindicator3.so.1` or `libayatana-appindicator3.so.1`.
-          # libxdo is NOT needed: `tray-icon` is declared with default-features =
-          # false, dropping its `libxdo` feature (only the predefined
-          # Copy/Paste items use it, and this app builds its own menu items).
+          # app ships) needs **no package at all**: the backend is `ksni`, a
+          # pure D-Bus `org.kde.StatusNotifierItem` (see
+          # docs/dependency-audit.md).  No gtk3, no libayatana-appindicator, no
+          # GMainLoop — that is why `gtk3` and `libayatana-appindicator` are no
+          # longer in this list.  libxdo is not needed either: `tray-icon` is
+          # declared with default-features = false.
+
+          # Window backend of holaf-ui: **Wayland** (eframe/winit, feature
+          # `wayland`; X11 is opt-in via `--features x11` and never in the
+          # packaged build, so a Wayland regression cannot go unnoticed).
+          #   wayland            -> libwayland-client + `wayland-scanner`, and
+          #                         the protocol XMLs winit generates its
+          #                         bindings from.
+          #   wayland-protocols  -> xdg-shell/xdg-decoration/viewporter XMLs.
+          #   libxkbcommon       -> keyboard handling (`xkbcommon-dl` dlopen()s
+          #                         libxkbcommon.so.0 at run time).
+          # The three libraries are dlopen()ed, so they show up neither in
+          # `ldd` nor in pkg-config output: installing them here is what makes
+          # the *build* hermetic, and the Arch packages are what the shipped
+          # binary needs at run time.
+          for bin in wayland-scanner; do
+            command -v "$bin" >/dev/null || {
+              echo "::error::$bin not found (pacman: wayland)"; exit 1;
+            }
+          done
+          ls /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml >/dev/null || {
+            echo "::error::wayland-protocols XMLs missing (pacman: wayland-protocols)"; exit 1;
+          }
 
           # Arch's `python` package provides /usr/bin/python3; verify
           # before continuing, otherwise the next step fails with a
@@ -369,9 +392,9 @@ jobs:
           # default of scripts/build_rust.sh (and therefore of build.sh), and
           # this step must match, otherwise the artifact the CI uploads (and
           # the bundle embedded by the PyInstaller steps below) would silently
-          # differ from a local release. `gtk3` + `libayatana-appindicator` are
-          # installed in the dependency step above; the `cargo check` step
-          # further down re-proves the feature compiles on its own.
+          # differ from what that script produces. The tray needs no system
+          # package (ksni/D-Bus); the `cargo check` step further down re-proves
+          # the feature compiles on its own.
           cargo build --release --locked --features tray \
             -p holaf-ui -p holafd -p holafctl
           cd ..
@@ -419,46 +442,66 @@ jobs:
             timeout 10 "$bin" --help >/dev/null 2>&1 || true
           done
 
-      - name: Build Rust UI with the tray feature (GTK3 + appindicator)
+      - name: Build Rust UI with the tray feature (ksni, no GTK)
         # Redundant on purpose with the release build above (which already
         # compiles `--features tray`): this step is the FOCUSED proof that the
         # tray feature alone compiles — the release build could be "fixed" by
-        # dropping the feature and still pass.  It prints the pkg-config/ldconfig
-        # versions the -sys crates actually resolved, which the release step does
-        # not.
+        # dropping the feature and still pass.
         #
-        # This is `cargo check`, not `build`: it type-checks and links the -sys
-        # crates (gtk/pango/cairo) against the system libraries without paying for
-        # a second release codegen of the whole egui stack.
+        # Two guards, both cheap and both aimed at the migration of 2026-11-15:
+        #   1. `cargo check --features tray` must pass (continue-on-error: false
+        #      on purpose — if the tray stops compiling we WANT the job red);
+        #   2. the tray build must pull **zero GTK/GLib** crates: the whole point
+        #      of ksni is that `gtk 0.18` (closed, unmaintained, RUSTSEC-2024-0370
+        #      via proc-macro-error) is gone.  A silent re-introduction is exactly
+        #      the kind of regression nobody notices.
         #
-        # continue-on-error: false on purpose — if the tray stops compiling we
-        # WANT the job red so it gets fixed. This is also what keeps the CI
-        # honest now that the tray ships by default in the packaged app.
+        # `cargo check`, not `build`: it type-checks the crate without paying for
+        # a second codegen of the whole egui stack.
         continue-on-error: false
         run: |
           set -euo pipefail
-          export PKG_CONFIG_PATH="/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-
-          # Fail fast and legibly when the GTK/appindicator packages are missing,
-          # instead of letting the -sys crate emit an opaque pkg-config error.
-          for pc in gtk+-3.0 gdk-3.0 pango cairo; do
-            pkg-config --exists "$pc" \
-              && echo "  OK   pkg-config: $pc $(pkg-config --modversion "$pc")" \
-              || { echo "::error::pkg-config cannot find $pc (pacman: gtk3)"; exit 1; }
-          done
-          if ldconfig -p | grep -Eq 'lib(appindicator|ayatana-appindicator)3\.so'; then
-            echo "  OK   appindicator shared library present"
-          else
-            # Not fatal: libappindicator-sys dlopen()s it at runtime and the
-            # feature still *compiles* without it. Warn so a missing runtime
-            # dependency is visible in the log.
-            echo "::warning::no libayatana-appindicator3/libappindicator3 in ldconfig (pacman: libayatana-appindicator); the tray will compile but may not show at runtime"
-          fi
 
           cd rust
           # --locked: same reproducibility rule as the release build above.
           cargo check --locked -p holaf-ui --features tray
-          echo "  OK   holaf-ui compiles with --features tray"
+          echo "  OK   holaf-ui compiles with --features tray (ksni)"
+
+          if cargo tree --locked -p holaf-ui --features tray -e normal \
+               | grep -qiE '^[^a-z]*(gtk|gdk|glib|pango|atk|libappindicator) v'; then
+            echo "::error::the tray build pulls GTK/GLib again — the backend must stay ksni (no GTK). See docs/dependency-audit.md."
+            cargo tree --locked -p holaf-ui --features tray -e normal | grep -iE '(gtk|gdk|glib|pango|atk|libappindicator) v' | head
+            exit 1
+          fi
+          echo "  OK   no GTK/GLib in the tray dependency tree (ksni/D-Bus)"
+
+      - name: Verify the Wayland window backend (and the optional X11 one)
+        # `holaf-ui` is a **Wayland** client: eframe is compiled with the
+        # `wayland` feature and *without* `x11`.  That is exactly what the user
+        # asked for (their desktop was showing the binary with the "X11" icon and
+        # demanding an X server under Wayland), so it needs a guard of its own —
+        # a stray `x11` in a dependency's defaults would silently bring XWayland
+        # back.
+        #
+        # X11 stays available as an opt-in feature (`--features x11`) for an
+        # X11-only machine; this step checks both, so neither can rot.
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          cd rust
+          # 1. The shipped configuration: Wayland only.
+          if cargo tree --locked -p holaf-ui -e normal | grep -qE '^.*\bx11(-dl|rb)? v'; then
+            echo "::error::holaf-ui pulls an X11 crate without --features x11"
+            exit 1
+          fi
+          cargo tree --locked -p holaf-ui -e features | grep -q 'wayland' \
+            || { echo "::error::the Wayland backend is gone from eframe"; exit 1; }
+          echo "  OK   holaf-ui is Wayland-only by default (no x11 crate)"
+          # 2. The opt-in X11 build still compiles.
+          cargo check --locked -p holaf-ui --features x11
+          cargo tree --locked -p holaf-ui --features x11 -e normal | grep -q 'x11-dl' \
+            || { echo "::error::--features x11 no longer enables the X11 backend"; exit 1; }
+          echo "  OK   holaf-ui builds with --features x11 (opt-in, not shipped)"
 
       - name: Verify generated SPA bindings (bindgen sanity)
         # Regression guard for upstream pipewire-rs issue #112: with an
@@ -690,10 +733,12 @@ jobs:
           echo "::endgroup::"
 
       - name: Verify the bundle does NOT embed the GTK3/GLib stack
-        # Regression guard for the bug packaging/holaf-mix.spec fixes: `holaf-ui`
-        # with the `tray` feature NEEDs libgtk-3.so.0, and PySide6 ships
-        # plugins/platformthemes/libqgtk3.so, so PyInstaller happily freezes the
-        # whole GTK3 + GLib stack.  The bootloader prepends sys._MEIPASS to
+        # Regression guard for the bug packaging/holaf-mix.spec fixes: PySide6
+        # ships plugins/platformthemes/libqgtk3.so (and libQt6Core NEEDs
+        # libglib-2.0), so PyInstaller happily freezes the whole GTK3 + GLib
+        # stack.  NB: `holaf-ui` itself no longer links any GTK — the tray is a
+        # D-Bus StatusNotifierItem since the ksni migration — so this guard now
+        # protects the **Qt fallback** only.  The bootloader prepends sys._MEIPASS to
         # LD_LIBRARY_PATH, so a frozen GTK3 wins over the user's: mismatched
         # themes, GSettings schemas, dlopened theme engines and an appindicator
         # the panel's libayatana may reject (same class of bug as the frozen
@@ -740,7 +785,7 @@ jobs:
           done
 
           if ((hits > 0)); then
-            echo "::error::the bundle contains the GTK3/GLib stack — holaf-ui would use a FROZEN GTK3 instead of the system one. Fix packaging/holaf-mix.spec (_GTK_SYSTEM_LIBS)."
+            echo "::error::the bundle contains the GTK3/GLib stack — the Qt GTK platform theme would use a FROZEN GTK3 instead of the system one. Fix packaging/holaf-mix.spec (_GTK_SYSTEM_LIBS)."
             exit 1
           fi
           echo "  OK   no GTK3/GLib library in the bundle (the system provides them)"

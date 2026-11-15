@@ -1,6 +1,20 @@
 # ============================================================================
 #  PKGBUILD — Holaf-Mix for CachyOS / Arch Linux
 # ============================================================================
+#  What this is: an OPTIONAL, maintained way to install/distribute Holaf-Mix as
+#  a real Arch package (pacman owns the files, `depends` are resolved, a clean
+#  `pacman -Rns` uninstalls).
+#
+#  It is NOT how the project is delivered: the application ships as the
+#  GitHub Actions artifact (`.github/workflows/build.yml`),
+#  `holaf-mix-<version>-<arch>.tar.gz`, which already contains holaf-mix,
+#  holaf-ui, holafd, holafctl and the icons.  Building from this PKGBUILD is a
+#  deliberate choice (own machine, or distributing to other Arch users) — see
+#  BUILD.md §1 for the artifact path and §4 for this package.
+#
+#  In both cases the RUNTIME dependencies below must be installed; they are the
+#  same list the tarball needs (BUILD.md §1.3).
+#
 #  Usage:
 #    makepkg -si          # build + install deps + install
 #    makepkg -s           # build + install deps (no install)
@@ -26,10 +40,11 @@ license=('MIT')
 #  not guessed:
 #
 #    ldd rust/target/release/holaf-ui | holafd   →  libpipewire-0.3.so.0,
-#        libasound.so.2, libgtk-3.so.0/libgdk-3/libgio/libglib/libpango/
-#        libcairo (GTK3 stack)
-#    ldd + dlopen strings                        →  libayatana-appindicator3
-#        (`libappindicator-sys`), libGL (glow/glutin), libxkbcommon (winit)
+#        libasound.so.2 (NO GTK: the tray is a pure D-Bus StatusNotifierItem,
+#        see the tray note below)
+#    ldd + dlopen strings                        →  libGL (glow/glutin),
+#        libwayland-client (`wayland-sys` with `dlopen`), libxkbcommon
+#        (winit/xkbcommon-dl)
 #    exec'ed binaries (Rust + Python code)       →  pactl, pw-cat, pw-cli,
 #        pw-dump, pw-link, pw-metadata, pw-top
 # ----------------------------------------------------------------------------
@@ -74,6 +89,20 @@ depends=(
                           # dependency and builds the graph Holaf-Mix renames,
                           # links and meters
 
+    # --- Window system: WAYLAND -------------------------------------------
+    # holaf-ui is a Wayland client (eframe/winit with the `wayland` feature and
+    # NO `x11`: that is what removes the "X11" application icon and the
+    # "needs an X server" behaviour on a Wayland desktop).  In a build WITHOUT
+    # the tray, winit `dlopen`s both libraries (`wayland-sys/dlopen`,
+    # `xkbcommon-dl`), so the ELF loader does not need them and pacman cannot
+    # see them as hard dependencies — declaring them here is still the only way
+    # `holaf-ui` starts on a minimal Wayland session.  (With `--features tray`,
+    # GTK3 links them anyway; the declared deps cover both builds.)
+    # An X11-only machine needs a build with `--features x11` and
+    # `libxkbcommon-x11` (optdepend below).
+    'wayland'             # libwayland-client.so.0 — the Wayland client library
+    'libxkbcommon'        # libxkbcommon.so.0 — keyboard handling (winit)
+
     # --- Audio / MIDI plumbing --------------------------------------------
     'alsa-lib'            # libasound.so.2 — hard-linked: midir talks to the
                           # ALSA sequencer for the AKAI MIDI Mix
@@ -82,20 +111,19 @@ depends=(
                           # src/backend/audio_engine.py.  NOTE: `ladspa-plugins`
                           # does not exist on Arch (nor on Debian), it was a
                           # phantom dependency.
+    # NOTE: `tap-plugins` (tap_tubewarmth.so — the TUBE WARMTH strip) is NOT
+    # here on purpose: it is **AUR-only** on Arch (`tap-plugins` 1.0.1-3), and a
+    # `depends` entry on a non-repo package makes `makepkg` unresolvable for
+    # everyone.  It is an optdepend below instead — the other strips (gate,
+    # eq, comp, noise) work without it, the UI only offers the FX whose plugin
+    # file it finds in /usr/lib/ladspa.
 
     # Tray icon: `holaf-ui` is built with `--features tray` by
-    # scripts/build_rust.sh (the default), so these are RUNTIME dependencies,
-    # not makedepends:
-    #   gtk3                    NEARLY hard-linked (libgtk-3.so.0, libgdk-3,
-    #                           libpango, libcairo, libatk…): the ELF loader
-    #                           refuses to start holaf-ui without it.
-    #   libayatana-appindicator dlopen()é par libappindicator-sys : sans lui le
-    #                           binaire démarre mais l'icône n'apparaît pas.
-    # Both are the SYSTEM copies on purpose — packaging/holaf-mix.spec strips
-    # them from the PyInstaller bundle so a frozen GTK3 cannot shadow the
-    # user's (theming, appindicator host, plugins).
-    'gtk3'
-    'libayatana-appindicator'
+    # scripts/build_rust.sh (the default).  That feature is the **ksni**
+    # backend — a pure D-Bus `org.kde.StatusNotifierItem` — so it needs **no
+    # package at all**: no GTK3, no libayatana-appindicator, no GMainLoop (see
+    # docs/dependency-audit.md).  Only a StatusNotifier *host* is required for
+    # the icon to be drawn, and every desktop here ships one (optdepends).
 )
 makedepends=(
     'librsvg'              # rsvg-convert — `librsvg2` does not exist on Arch
@@ -107,8 +135,8 @@ makedepends=(
     # /usr/bin.
     'rust'
     'clang'                # bindgen needs libclang.so (libspa-sys / pipewire-sys)
-    'pkgconf'              # the -sys crates (libspa-sys, pipewire-sys, alsa-sys,
-                          # gtk-sys) probe the .pc files at build time
+    'pkgconf'              # the -sys crates (libspa-sys, pipewire-sys,
+                          # alsa-sys) probe the .pc files at build time
     # NOTE: no `git` — the workspace has no git-sourced crate (Cargo.lock is
     # registry-only), so cargo never shells out to it.
     #
@@ -119,6 +147,12 @@ makedepends=(
     # explicit message when it is missing.
 )
 optdepends=(
+    # `tap-plugins` is the TUBE WARMTH strip (`tap_tubewarmth.so` in
+    # /usr/lib/ladspa, named by rust/crates/holaf-core/src/spa.rs and
+    # tools/export_fixtures.py).  It is AUR-only on Arch, hence an optdepend and
+    # not a `depends` entry: every other strip works without it, and the UI only
+    # offers an FX whose plugin file it actually finds.
+    'tap-plugins: TUBE WARMTH strip — AUR only (tap_tubewarmth.so in /usr/lib/ladspa); every other strip works without it'
     # `rnnoise` ([extra]) is the DENOISER LIBRARY, it ships NO LADSPA plugin:
     # the `noise_cancel` strip needs `librnnoise_ladspa.so`
     # (label `noise_suppressor_stereo`), which is not packaged for Arch at all.
@@ -126,17 +160,22 @@ optdepends=(
     # into /usr/lib/ladspa/ to enable that strip — the other three FX
     # (gate/mbeq/sc4) come from `swh-plugins`, a hard dependency.
     'rnnoise: noise_cancel strip — needs librnnoise_ladspa.so, built from source (not packaged)'
-    # An appindicator HOST is what actually draws the tray icon; without one
-    # libappindicator "succeeds" and nothing is visible (GNOME needs the
-    # extension, KDE ships its own StatusNotifier host):
+    # The Qt (PySide6) UI is only the `HOLAF_UI=python` fallback now, and its GTK
+    # platform theme dlopen()s the SYSTEM GTK3.  holaf-ui itself links none.
+    'gtk3: only for the Qt (PySide6) fallback UI — its platform theme (plugins/platformthemes/libqgtk3.so) needs the SYSTEM GTK3'
+    # A StatusNotifier HOST is what actually draws the tray icon; without one
+    # the app detects it (org.kde.StatusNotifierWatcher has no owner), logs a
+    # warning and closing the window QUITS instead of hiding — so it can never
+    # be stranded.  KDE ships its own host; GNOME needs the extension:
     'gnome-shell-extension-appindicator: tray icon in the GNOME panel'
     # holaf-ui dlopens these (winit/xkbcommon-dl/glutin), so pacman cannot see
-    # them as hard dependencies.  `libxkbcommon` also arrives transitively with
-    # gtk3; `mesa` is the actual GL driver (gtk3 only pulls libglvnd).
-    'libxkbcommon: X11/Wayland keyboard handling for the Rust UI'
+    # them as hard dependencies.  `libxkbcommon` and `wayland` are in `depends`
+    # above for that reason; `mesa` is the actual GL driver (libglvnd only
+    # ships the loader).  `libxkbcommon-x11` is only needed by an X11 build (opt-in).
+    'libxkbcommon-x11: only for a build made with `--features x11` (an X11-only session)'
     'mesa: OpenGL driver for the Rust UI (eframe/glow)'
     # `rust/crates/holaf-ui/src/menus.rs` tries xdg-open, then `gio open`
-    # (glib2, already installed with gtk3), then sensible-browser:
+    # (glib2), then sensible-browser:
     'xdg-utils: open the project page / config folder from the context menus'
     # LADSPA SDK + `analyseplugin`/`applyplugin`: handy to inspect the plugins
     # by hand (docs/j1-spike-recon.md).  Nothing is linked or dlopen()ed from it.
@@ -144,7 +183,8 @@ optdepends=(
 )
 
 # Use the source directory or a git checkout
-# For a local dev build: leave _srcroot unset, build from current dir
+# For a local dev build (a developer/packager action, not the delivery path):
+# leave _srcroot unset, build from current dir
 # For a release tarball: set _srcroot=/path/to/holaf-mix-${pkgver}
 _srcroot="."
 _srcdir="$startdir"
@@ -177,7 +217,7 @@ build() {
     if ! command -v pyinstaller >/dev/null 2>&1; then
         error "pyinstaller not found."
         error "  Arch has no pyinstaller package: pip install --user pyinstaller"
-        error "  (see BUILD.md §1 'Install build dependencies')"
+        error "  (see BUILD.md, section 'Install build dependencies')"
         exit 1
     fi
     pyinstaller \

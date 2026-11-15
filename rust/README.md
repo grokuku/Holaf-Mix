@@ -65,29 +65,93 @@ cargo test  -p holaf-ui --features tray   # + le test de repli sans display
 Comme la feature cargo n'est pas dans `default = ["engine-pw", "midi"]`, un
 `cargo build -p holaf-ui` **brut** ne l'inclut pas : c'est le *script* de build
 (et le PKGBUILD/CI) qui ajoute `--features tray`.  Si la compilation avec la
-feature échoue (GTK3 dev absent), le script **réessaie sans** : on garde
-`holaf-ui` et on perd seulement l'icône (WARNING explicite).
+feature échoue, le script **réessaie sans** : on garde `holaf-ui` et on perd
+seulement l'icône (WARNING explicite).
 
 | | |
 |---|---|
-| Paquets (Arch, **runtime**) | **`gtk3`** (lié : `libgtk-3.so.0`, `libgdk-3`, `pango`, `cairo`, `atk`…) + **`libayatana-appindicator`** (`dlopen`é par `libappindicator-sys`) |
-| Paquets (Debian/Ubuntu) | `libgtk-3-dev` + `libayatana-appindicator3-dev` (build) ; `libgtk-3-0` + `libayatana-appindicator3-1` (runtime) |
-| Hôte appindicator | sinon l'icône ne **s'affiche** pas : `gnome-shell-extension-appindicator`, `kstatusnotifieritem` (KDE), `tray` de `swaybar` |
+| Backend | **`ksni`** — un `org.kde.StatusNotifierItem` en D-Bus pur (`tray-icon 0.26`, feature `ksni`). **Aucune bibliothèque GTK**, aucun `libappindicator`, aucune `GMainLoop` (migration du 2026-11-15 : `docs/dependency-audit.md`) |
+| Paquets à installer | **aucun** au build comme au runtime |
+| Hôte StatusNotifier | sinon l'icône ne **s'affiche** pas : `kstatusnotifieritem` (KDE/Plasma), `waybar`, `tray` de `swaybar`, `gnome-shell-extension-appindicator` (GNOME) |
+| Détection de l'hôte | l'app interroge D-Bus (`org.kde.StatusNotifierWatcher`) **avant** de revendiquer un tray — l'équivalent de `QSystemTrayIcon::isSystemTrayAvailable()`, que le backend ksni ne fait pas lui-même |
 | `libxdo` | **inutile** : `tray-icon` est déclaré `default-features = false` (cette feature ne sert qu'aux items prédéfinis Copy/Paste) |
-| Bundle PyInstaller | ces bibliothèques **ne sont PAS embarquées** : `packaging/holaf-mix.spec` les retire de `a.binaries` (même règle que libpipewire) pour que l'app utilise la GTK3 **du système** |
+| Repli | `--features tray-gtk` = l'ancien backend libappindicator (GTK3 `gtk3` + `libayatana-appindicator`) ; jamais activé par défaut |
+| Bundle PyInstaller | plus aucune bibliothèque de tray à retirer ; `packaging/holaf-mix.spec` ne filtre plus GTK3 que pour le **fallback Qt** (`libqgtk3.so` de PySide6) |
 
-Sans display ou sans hôte appindicator au lancement, `tray::available()` vaut
-`false` et **fermer la fenêtre quitte** (cacher sans moyen de revenir
-laisserait un processus inatteignable) ; le log dit
-`tray: unavailable (…) - closing the window will quit, not hide`.  L'icône est
-**générée en RGBA dans le code** (`tray::icon_rgba`) : aucun fichier, donc pas
-de dépendance aux PNG gitignorés de `dist/icons/`.
+Sans display, sans bus de session ou sans hôte StatusNotifier au lancement,
+`tray::available()` vaut `false` et **fermer la fenêtre quitte** (cacher sans
+moyen de revenir laisserait un processus inatteignable) ; le log dit
+`tray: unavailable (no StatusNotifier host: org.kde.StatusNotifierWatcher has no
+owner) - closing the window will quit, not hide`.  L'icône est **générée en
+RGBA dans le code** (`tray::icon_rgba`) : aucun fichier, donc pas de dépendance
+aux PNG gitignorés de `dist/icons/`.
 
-**Wayland** : `tray-icon` ne livre les **clics** que sous X11. Sous
-GNOME/Wayland les clics sur l'icône sont donc ignorés — c'est le **menu** qui
-pilote l'app (`with_menu_on_left_click(true)` : le clic gauche ouvre le menu,
-qui contient `Show/Hide`, `Restart audio engine`, `Quit`).  Détails et
-limites : §10quater de [`docs/ui-rust-design.md`](../docs/ui-rust-design.md).
+**Preuve de bout en bout, sans desktop** :
+`cargo test -p holaf-ui --features tray --test tray_live` démarre un
+`dbus-daemon --session` privé, sert un faux `org.kde.StatusNotifierWatcher` et
+vérifie que l'item **s'enregistre** puis publie le menu attendu
+(`Show/Hide`, `Restart audio engine`, séparateur, `Quit`) via
+`com.canonical.dbusmenu`.
+
+**Clics** : le backend ksni ne transmet pas les clics de souris à l'app (comme
+`libappindicator` avant lui).  C'est le **menu** qui pilote tout
+(`with_menu_on_left_click(true)` : clic gauche → menu).  Détails et limites :
+§10quater de [`docs/ui-rust-design.md`](../docs/ui-rust-design.md).
+
+Pour l'interface : **Wayland**, pas X11.  La fenêtre (`eframe`/`winit`) est
+compilée avec la feature cargo `wayland` **seule** — c'est ce qui supprime
+l'icône « X11 » de la barre des tâches et le message « réclame un serveur X » :
+sans le backend X11, le binaire ne peut plus être pris pour un client XWayland.
+X11 reste disponible **en option** pour une machine X11-only, jamais par défaut :
+
+```bash
+cargo build -p holaf-ui --features x11      # session X11 uniquement
+```
+
+Plus de détails (paquets, `ldd`, ce qui reste à vérifier sur une vraie session) :
+§ « Serveur graphique » ci-dessous.
+
+### Serveur graphique : Wayland (X11 en option)
+
+`rust/crates/holaf-ui/Cargo.toml` :
+
+```toml
+eframe = { version = "0.37", default-features = false,
+           features = ["glow", "wayland", "default_fonts"] }
+# feature cargo `x11` du crate = `eframe/x11`, désactivée par défaut
+```
+
+Mesuré ici (`ldd rust/target/release/holaf-ui`) :
+
+* **sans `tray`** : ni `libX11`/`libxcb`, ni `libwayland-client`, ni
+  `libxkbcommon`.  `winit` les `dlopen` (`wayland-sys/dlopen`,
+  `xkbcommon-dl`) : c'est ce qui rend le binaire Wayland-only et ce qui explique
+  qu'aucun outil ne les voie comme dépendances ;
+* **avec `tray` (le paquet livré)** : plus rien de tout ça non plus — le
+  backend ksni est du D-Bus pur (zbus, via la socket de session), donc
+  `ldd holaf-ui` ne montre **ni GTK3, ni la pile X11 de GDK**
+  (`libX11`, `libxcb`, `libXcursor`…), contrairement à l'ancien build
+  libappindicator.
+
+| | Arch | Debian / Ubuntu | Rôle |
+|---|---|---|---|
+| client Wayland | `wayland` | `libwayland-dev` | `libwayland-client.so.0`, **`dlopen`é** au run par `winit` (feature `wayland-sys/dlopen` → aucune édition de liens dans un build sans tray) |
+| protocoles | `wayland-protocols` | `wayland-protocols` | XML `xdg-shell`, `xdg-decoration`, `viewporter`… consommés à la compilation par `wayland-protocols` (crate) |
+| scanner | `wayland` (fournit `wayland-scanner`) | `libwayland-bin` | génération des bindings à la compilation |
+| clavier | `libxkbcommon` | `libxkbcommon-dev` (build) / `libxkbcommon0` (run) | `libxkbcommon.so.0`, **`dlopen`é** (`xkbcommon-dl`) |
+| X11 (option) | `libxkbcommon-x11` | `libxkbcommon-x11-dev` | seulement si on compile avec `--features x11` |
+
+Avec `--features x11`, `winit` choisit son backend à l'exécution
+(`WAYLAND_DISPLAY` d'abord, puis `DISPLAY`) : le binaire peut tourner sur les
+deux, mais le paquet livré n'a que Wayland pour que le support Wayland ne
+puisse pas régresser sans qu'on le voie.
+
+**Limites connues** : le conteneur de dev n'a **ni Wayland ni X11**, donc seul le
+repli est vérifiable ici (le binaire démarre, `run_native` échoue avec un
+message explicite et propose le snapshot PNG) ; le verrouillage de la largeur
+passe par `xdg_toplevel.set_min_size`/`set_max_size`, que la plupart des
+compositeurs respectent pendant le drag, et `enforce_window_width` corrige le
+cas contraire (`docs/ui-rust-design.md` §10quinquies).
 
 Seuls les jalons J0/J3/J4 sont **sans libpipewire obligatoire** ; `holaf-pw`
 lie `libpipewire-0.3` (installée ici).  La couche réelle `holaf-pw` (J1/J2)
@@ -99,18 +163,29 @@ est faite et testée contre le daemon headless : voir
 * Rust stable ≥ 1.98 (`rustc`/`cargo`).  `holaf-pw` (et donc `holafd`, qui en
 dépend) lie `libpipewire-0.3`/`libspa-0.2` + `pkg-config`/`clang` pour le
 build (installés sur ce conteneur).
+* **Wayland** pour bâtir l'UI: `wayland` + `wayland-protocols` +
+  `libxkbcommon` (Arch), `libwayland-dev` + `wayland-protocols` +
+  `libxkbcommon-dev` + `libwayland-bin` (Debian).  Le lien est **dynamique au
+  run** (`dlopen`), mais `wayland-scanner` et les XML de protocoles sont
+  nécessaires à la compilation du backend.  `--features x11` ajoute
+  `libxkbcommon-x11` (Debian) — voir § « Serveur graphique ».
 * Python 3.10+ uniquement pour le côté client (`ipc_audio_engine.py`,
   `rust_launcher.py`) et les tests d'intégration.
 * **Pour l'icône de tray** (feature `tray`, **activée par défaut par
-  `scripts/build_rust.sh`**) : GTK3 dev + libappindicator — Arch `gtk3` +
-  `libayatana-appindicator`, Debian/Ubuntu `libgtk-3-dev` +
-  `libayatana-appindicator3-dev`.  Sans elles, le script réessaie sans la
-  feature (build sans icône) ; `HOLAF_NO_TRAY=1` rend ce choix explicite.
+  `scripts/build_rust.sh`**) : **rien**.  Le backend est `ksni` (D-Bus
+  StatusNotifierItem), donc plus de `gtk3` + `libayatana-appindicator` au build.
+  Le script réessaie de toute façon sans la feature si elle échoue ;
+  `HOLAF_NO_TRAY=1` rend ce choix explicite, `HOLAF_TRAY_GTK=1` force l'ancien
+  backend libappindicator (qui, lui, exige `gtk3` +
+  `libayatana-appindicator`).
 
 ### Dépendances RUNTIME des binaires livrés
 
 Vérifiées sur le binaire (`ldd rust/target/release/holaf-ui`, plus la liste des
-commandes externes que le code lance) — ce sont les `depends` du PKGBUILD :
+commandes externes que le code lance).  C'est **exactement ce qu'il faut
+installer sur la machine cible**, que les binaires viennent de l'artefact CI
+(`holaf-mix-<version>-<arch>.tar.gz`, voir `BUILD.md` §1.3) ou d'un paquet Arch
+(ce sont les `depends` de `packaging/PKGBUILD`) :
 
 | | Arch | Debian / Ubuntu | Ce que ça fournit |
 |---|---|---|---|
@@ -119,11 +194,16 @@ commandes externes que le code lance) — ce sont les `depends` du PKGBUILD :
 | `pactl` | `libpulse` | `pulseaudio-utils` | liste / déplace les flux applicatifs (`holaf-pw/src/sink_inputs.rs`) |
 | `pw-cat` | `pipewire-audio` | `pipewire-bin` | une capture enfant par source pour les vumètres (`holaf-ui/src/capture.rs`) |
 | session | `wireplumber` | `wireplumber` | construit le graphe (nœuds physiques, `.monitor`) que le mixeur pilote |
+| affichage | `wayland` + `libxkbcommon` | `libwayland-client0` + `libxkbcommon0` | `libwayland-client.so.0` et `libxkbcommon.so.0`, **`dlopen`és** par `winit`/`xkbcommon-dl` (invisibles dans `ldd`) : l'UI est une cliente **Wayland** (X11 seulement si recompilée avec `--features x11`) |
 | MIDI | `alsa-lib` | `libasound2` | `libasound.so.2` **liée** : séquenceur ALSA via `midir` |
 | FX | `swh-plugins` | `swh-plugins` | `gate_1410`, `mbeq_1197`, `sc4_1882` dans `/usr/lib/ladspa/` (⚠ `ladspa-plugins` n'existe sur aucune des deux distros ; `rnnoise` ne contient **pas** le plugin LADSPA `librnnoise_ladspa`) |
-| tray | `gtk3` + `libayatana-appindicator` | `libgtk-3-0` + `libayatana-appindicator3-1` | GTK3 **liée**, appindicator `dlopen`é |
+| FX (tube) | `tap-plugins` (**AUR**) | `tap-plugins` | `tap_tubewarmth` — l'étage **TUBE WARMTH** ; absent ⇒ seul cet étage n'est pas proposé |
+| tray | **aucun** | **aucun** | `ksni` = D-Bus pur : rien à lier, rien à `dlopen`er (l'hôte StatusNotifier du bureau dessine l'icône) |
 
 ## Builder
+
+Réservé au développement : l'utilisateur final n'a **pas** besoin de compiler,
+les binaires arrivent dans l'artefact CI (`BUILD.md` §1).
 
 Depuis la racine du workspace :
 
@@ -236,13 +316,18 @@ Côté Python (client IPC + launcher) :
 python -m unittest discover -s tests -v     # depuis la racine du dépôt
 ```
 
-## Intégration future dans build.sh / packaging
+## Empaquetage (fait) et livraison
 
-`build.sh` (PyInstaller) et `packaging/` n'embarquent **pas encore** le binaire
-Rust.  Le script [`scripts/build_rust.sh`](../scripts/build_rust.sh) construit
-`holafd` en release et le copie dans `dist/` sans modifier `build.sh` ;
-l'étape suivante (quand le backend réel sera stable) sera de l'appeler depuis
-`build.sh` et de déclarer `holafd` dans la spec PyInstaller / PKGBUILD.
+Les trois binaires sont construits par [`scripts/build_rust.sh`](../scripts/build_rust.sh)
+(qui publie `dist/{holaf-ui,holafd,holafctl}`), embarqués par
+`packaging/holaf-mix.spec` (onefile **et** onedir), inclus dans le tarball de
+`build.sh`, installés par `packaging/PKGBUILD` et **construits par la CI**
+(`.github/workflows/build.yml`, artefacts `holaf-mix-…` et `holaf-rust-…`).
+
+Conséquence pratique : **rien de tout ça n'a besoin d'un toolchain Rust sur la
+machine de destination** — les binaires arrivent précompilés dans l'artefact CI
+(cf. `BUILD.md` §1).  Le PKGBUILD reste une option de distribution Arch
+maintenue, pas le chemin de livraison.
 
 ## Contribuer
 

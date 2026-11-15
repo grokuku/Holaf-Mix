@@ -151,7 +151,7 @@ pub enum EngineEvent {
     Restarted(Result<String, String>),
     /// An operation succeeded; the payload names it (for logging/tests).
     Applied(String),
-    /// An operation failed.  Shown in the status bar, never fatal.  This is the
+    /// An operation failed.  Shown in the status notice, never fatal.  This is the
     /// connection-level form (no command to roll back).
     Error(String),
     /// One command was refused.  The UI rolls its optimistic change back and

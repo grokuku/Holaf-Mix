@@ -24,7 +24,7 @@
 //! controller) and [`MidiRuntime`] (reconnection state machine).  The device I/O
 //! is behind the `midi` feature (the `port` submodule), **on by default** because the MIDI Mix
 //! is the primary controller of this mixer: a machine without an ALSA sequencer
-//! still starts, and says why in the status bar.  `--no-default-features` drops
+//! still starts, and says why in the status notice.  `--no-default-features` drops
 //! it (the mixer then keeps working exactly as before, and the pure rules stay
 //! unit tested: `cargo test -p holaf-ui` runs them everywhere).
 //!
@@ -55,14 +55,6 @@ use crate::app::UiAction;
 
 /// Controller values are 7-bit (`value / 127` is the Qt volume law).
 pub const CC_MAX: u8 = 127;
-
-/// Minimum interval between two volume updates of one strip.
-///
-/// A controller sends one message per tick of the knob (a few hundred per
-/// second on some hardware).  The engine already coalesces fader moves, but the
-/// model does not need that many writes, and a 10 ms floor keeps a MIDI sweep
-/// looking the same as a mouse drag.
-pub const VOLUME_INTERVAL: Duration = Duration::from_millis(10);
 
 /// How often a lost or absent controller is looked for again.
 ///
@@ -436,19 +428,19 @@ pub enum MidiOutcome {
 ///
 /// * learn mode wins over the table: the first bindable message defines the
 ///   mapping (Python `_process_learn`);
-/// * `volume` uses `value / 127` and a [`VOLUME_INTERVAL`] floor per strip;
+/// * `volume` uses `value / 127` and is applied **as it arrives** — no throttle
+///   here.  A knob sends a few hundred messages per second and every one of them
+///   is the truth about where the knob is; the engine side already coalesces
+///   (`AppState::volumes`, 25 Hz, last value wins), so dropping messages at this
+///   level could only ever *lose* the final position of a gesture and make the
+///   fader arrive short of where the knob stopped;
 /// * `mute` / `mono` toggle on press only (`velocity > 0`), which is what makes
 ///   a two-event button behave like a button instead of a double toggle.
-///
-/// `last_volume` is the per-(strip, target) clock the throttle needs; the caller
-/// owns it so decoding stays a free function (and a test can drive time).
 pub fn decode(
     map: &MidiMap,
     message: MidiMessage,
     learning: Option<(&str, MidiTarget)>,
     strips: &[Strip],
-    last_volume: &mut HashMap<(String, MidiTarget), Instant>,
-    now: Instant,
 ) -> MidiOutcome {
     if let Some((uid, target)) = learning {
         let binding = match message {
@@ -470,19 +462,10 @@ pub fn decode(
         return MidiOutcome::Ignored;
     };
     match target {
-        MidiTarget::Volume => {
-            let key = (uid.to_string(), MidiTarget::Volume);
-            if let Some(previous) = last_volume.get(&key) {
-                if now.saturating_duration_since(*previous) < VOLUME_INTERVAL {
-                    return MidiOutcome::Ignored;
-                }
-            }
-            last_volume.insert(key, now);
-            MidiOutcome::Action(UiAction::Volume {
-                uid: uid.to_string(),
-                volume: cc_to_volume(message.value()),
-            })
-        }
+        MidiTarget::Volume => MidiOutcome::Action(UiAction::Volume {
+            uid: uid.to_string(),
+            volume: cc_to_volume(message.value()),
+        }),
         MidiTarget::Mute => {
             if message.value() == 0 {
                 // Button release: the toggle already happened on the press.
@@ -595,7 +578,7 @@ pub enum PortState {
     Closed,
     /// A controller answers.
     Open,
-    /// The last attempt failed (the reason is what the status bar shows).
+    /// The last attempt failed (the reason is what the status notice shows).
     Failed(String),
 }
 
@@ -705,7 +688,7 @@ impl MidiRuntime {
         }
     }
 
-    /// What the status bar should say about the controller.
+    /// What the status notice should say about the controller.
     pub fn status_line(&self) -> Option<String> {
         match (&self.state, self.desired.as_deref()) {
             (PortState::Open, Some(name)) => Some(format!("MIDI: {name}")),
@@ -825,6 +808,20 @@ mod port {
         /// The callback runs on `midir`'s own thread; it only pushes into a
         /// channel, so no lock is taken on the audio/UI path.
         pub fn open(name: &str) -> Result<Self, String> {
+            Self::open_with_wake(name, None)
+        }
+
+        /// [`Self::open`], plus a `wake` — usually the `egui::Context` of the
+        /// window.
+        ///
+        /// The reader thread calls `wake.request_repaint()` as soon as a message
+        /// arrives, so the UI paints **at the speed of the controller** instead of
+        /// on the next vumeter tick (40 ms).  That is the whole difference between
+        /// a MIDI fader that feels like the mouse and one that arrives in visible
+        /// steps; without it a knob sweep is only *seen* 25 times a second.
+        /// `Context` is `Send + Sync + Clone`, and `request_repaint` only sets a
+        /// flag in winit, so this is safe from `midir`'s thread.
+        pub fn open_with_wake(name: &str, wake: Option<egui::Context>) -> Result<Self, String> {
             let input = midir::MidiInput::new("holaf-mix-in")
                 .map_err(|err| describe_alsa_error(&err.to_string()))?;
             let output = midir::MidiOutput::new("holaf-mix-out").map_err(|err| err.to_string())?;
@@ -848,6 +845,12 @@ mod port {
                     move |_stamp, bytes, _| {
                         if let Some(message) = MidiMessage::parse(bytes) {
                             let _ = callback_tx.send(MidiEvent::Message(message));
+                            // Wake the UI thread *now*: the message is applied on
+                            // the next frame, so scheduling one immediately is
+                            // what keeps a knob as responsive as the mouse.
+                            if let Some(ctx) = &wake {
+                                ctx.request_repaint();
+                            }
                         }
                     },
                     (),
@@ -1042,7 +1045,6 @@ mod port {
                 .send(MidiEvent::Error("port closed".to_string()));
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1123,8 +1125,6 @@ mod tests {
     fn a_control_change_drives_the_volume_with_the_qt_law() {
         let map = map();
         let strips = [strip("in-mic"), strip("out-hp")];
-        let now = Instant::now();
-        let mut last = HashMap::new();
         let outcome = decode(
             &map,
             MidiMessage::Control {
@@ -1134,8 +1134,6 @@ mod tests {
             },
             None,
             &strips,
-            &mut last,
-            now,
         );
         match outcome {
             MidiOutcome::Action(UiAction::Volume { uid, volume }) => {
@@ -1166,60 +1164,47 @@ mod tests {
         );
     }
 
+    /// A knob burst must be **lossless**: the model follows every message and
+    /// the last one always wins.  The engine side coalesces (25 Hz, last value
+    /// wins); dropping messages here is what used to make a MIDI sweep arrive
+    /// short of where the knob stopped, and in visible steps.
     #[test]
-    fn a_knob_burst_is_throttled_but_the_first_value_is_kept() {
+    fn a_knob_burst_is_applied_in_full_and_the_last_value_wins() {
         let map = map();
         let strips = [strip("in-mic")];
-        let start = Instant::now();
-        let mut last = HashMap::new();
         let control = |value| MidiMessage::Control {
             channel: 0,
             control: 61,
             value,
         };
-        assert!(matches!(
-            decode(&map, control(10), None, &strips, &mut last, start),
-            MidiOutcome::Action(UiAction::Volume { .. })
-        ));
-        // 5 ms later: too soon, dropped.
-        assert_eq!(
-            decode(
-                &map,
-                control(20),
-                None,
-                &strips,
-                &mut last,
-                start + Duration::from_millis(5)
-            ),
-            MidiOutcome::Ignored
-        );
-        // After the floor, accepted again.
-        assert!(matches!(
-            decode(
-                &map,
-                control(30),
-                None,
-                &strips,
-                &mut last,
-                start + VOLUME_INTERVAL
-            ),
-            MidiOutcome::Action(UiAction::Volume { .. })
-        ));
+        let mut volumes = Vec::new();
+        for value in (10..=100).step_by(5) {
+            match decode(&map, control(value), None, &strips) {
+                MidiOutcome::Action(UiAction::Volume { uid, volume }) => {
+                    assert_eq!(uid, "in-mic");
+                    volumes.push(volume);
+                }
+                other => panic!("a burst message was dropped: {other:?}"),
+            }
+        }
+        assert_eq!(volumes.len(), 19, "every message is applied");
+        assert_eq!(*volumes.last().unwrap(), cc_to_volume(100));
+        // Monotonic here because the CC values are: the fader does not jump
+        // backwards between two messages of one gesture.
+        assert!(volumes.windows(2).all(|pair| pair[1] > pair[0]));
     }
 
     #[test]
     fn a_button_toggles_on_press_and_ignores_the_release() {
         let map = map();
         let strips = [strip("in-mic")];
-        let now = Instant::now();
-        let mut last = HashMap::new();
         let press = MidiMessage::Note {
             channel: 0,
             note: 24,
             velocity: 127,
         };
         assert_eq!(
-            decode(&map, press, None, &strips, &mut last, now),
+            decode(&map, press, None, &strips),
             MidiOutcome::Action(UiAction::Mute {
                 uid: "in-mic".to_string(),
                 mute: true
@@ -1231,10 +1216,7 @@ mod tests {
             note: 24,
             velocity: 0,
         };
-        assert_eq!(
-            decode(&map, release, None, &strips, &mut last, now),
-            MidiOutcome::Ignored
-        );
+        assert_eq!(decode(&map, release, None, &strips), MidiOutcome::Ignored);
         // MONO likewise, and the toggle reads the current model state.
         let mut mono = strip("in-mic");
         mono.is_mono = true;
@@ -1247,9 +1229,7 @@ mod tests {
                     velocity: 1
                 },
                 None,
-                &[mono],
-                &mut last,
-                now
+                &[mono]
             ),
             MidiOutcome::Action(UiAction::Mono {
                 uid: "in-mic".to_string(),
@@ -1262,8 +1242,6 @@ mod tests {
     fn learning_captures_the_first_bindable_message() {
         let map = map();
         let strips = [strip("in-mic")];
-        let now = Instant::now();
-        let mut last = HashMap::new();
         // Nothing mapped on CC 5: ignored without learn mode.
         assert_eq!(
             decode(
@@ -1275,8 +1253,6 @@ mod tests {
                 },
                 None,
                 &strips,
-                &mut last,
-                now
             ),
             MidiOutcome::Ignored
         );
@@ -1292,8 +1268,6 @@ mod tests {
                 },
                 Some(("in-mic", MidiTarget::Mute)),
                 &strips,
-                &mut last,
-                now
             ),
             MidiOutcome::Learned {
                 uid: "in-mic".to_string(),
@@ -1312,8 +1286,6 @@ mod tests {
                 },
                 Some(("in-mic", MidiTarget::Volume)),
                 &strips,
-                &mut last,
-                now
             ),
             MidiOutcome::Learned {
                 uid: "in-mic".to_string(),
@@ -1479,7 +1451,7 @@ mod tests {
 
     #[test]
     fn a_binding_shows_itself_the_way_a_controller_labels_it() {
-        // What the MIDI button flashes after a learn, and what the status bar
+        // What the MIDI button flashes after a learn, and what the status notice
         // says (`ch.` is 1-based: the file stores 0).
         assert_eq!(Binding::control(0, 19).short_label(), "CC 19");
         assert_eq!(Binding::note(0, 24).short_label(), "N 24");
@@ -1586,7 +1558,7 @@ mod tests {
         assert_eq!(
             runtime.last_error(),
             Some("no such port"),
-            "the reason is what the status bar shows"
+            "the reason is what the status notice shows"
         );
         // Not due again before the interval…
         assert_eq!(runtime.attempt(start + Duration::from_millis(1999)), None);
@@ -1642,7 +1614,7 @@ mod tests {
         let line = runtime.status_line().expect("a lost port is explained");
         assert!(line.contains("MIDI Mix"), "{line}");
         assert!(line.contains("retrying"), "{line}");
-        // No controller selected: the status bar says nothing.
+        // No controller selected: the status notice says nothing.
         runtime.set_desired(None);
         assert_eq!(runtime.status_line(), None);
     }

@@ -313,8 +313,10 @@ fn draw_apps(state: &mut AppState, ui: &mut Ui) {
 /// only paints it.  The **Journal** tab shows the log ring buffer
 /// ([`crate::logbuf`]) — the only place a desktop-launched app can read its own
 /// log — and is the one tab that auto-scrolls (a log is read at its tail).
-/// "Copy report" uses `ctx.copy_text`, which is what makes the window useful in
-/// a bug thread — the text has the findings first.
+/// "Copy report" goes through [`crate::clipboard::copy`], which reports whether
+/// a system clipboard exists in this build: the status line must never claim
+/// the text reached the desktop when only egui's in-app fallback got it (that
+/// was the bug — the button said "copied" and pasted nothing).
 fn draw_diagnostics(state: &mut AppState, ui: &mut Ui) {
     let Some(diagnostics) = state.diagnostics.clone() else {
         return;
@@ -559,8 +561,8 @@ fn draw_diagnostics(state: &mut AppState, ui: &mut Ui) {
             .as_ref()
             .map(|diagnostics| diagnostics.report.text())
             .unwrap_or_default();
-        ui.ctx().copy_text(text);
-        state.status = Some("diagnostic report copied to the clipboard".to_string());
+        let outcome = crate::clipboard::copy(ui.ctx(), &text);
+        state.status = Some(outcome.status("diagnostic report"));
     }
     if refresh {
         state.refresh_diagnostics();

@@ -456,10 +456,18 @@ python -m unittest discover -s tests -v
      daemon (actuellement l'UI appelle encore `pipewire_utils` directement).
 3. **Packaging (fait)** : `build.sh` appelle `scripts/build_rust.sh` avant
    PyInstaller, `packaging/holaf-mix.spec` embarque `holafd`+`holafctl`,
-   `PKGBUILD` et `.desktop` les installent à côté du binaire, la CI construit le
-   daemon avant les étapes Python.  Reste à valider la **machine utilisateur** :
-   un tarball/paquet réel doit trouver son `holafd` embarqué (log INFO
-   « holafd resolved from the PyInstaller bundle »).
+   `.desktop` les installe à côté du binaire, la CI construit le daemon avant
+   les étapes Python et publie le tarball (`holaf-mix-<version>-<arch>.tar.gz`)
+   comme artefact principal.  `packaging/PKGBUILD` est une **option de
+   distribution Arch maintenue**, pas le workflow de livraison : elle n'est pas
+   exercée par la CI.  Côté artefact, le smoke test de `build.yml`
+   (« the bundled Rust UI is embedded and runs ») vérifie que `holaf-ui` est
+   bien embarqué et démarre ; `holafd`/`holafctl` sont embarqués par le spec et
+   leur résolution au lancement se lit dans le log INFO « holafd resolved from
+   the PyInstaller bundle » — un paquet construit à la main reste à vérifier
+   par celui qui le construit.
+   Ce qui reste ouvert côté **machine cible** est le matériel : devices audio
+   réels, strips physiques, hotplug (point 1).
 4. **J5 — polish** : purge des sockets/zombies résiduels au démarrage, tests
    de charge IPC, logging `RUST_LOG` réglable depuis l'app.
 

@@ -9,7 +9,9 @@
 //! │  ┌────────────────────────┐  │  device combo (`QComboBox`, 18 px)
 //! │  └────────────────────────┘  │
 //! │  [x] Default Sink            │  inputs only: default-sink checkbox
-//! │  [   SELECT APPS   ]         │  inputs only: virtual & not default
+//! │  [   SELECT APPS   ]         │  inputs only — the ROW is reserved on every
+//! │                              │  input, the button is drawn on a virtual,
+//! │                              │  non-default one (Qt hid it, kept the space)
 //! │  [GT][RN][EQ][TB][CP]        │  FX toggles: 5 inputs / 3 outputs
 //! │  ╭────────────────────────╮  │
 //! │  │        [CASQ]          │  │  routing chips (inputs) — 20 px each
@@ -67,7 +69,7 @@ use crate::theme::resolve::{resolve, StripDescriptor, StripKind};
 use crate::theme::ThemeFile;
 use crate::views::text_centered;
 use crate::widgets::{
-    combo_display, fader_with_vu, flat_button, fx_button_in, midi_button_in, route_button_in,
+    combo_display, fader_with_vu, flat_button_in, fx_button_in, midi_button_in, route_button_in,
     state_button_in, FaderStyle, MidiButtonState,
 };
 
@@ -281,9 +283,13 @@ pub fn strip_ui(
 
     // 4. inputs only: default sink + app selection
     //
-    // `_update_app_btn_visibility`: the "SELECT APPS" row only exists on a
-    // virtual, non-default input, which makes this strip 23 px shorter than its
-    // sibling and gives the fader 23 px more.
+    // `_update_app_btn_visibility`: the "SELECT APPS" button only *shows* on a
+    // virtual, non-default input — but its row is reserved on **every** input.
+    // Qt called `setVisible(false)` on a widget that stayed in the layout, so all
+    // input strips kept the same height and their faders lined up; laying the row
+    // out only when the button is drawn made the other strips 23 px taller (a
+    // longer fader, a VU scale that starts higher).  Same height, always: the row
+    // is allocated, the button is painted into it only when it applies.
     let apps_row =
         style.kind == StripKind::Input && strip.device_name.is_none() && !strip.is_default;
     if style.kind == StripKind::Input {
@@ -326,22 +332,16 @@ pub fn strip_ui(
         }
         child.add_space(row_gap(theme));
 
-        // `_update_app_btn_visibility`: only a virtual, non-default input.
-        if apps_row {
-            if flat_button(
-                &mut child,
-                "SELECT APPS",
-                Vec2::new(avail_w, dims.combo_height),
-                theme,
-            )
-            .clicked()
-            {
-                actions.push(UiAction::SelectApps {
-                    uid: strip.uid.clone(),
-                });
-            }
-            child.add_space(row_gap(theme));
+        // `_update_app_btn_visibility`: only a virtual, non-default input gets
+        // the button — but the space is reserved for every input (see above).
+        let (apps_rect, _) =
+            child.allocate_exact_size(Vec2::new(avail_w, dims.combo_height), Sense::hover());
+        if apps_row && flat_button_in(&child, "SELECT APPS", apps_rect, theme).clicked() {
+            actions.push(UiAction::SelectApps {
+                uid: strip.uid.clone(),
+            });
         }
+        child.add_space(row_gap(theme));
     }
 
     // 5. FX row
@@ -481,13 +481,8 @@ pub fn strip_ui(
     // one and not to the other.
     #[cfg(debug_assertions)]
     {
-        let modeled = crate::layout::fader_height_for_case(
-            theme,
-            strip.kind,
-            apps_row,
-            outputs.len(),
-            rect.height(),
-        );
+        let modeled =
+            crate::layout::fader_height_for(theme, strip.kind, outputs.len(), rect.height());
         debug_assert!(
             (fader_h - modeled).abs() < 0.5,
             "{}: drawn fader {fader_h} vs layout model {modeled}",
@@ -507,6 +502,19 @@ pub fn strip_ui(
         actions.push(UiAction::Volume {
             uid: strip.uid.clone(),
             volume,
+        });
+    }
+    // Right click on the fader / VU: the strip's menu (`Rename`, `Delete`, then
+    // the application entries) — the Qt `StripWidget` context menu, since the
+    // fader is a child of the strip.  The fader itself only reacts to the
+    // primary button (`widgets::fader`), so the volume never moves on the way.
+    if fader.response.secondary_clicked() {
+        actions.push(UiAction::OpenContextMenu {
+            kind: crate::menus::ContextMenuKind::Strip {
+                uid: strip.uid.clone(),
+                label: strip.label.clone(),
+            },
+            pos: pointer_pos(ui, fader.response.rect),
         });
     }
     child.add_space(row_gap(theme));
@@ -743,6 +751,120 @@ mod tests {
                 assert!(!primitives.is_empty(), "the strip painted nothing");
             }
         }
+    }
+
+    /// Every input strip draws the same rows — `SELECT APPS` included, shown or
+    /// not — so they all have the same height and their faders line up.  This is
+    /// the regression the user reported (Qt kept the hidden widget in the layout;
+    /// the Rust port laid the row out only when the button was drawn).
+    #[test]
+    fn every_input_gets_the_same_fader_height() {
+        let state = AppState::demo();
+        let outputs = state.output_targets();
+        let theme = &state.theme.theme;
+        let strip_h = 532.0;
+        let heights: Vec<f32> = state
+            .strips
+            .iter()
+            .filter(|strip| strip.kind == StripType::Input)
+            .map(|strip| crate::layout::fader_height_for(theme, strip.kind, outputs.len(), strip_h))
+            .collect();
+        assert!(heights.len() >= 2);
+        let first = heights[0];
+        assert!(
+            heights.iter().all(|h| (h - first).abs() < 0.01),
+            "inputs must share one fader height: {heights:?}"
+        );
+        // The demo really contains both cases (a physical/default input *and* a
+        // virtual non-default one), otherwise the assertion above proves nothing.
+        let has_button = state.strips.iter().any(|strip| {
+            strip.kind == StripType::Input && strip.device_name.is_none() && !strip.is_default
+        });
+        let has_no_button = state.strips.iter().any(|strip| {
+            strip.kind == StripType::Input && (strip.device_name.is_some() || strip.is_default)
+        });
+        assert!(
+            has_button && has_no_button,
+            "the demo must cover both cases"
+        );
+    }
+
+    /// A right click on the fader / VU opens the strip's context menu and must
+    /// **not** move the volume — egui gives the drag to any button, so the old
+    /// `Sense` handling swallowed the click and the menu never opened.
+    #[test]
+    fn a_right_click_on_the_fader_opens_the_strip_menu_without_moving_it() {
+        let ctx = crate::test_support::headless_context();
+        let state = AppState::demo();
+        let outputs = state.output_targets();
+        let strip = state
+            .strips
+            .iter()
+            .find(|strip| strip.kind == StripType::Input)
+            .expect("the demo has inputs");
+        let height = 500.0_f32;
+        let strip_rect = Rect::from_min_size(egui::pos2(10.0, 10.0), Vec2::new(100.0, height));
+        // Middle of the fader row, computed from the same model the view uses.
+        let theme = &state.theme.theme;
+        let fader_h =
+            crate::layout::fader_height_for(theme, strip.kind, outputs.len(), strip_rect.height());
+        let fader_top = strip_rect.top()
+            + theme.dimensions.strip_padding
+            + crate::layout::rows_before_fader(theme, strip.kind, outputs.len());
+        let pos = egui::pos2(strip_rect.center().x, fader_top + fader_h / 2.0);
+
+        let mut actions: Vec<UiAction> = Vec::new();
+        let mut run = |time: f64, events: Vec<egui::Event>| {
+            let mut cache = ImageCache::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                actions.extend(strip_ui(
+                    ui,
+                    strip_rect,
+                    &state.theme,
+                    strip,
+                    &outputs,
+                    [0.5, 0.5],
+                    &mut cache,
+                    MidiButtonState::default(),
+                    DevicePresence::Unknown,
+                ));
+            });
+            output.textures_delta.clear();
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run(1.0, vec![egui::Event::PointerMoved(pos)]);
+        run(1.1, vec![button(true)]);
+        run(1.2, vec![button(false)]);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                UiAction::OpenContextMenu {
+                    kind: crate::menus::ContextMenuKind::Strip { .. },
+                    ..
+                }
+            )),
+            "a right click on the fader must open the strip menu: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, UiAction::Volume { .. })),
+            "and must not move the volume: {actions:?}"
+        );
     }
 
     #[test]

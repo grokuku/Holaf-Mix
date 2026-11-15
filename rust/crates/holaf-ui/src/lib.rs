@@ -22,6 +22,7 @@
 //! | [`apps`]      | per-application routing: list, selection, 5 s enforcement    |
 //! | [`menus`]     | window/strip/FX context menus + their actions                |
 //! | [`diagnostics`] | the pure diagnostic report (collector + findings + text)   |
+//! | [`clipboard`] | system clipboard + an honest "did it reach the desktop?"    |
 //! | [`midi`]      | MIDI CC mapping / learn / LED feedback (I/O behind `midi`)   |
 //! | [`tray`]      | tray policy + always-on-top + generated icon (feature `tray`) |
 //! | [`fx_ui`]     | FX control-port ranges/order (the Qt keyword table)          |
@@ -40,6 +41,7 @@
 pub mod app;
 pub mod apps;
 pub mod bridge;
+pub mod clipboard;
 pub mod coalesce;
 pub mod config;
 pub mod devices;

@@ -245,19 +245,24 @@ if _bundled_pipewire:
         '(dropped from the bundle: ' + ', '.join(sorted(_bundled_pipewire)) + ')'
     )
 
-# --- Keep the SYSTEM GTK3 stack (tray icon + Qt's GTK platform theme) -------
+# --- Keep the SYSTEM GTK3/GLib stack (Qt's GTK platform theme only) --------
 # Same rule as the PipeWire block below, and the same *reason*: the bootloader
 # prepends `sys._MEIPASS` to `LD_LIBRARY_PATH`, so anything frozen wins over the
 # user's copy.  For a toolkit that is much worse than for a client library.
 #
-# **Measured, not assumed** (onedir bundle, holaf-ui built with `--features tray`,
-# Debian 12): PyInstaller put the whole GTK3 stack in `_internal/` —
-# libgtk-3.so.0, libgdk-3.so.0, libgdk_pixbuf-2.0.so.0, libpango*, libcairo*,
-# libatk*, libatspi, libepoxy, libharfbuzz, plus GLib.  Two entry points pull it:
-#   1. `holaf-ui` with the `tray` feature NEEDs libgtk-3.so.0 (tray-icon/gtk);
-#   2. PySide6 ships `plugins/platformthemes/libqgtk3.so`, which NEEDs it too
-#      (so the stack was already frozen *before* the tray — pre-existing bug for
-#      the Qt fallback, now also fatal for holaf-ui).
+# **Measured, not assumed** (onedir bundle, Debian 12): PyInstaller put the
+# whole GTK3 stack in `_internal/` — libgtk-3.so.0, libgdk-3.so.0,
+# libgdk_pixbuf-2.0.so.0, libpango*, libcairo*, libatk*, libatspi, libepoxy,
+# libharfbuzz, plus GLib.
+#
+# Since the tray went **ksni** (D-Bus, no GTK — see docs/dependency-audit.md),
+# `holaf-ui` no longer NEEDs libgtk-3.so.0 at all: what still pulls GTK3 is
+# **PySide6**, which ships `plugins/platformthemes/libqgtk3.so` that NEEDs it
+# (and `libQt6Core` NEEDs libglib-2.0).  The Qt UI is only the fallback now, but
+# it is still in the bundle, so this exclusion stays — it is the *Qt* part that
+# needs it.  Verify with:
+#   ldd .../PySide6/Qt/plugins/platformthemes/libqgtk3.so | grep gtk
+#   ldd rust/target/release/holaf-ui                 | grep gtk   # must be EMPTY
 #
 # Why a frozen GTK3 breaks the app:
 #   * a GTK3 older than the user's GLib/GDK cannot load: its dlopened theme
@@ -265,8 +270,8 @@ if _bundled_pipewire:
 #     are looked up from the *system* and version-checked against the *frozen*
 #     library → "cannot open shared object", "undefined symbol", or a silent
 #     theme fallback with mismatched CSS;
-#   * an appindicator that talks to the host panel through a frozen GTK/GDK
-#     cannot own a StatusNotifier item that the panel's libayatana accepts.
+#   * the Qt GTK platform theme would talk to the desktop through a frozen
+#     GTK/GDK, i.e. through a toolkit the desktop's own modules reject.
 # GLib is included on purpose: a frozen GLib + a system GTK3 is exactly the
 # mismatch above (GType system, GSettings, gio modules are shared state).  Qt6's
 # Core/Gui also NEED libglib (QEventDispatcherGlib), so letting *both* use the
@@ -277,8 +282,10 @@ if _bundled_pipewire:
 # pre-existing status quo and whose ABI is far narrower than GTK's):
 # libX11, libxkbcommon, libdbus-1, libfontconfig, libfreetype, libpng16, libz.
 #
-# `libayatana-appindicator3.so.1` never appears here: `libappindicator-sys`
-# dlopen()s it at run time, so it is a PKGBUILD runtime dep, not a bundle entry.
+# `libayatana-appindicator3.so.1` is not in this set: with the ksni tray nothing
+# links it or dlopen()s it any more (it used to be dlopen()ed by
+# `libappindicator-sys` in the old `tray-gtk` build, and a dlopen()ed library is
+# never a bundle entry anyway).
 _GTK_SYSTEM_LIBS = frozenset(
     {
         # GTK toolkit + its rendering/text stack
@@ -331,7 +338,7 @@ if _bundled_gtk:
         entry for entry in a.binaries if Path(entry[0]).name not in _GTK_SYSTEM_LIBS
     ]
     print(
-        '[holaf-mix.spec] keeping the system GTK3/GLib libraries '
+        '[holaf-mix.spec] keeping the system GTK3/GLib libraries (Qt GTK theme) '
         '(dropped from the bundle: ' + ', '.join(sorted(_bundled_gtk)) + ')'
     )
 

@@ -29,8 +29,38 @@ path = "src/bin/holaf-ui-snapshot.rs"
 # (`--no-default-features` = no `holaf-pw`, no `midir`, mock engine + config-only
 # MIDI mappings), which is what the headless snapshot and a machine with no
 # libpipewire/libasound need.
-default = ["engine-pw", "midi"]
+default = ["engine-pw", "midi", "clipboard", "system_fonts"]
 engine-pw = ["dep:holaf-pw"]
+# **System clipboard** (eframe's `clipboard` feature ⇒ `arboard` on X11/
+# Wayland + `smithay-clipboard` for the Wayland data-control protocol).
+#
+# It is a feature of its own — not a bare eframe feature — because the code has
+# to *know* which clipboard it is talking to: [`crate::clipboard::copy`] returns
+# [`crate::clipboard::CopyOutcome::InApp`] when this build has no system
+# clipboard, and the diagnostics dialog then says "kept in this window" instead
+# of claiming the text reached the desktop.  (Before this feature existed the
+# dialog always said "copied to the clipboard" while egui quietly filled its
+# in-app fallback string: the button lied.)
+clipboard = ["eframe/clipboard"]
+# **System fonts** (eframe's `system_fonts` ⇒ `egui_system_font_provider` +
+# `fontique`): fallback fonts from the host, so a device name with emoji,
+# Cyrillic or CJK glyphs is not rendered as boxes by egui's built-in font.
+# Optional because it costs a font-parsing dependency chain and a font scan at
+# startup: `--no-default-features` still builds (embedded font only).
+system_fonts = ["eframe/system_fonts"]
+# **X11 is opt-in, Wayland is the default.**  The windowing backend is chosen by
+# eframe/winit at build time and there is no runtime switch: the shipped build
+# targets Wayland only (the user runs Wayland exclusively, and the X11 build was
+# what made the desktop show the "X11" application icon and demand an X server).
+# X11 stays *available* as a feature because it costs one flag and saves anyone
+# on an X11-only machine from a build that cannot open a window:
+#
+#     cargo build -p holaf-ui --features x11      # an X11-only session
+#
+# Both can be on at once (winit then picks the backend from
+# `WAYLAND_DISPLAY`/`DISPLAY`, Wayland first); the packaged build has only
+# Wayland, which is why Wayland support can never silently regress.
+x11 = ["eframe/x11"]
 # MIDI control (CC/note → volume/mute/mono, learn, LED feedback, port picker,
 # reconnection).  Needs an ALSA sequencer at run time (`libasound2-dev` at build
 # time) — present on every desktop; where it is missing the UI says so in the
@@ -39,29 +69,45 @@ engine-pw = ["dep:holaf-pw"]
 # feature.
 midi = ["dep:midir"]
 # The real system-tray icon (Show/Hide, Restart, Quit) — Qt's
-# `QSystemTrayIcon`.  NOT part of `default` here: `tray-icon` links **GTK3 +
-# libappindicator** on Linux, which are not installed on every build machine (the
-# dev container started without GTK3 at all), and `cargo test --workspace` must
-# stay hermetic.  The SHIPPED build enables it: `scripts/build_rust.sh` adds
-# `--features tray` by default (`HOLAF_NO_TRAY=1` opts out), so build.sh, the
-# PKGBUILD, the tarball and the CI all produce a UI with the icon.
-# The *policy* (menu entries, close rule, menu-id → action mapping) is always
-# compiled and tested (`src/tray.rs`); only the GTK/libappindicator I/O lives
-# behind this feature.
+# `QSystemTrayIcon`.  NOT part of `default` here: `tray-icon` needs a D-Bus
+# session at *run* time and the `ksni` backend is one more dependency tree, so
+# `cargo test --workspace` must stay hermetic.  The SHIPPED build enables it:
+# `scripts/build_rust.sh` adds `--features tray` by default (`HOLAF_NO_TRAY=1`
+# opts out), so build.sh, the PKGBUILD, the tarball and the CI all produce a UI
+# with the icon.
 #
-# Arch build deps: `gtk3` (build/link) + `libayatana-appindicator` (the runtime
-# appindicator library `libappindicator-sys` dlopen()s; Arch has no
-# `libappindicator-gtk3`, that name is AUR-only).  No libxdo: `tray-icon` is used
-# with `default-features = false` (see below).  Runtime: an appindicator host
-# (`gnome-shell-extension-appindicator`, `kstatusnotifieritem`, `swaybar`'s tray).
-tray = ["dep:tray-icon", "dep:gtk"]
+# The backend is **`ksni`**: a pure D-Bus StatusNotifierItem (KDE/Plasma,
+# waybar, `swaybar`, GNOME + `gnome-shell-extension-appindicator`), i.e. no
+# GTK3, no `libappindicator`, no GMainLoop.  That is the native backend of the
+# user's desktop (KDE/Wayland) and it keeps `gtk 0.18` — a closed, unmaintained
+# line with no possible update — out of the dependency graph entirely.
+#
+# `tray-gtk` is the escape hatch: the old `libappindicator` backend, which
+# needs `gtk3` + `libayatana-appindicator` and a GTK main loop.  It is NOT
+# implied by `tray` and must be selected *instead* of it (`--features tray-gtk`);
+# when both are on, `tray-icon` picks ksni (its own `cfg` prefers it) and so does
+# [`crate::tray`].  Keep it only to be able to fall back without rewriting code.
+#
+# The *policy* (menu entries, close rule, menu-id → action mapping) is always
+# compiled and tested (`src/tray.rs`); only the tray-icon/D-Bus I/O lives
+# behind this feature.
+tray = ["dep:tray-icon", "tray-icon/ksni", "dep:zbus"]
+tray-gtk = ["dep:tray-icon", "tray-icon/libappindicator", "dep:gtk"]
 
 [dependencies]
 # `default-features = false` everywhere: we do not want the wgpu/x11+wayland
-# double stack, nor accesskit/clipboard/persistence.  Only glow/x11/default_fonts.
+# double stack, nor accesskit/persistence.  Only glow/Wayland (or glow/X11 with
+# `--features x11`)/default_fonts here — `clipboard` and `system_fonts` are
+# forwarded by this crate's own features of the same name (see `[features]`).
+#
+# Build deps on Arch: `wayland` (libwayland-client) + `libxkbcommon`; on Debian:
+# `libwayland-dev` + `libxkbcommon-dev` (plus `wayland-protocols`, and
+# `wayland-scanner` from `libwayland-bin`/`wayland-protocols` — the `wayland-sys`
+# build script generates the protocol bindings).
+# Adding `--features x11` instead needs `libxkbcommon-x11` + `libx11`/`libxcb`.
 eframe = { version = "0.37", default-features = false, features = [
     "glow",
-    "x11",
+    "wayland",
     "default_fonts",
 ] }
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
@@ -74,13 +120,32 @@ env_logger = { workspace = true }
 holaf-core = { path = "../holaf-core" }
 holaf-pw = { path = "../holaf-pw", optional = true }
 midir = { version = "0.11", optional = true }
-# System tray (feature `tray`, enabled by the build script — see above):
-# `tray-icon` re-exports `muda`
-# for the menu, so only these two are needed.  `gtk` drives the main loop on the
-# tray thread (libappindicator needs a running GTK loop).
+# System tray (feature `tray` = ksni/D-Bus, `tray-gtk` = libappindicator — see
+# above): `tray-icon` re-exports `muda` for the menu, so only these are needed.
 #
-# `default-features = false` on `tray-icon` drops its `libxdo` feature: that
-# only powers the predefined Copy/Paste/SelectAll items, which this app never
-# uses, and it spares both a build dependency and a runtime `libxdo` dlopen.
-tray-icon = { version = "0.19", default-features = false, optional = true }
+# `default-features = false` on `tray-icon` drops its default `libappindicator`
+# backend (and with it GTK3 and libxdo: `libxdo` only powers the predefined
+# Copy/Paste items, which this app never uses).
+#
+# `zbus` is what lets [`crate::tray`] ask D-Bus whether a StatusNotifier
+# **host** exists before claiming a tray — Qt's
+# `QSystemTrayIcon::isSystemTrayAvailable()`, which is what keeps "close hides
+# the window" from stranding the app with no icon to bring it back.  Version 5
+# is the one `ksni` already depends on, so it adds no build to the graph.
+tray-icon = { version = "0.26", default-features = false, optional = true }
+zbus = { version = "5", default-features = false, features = [
+    "blocking-api",
+    "async-io",
+], optional = true }
+# Only for the `tray-gtk` fallback: libappindicator needs a running GMainLoop.
 gtk = { version = "0.18", optional = true }
+
+[dev-dependencies]
+# `tests/tray_live.rs` plays the part of the panel: it serves a fake
+# `org.kde.StatusNotifierWatcher` on a private session bus to prove the ksni
+# backend really registers (and publishes the Qt menu).  Test-only, so it costs
+# nothing in the shipped binary; it is the very crate `ksni` already links.
+zbus = { version = "5", default-features = false, features = [
+    "blocking-api",
+    "async-io",
+] }

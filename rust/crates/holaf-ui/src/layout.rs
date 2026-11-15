@@ -13,24 +13,30 @@
 //!    absorbs every extra pixel** while the button rows keep their fixed theme
 //!    heights.
 //!
-//! # Why a `ViewportCommand` and not `with_min_inner_size`/`with_max_inner_size`
+//! # Two layers, because a drag must be *blocked*, not undone
 //!
-//! Pinning `min_inner_size == max_inner_size` would be one line, but the window
-//! manager owns the drag: on several WMs/compositors the constraints are applied
-//! *after* the resize (the window visibly stretches then snaps back, and on
-//! tiling WMs it can be ignored altogether).  Re-asserting the width from
-//! `Context::send_viewport_cmd(ViewportCommand::InnerSize(..))` is deterministic
-//! on every backend, keeps the height the user picked, and is trivially testable
-//! headless (see `enforce_window_width`'s test).  `min_inner_size` is still used,
-//! for the *height* only, as a floor below which the fixed rows would not fit.
+//! 1. **The hint** — `min_inner_size.width == max_inner_size.width == required`
+//!    (height free between [`minimum_window_height`] and
+//!    [`MAX_WINDOW_HEIGHT`]).  Compositors implement this natively: X11 through
+//!    `WM_NORMAL_HINTS`, Wayland through `xdg_toplevel.set_min_size` /
+//!    `set_max_size`, so the vertical edges of the window cannot move under a
+//!    horizontal drag.  That is what makes "the horizontal resize is blocked"
+//!    true *during* the gesture instead of after it.
+//! 2. **The correction** — `ViewportCommand::InnerSize` whenever the measured
+//!    width drifted from the required one.  A compositor may ignore the hint
+//!    (tiling WMs) and the width must follow the strip count anyway: adding a
+//!    strip widens the window by one `strip_width + gap` at once.
+//!
+//! The height is only hinted at its floor, so the user keeps the vertical axis
+//! (the strips and their faders stretch).
 //!
 //! # Anti feedback loop
 //!
-//! `InnerSize` is sent **only when the measured width differs from the required
-//! one by more than [`WIDTH_TOLERANCE`]** (2 px — a WM may land one point off
-//! because of rounding).  A frame in which the window already has the right
-//! width sends nothing, so the resize request cannot ping-pong with the
-//! compositor.
+//! Each command is sent **only when its value changed**: the size hints when the
+//! required width (or the height floor) moves, the `InnerSize` correction when
+//! `|current - required| >` [`WIDTH_TOLERANCE`] (2 px — a compositor may land one
+//! point off because of rounding).  A frame in which nothing changed sends
+//! nothing, so the requests cannot ping-pong with the compositor.
 
 use egui::{Context, Vec2, ViewportCommand};
 use holaf_core::model::{Strip, StripType};
@@ -56,9 +62,11 @@ pub const QT_MIN_SECTION_WIDTH: f32 = 160.0;
 /// and the rows below it are clipped instead — see `views::strip`.
 pub const MIN_FADER_HEIGHT: f32 = 40.0;
 
-/// Height reserved at the bottom of the window for the status line, so a strip
-/// stretched to the bottom never hides its MIDI button underneath it.
-pub const FOOTER_HEIGHT: f32 = 18.0;
+/// Largest height the user may drag the window to.  It exists only so the width
+/// can be pinned with `min == max` while the height stays free (both
+/// `set_min_size` and `set_max_size` are 2-D): 10 000 points is far beyond any
+/// real display, so it is effectively "unbounded".
+pub const MAX_WINDOW_HEIGHT: f32 = 10_000.0;
 
 /// Width difference (points) tolerated before asking the WM for a resize.
 pub const WIDTH_TOLERANCE: f32 = 2.0;
@@ -130,15 +138,70 @@ pub fn width_correction(current_width: f32, required: u32) -> Option<f32> {
     }
 }
 
-/// Keep the window at [`required_width_for`] `strips`, **preserving the current
-/// height** (only the width is locked; the user owns the vertical axis).
+/// The `(min, max)` inner size that pins the width and leaves the height free.
 ///
-/// Called once per frame from [`crate::render`]: it is cheap (two rect reads and
-/// a comparison) and it self-corrects when a strip is added, deleted or when the
-/// WM ignored a previous request.
-pub fn enforce_window_width(ctx: &Context, strips: &[Strip]) {
+/// **The whole horizontal lock**: `min.x == max.x == required`, so no resize
+/// gesture can move the vertical edges of the window (X11 `WM_NORMAL_HINTS`,
+/// Wayland `xdg_toplevel.set_min_size`/`set_max_size`).  The height keeps its
+/// floor ([`minimum_window_height`]) and a ceiling far above any display, so the
+/// user still owns the vertical axis.
+///
+/// Pure, so the hint is unit-tested without a window.
+pub fn size_hints(required_width: u32, min_height: f32) -> (Vec2, Vec2) {
+    let width = required_width.max(1) as f32;
+    let min_height = if min_height.is_finite() {
+        min_height.clamp(1.0, MAX_WINDOW_HEIGHT)
+    } else {
+        1.0
+    };
+    (
+        Vec2::new(width, min_height),
+        Vec2::new(width, MAX_WINDOW_HEIGHT),
+    )
+}
+
+/// egui-memory key of the size hints last sent ([`enforce_window_width`]).
+fn hint_id() -> egui::Id {
+    egui::Id::unique("holaf-window-size-hint")
+}
+
+/// Lock the window width to [`required_width_for`] `strips` and keep the height
+/// free.
+///
+/// Two layers, both idempotent (see the module docs):
+///
+/// 1. the `min_inner_size`/`max_inner_size` hints, sent **when they change**
+///    (a new strip count, a new theme height) — this is what blocks the
+///    horizontal drag instead of undoing it;
+/// 2. an `InnerSize` correction, sent **when the measured width is off by more
+///    than [`WIDTH_TOLERANCE`]** — for a compositor that ignores the hint, and
+///    for the frame in which a strip was added or removed.
+///
+/// Called once per frame from [`crate::render`]; it costs two rect reads and a
+/// memory lookup.
+pub fn enforce_window_width(ctx: &Context, strips: &[Strip], min_height: f32) {
+    let required = required_width_for(strips);
+    if required == 0 {
+        return;
+    }
+    // 1. Pin the width (only when the hint actually changed: a compositor must
+    //    not be re-programmed on every frame).
+    let (min, max) = size_hints(required, min_height);
+    let hint = (required, min.y.to_bits());
+    let previous: Option<(u32, u32)> = ctx.data(|data| data.get_temp(hint_id()));
+    if previous != Some(hint) {
+        ctx.data_mut(|data| data.insert_temp(hint_id(), hint));
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(min));
+        ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(max));
+        log::debug!(
+            "window: width locked to {required} px (height floor {} px)",
+            min.y
+        );
+    }
+    // 2. Correct an actual drift (compositor ignored the hint, or a strip was
+    //    just added) without touching the height the user picked.
     let current = ctx.content_rect();
-    if let Some(width) = width_correction(current.width(), required_width_for(strips)) {
+    if let Some(width) = width_correction(current.width(), required) {
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
             width,
             current.height().max(1.0),
@@ -185,19 +248,20 @@ pub fn routing_plate_height(theme: &Theme, targets: usize) -> f32 {
     n * theme.dimensions.route_button_height + (n - 1.0) * 2.0 + 4.0
 }
 
-/// Height of the rows **above** the fader for exactly the rows that are drawn.
+/// Height of the rows **above** the fader — the same for every strip of a kind.
 ///
 /// Must stay in sync with the drawing order of `views::strip::strip_ui`
 /// (header → caption → combo → [inputs: checkbox, SELECT APPS, routing plate |
-/// outputs: BUS MASTER] → gap → *fader*).  `apps_row` is
-/// `_update_app_btn_visibility`: the `SELECT APPS` row only exists on a virtual,
-/// non-default input, so the same kind can be 23 px shorter.
-pub fn rows_before_fader(
-    theme: &Theme,
-    kind: StripType,
-    apps_row: bool,
-    route_targets: usize,
-) -> f32 {
+/// outputs: BUS MASTER] → gap → *fader*).
+///
+/// The `SELECT APPS` row is counted for **every** input, although
+/// `_update_app_btn_visibility` hides the button on a physical or default-sink
+/// input: Qt kept the widget in the layout (`setVisible(false)`, not a removal),
+/// so its 18 px and its 5 px gap stayed reserved and every input had the same
+/// height — which is what lined the faders up.  [`crate::views::strip`] reserves
+/// the row too: it allocates it always and only paints the button when it
+/// applies, so the picture and this model never disagree.
+pub fn rows_before_fader(theme: &Theme, kind: StripType, route_targets: usize) -> f32 {
     let d = &theme.dimensions;
     let t = &theme.typography;
     let mut rows: Vec<f32> = vec![
@@ -209,9 +273,7 @@ pub fn rows_before_fader(
     match kind {
         StripType::Input => {
             rows.push(d.checkbox_height); // "Default Sink"
-            if apps_row {
-                rows.push(d.combo_height); // "SELECT APPS"
-            }
+            rows.push(d.combo_height); // "SELECT APPS" (space always reserved)
             rows.push(routing_plate_height(theme, route_targets));
         }
         StripType::Output => rows.push(BUS_MASTER_HEIGHT),
@@ -222,10 +284,10 @@ pub fn rows_before_fader(
     sum + row_gap(theme) * rows.len() as f32
 }
 
-/// Worst case of [`rows_before_fader`]: every optional row drawn (`SELECT APPS`
-/// included).  Used by the height floors, which must hold whatever the strip is.
+/// [`rows_before_fader`] for a strip kind (the "before the fader" half of the
+/// height model).
 pub fn strip_rows_before_fader(theme: &Theme, kind: StripType, route_targets: usize) -> f32 {
-    rows_before_fader(theme, kind, true, route_targets)
+    rows_before_fader(theme, kind, route_targets)
 }
 
 /// Height of the rows **below** the fader: gap, MONO/MUTE, gap, MIDI.
@@ -241,26 +303,6 @@ pub fn strip_fixed_height(theme: &Theme, kind: StripType, route_targets: usize) 
         + strip_rows_after_fader(theme)
         + theme.dimensions.strip_padding
         + theme.dimensions.strip_padding_bottom
-}
-
-/// [`fader_height_for`] for the rows a strip actually draws — `apps_row` tells
-/// whether the optional `SELECT APPS` row is there.
-///
-/// `views::strip` measures what it drew (`Ui::available_height`) rather than
-/// trusting this, but it debug-asserts the two agree, so the model can never
-/// drift away from the picture.
-pub fn fader_height_for_case(
-    theme: &Theme,
-    kind: StripType,
-    apps_row: bool,
-    route_targets: usize,
-    strip_height: f32,
-) -> f32 {
-    let fixed = rows_before_fader(theme, kind, apps_row, route_targets)
-        + strip_rows_after_fader(theme)
-        + theme.dimensions.strip_padding
-        + theme.dimensions.strip_padding_bottom;
-    (strip_height - fixed).max(MIN_FADER_HEIGHT)
 }
 
 /// Natural (Qt `sizeHint`) height of a strip: fixed rows + the theme's default
@@ -283,11 +325,11 @@ pub fn strip_min_height(theme: &Theme, kind: StripType, route_targets: usize) ->
 /// [`MIN_FADER_HEIGHT`]; when the window is squeezed below that the strip
 /// clips its last rows instead of drawing a 2 px fader).
 ///
-/// *Model, not the drawn value*: `views::strip` measures the rows it actually
-/// drew (a strip whose `SELECT APPS` row is hidden has 21 px more fader), so the
-/// drawn fader of a virtual-and-default input is 21 px taller than this
-/// function says.  The formula is the worst case (every optional row shown),
-/// which is what the height floors below must be built on.
+/// Every row of a kind has its height reserved, the `SELECT APPS` one included,
+/// so this is not a "worst case": it is exactly what is drawn, for every strip
+/// of that kind — hence identical strips and aligned faders.
+/// [`crate::views::strip`] measures the rows it drew (`Ui::available_height`)
+/// and debug-asserts that the two agree.
 pub fn fader_height_for(
     theme: &Theme,
     kind: StripType,
@@ -298,10 +340,9 @@ pub fn fader_height_for(
 }
 
 /// Height available to a strip inside a window `window_height` tall: the window
-/// minus the section header, the section's bottom margin and the status line.
+/// minus the section header and the section's bottom margin.
 pub fn available_strip_height(theme: &Theme, window_height: f32) -> f32 {
-    (window_height - header_height(theme) - theme.dimensions.section_padding - FOOTER_HEIGHT)
-        .max(0.0)
+    (window_height - header_height(theme) - theme.dimensions.section_padding).max(0.0)
 }
 
 /// Height every strip is drawn at for a window `window_height` tall: all the
@@ -326,7 +367,6 @@ pub fn minimum_window_height(theme: &Theme, route_targets: usize) -> f32 {
     header_height(theme)
         + strip_min_height(theme, StripType::Input, route_targets)
         + theme.dimensions.section_padding
-        + FOOTER_HEIGHT
 }
 
 #[cfg(test)]
@@ -410,7 +450,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(raw, |_ui| {
-            enforce_window_width(&ctx, &strips);
+            enforce_window_width(&ctx, &strips, 373.0);
         });
         output.textures_delta.clear();
         let commands = &output
@@ -418,15 +458,19 @@ mod tests {
             .get(&egui::ViewportId::ROOT)
             .expect("the root viewport is always reported")
             .commands;
-        assert_eq!(
-            commands,
-            &vec![ViewportCommand::InnerSize(egui::vec2(794.0, 640.0))],
-            "1200 px wide window must be pulled back to 794 px, height untouched"
+        assert!(
+            commands.contains(&ViewportCommand::InnerSize(egui::vec2(794.0, 640.0))),
+            "1200 px wide window must be pulled back to 794 px, height untouched: {commands:?}"
+        );
+        // The hint that blocks the *next* drag travels with it.
+        assert!(
+            commands.contains(&ViewportCommand::MinInnerSize(egui::vec2(794.0, 373.0))),
+            "{commands:?}"
         );
     }
 
     #[test]
-    fn a_frame_with_the_right_width_sends_no_command() {
+    fn a_frame_with_the_right_width_only_sends_the_hint_once() {
         let ctx = crate::test_support::headless_context();
         let strips = demo_strips();
         let raw = egui::RawInput {
@@ -437,7 +481,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(raw, |_ui| {
-            enforce_window_width(&ctx, &strips);
+            enforce_window_width(&ctx, &strips, 373.0);
         });
         output.textures_delta.clear();
         let commands = &output
@@ -446,9 +490,76 @@ mod tests {
             .expect("the root viewport is always reported")
             .commands;
         assert!(
-            commands.is_empty(),
+            !commands
+                .iter()
+                .any(|command| matches!(command, ViewportCommand::InnerSize(_))),
             "already 794 px wide: {commands:?} would fight the compositor"
         );
+    }
+
+    /// The whole horizontal lock: `min.x == max.x`, the height stays free
+    /// between its floor and a ceiling no display reaches.
+    #[test]
+    fn the_size_hints_pin_the_width_and_leave_the_height_free() {
+        let (min, max) = size_hints(794, 373.0);
+        assert_eq!(min, egui::vec2(794.0, 373.0));
+        assert_eq!(max, egui::vec2(794.0, MAX_WINDOW_HEIGHT));
+        assert_eq!(min.x, max.x, "the width is blocked in both directions");
+        assert!(max.y > 1440.0, "no real display is that tall");
+        // Degenerate input never produces a zero-sized window.
+        let (min, max) = size_hints(0, f32::NAN);
+        assert_eq!(min.x, 1.0);
+        assert_eq!(min.y, 1.0);
+        assert_eq!(max.x, 1.0);
+        // A floor taller than the ceiling is clamped instead of inverted.
+        let (min, _) = size_hints(500, MAX_WINDOW_HEIGHT * 2.0);
+        assert_eq!(min.y, MAX_WINDOW_HEIGHT);
+    }
+
+    #[test]
+    fn the_hints_are_sent_once_and_only_when_the_width_changes() {
+        // The hints are what actually blocks the drag, so they must reach the
+        // compositor — but once, not on every frame.
+        let ctx = crate::test_support::headless_context();
+        let strips = demo_strips();
+        let run = |width: f32| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 720.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |_ui| {
+                enforce_window_width(&ctx, &strips, 373.0);
+            });
+            output.textures_delta.clear();
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .expect("the root viewport is always reported")
+                .commands
+                .clone()
+        };
+        let first = run(794.0);
+        assert!(
+            first.contains(&ViewportCommand::MinInnerSize(egui::vec2(794.0, 373.0))),
+            "{first:?}"
+        );
+        assert!(
+            first.contains(&ViewportCommand::MaxInnerSize(egui::vec2(
+                794.0,
+                MAX_WINDOW_HEIGHT
+            ))),
+            "{first:?}"
+        );
+        assert!(
+            !first.contains(&ViewportCommand::InnerSize(egui::vec2(794.0, 720.0))),
+            "the right width needs no correction: {first:?}"
+        );
+        // Second frame, same width: nothing at all.
+        let second = run(794.0);
+        assert!(second.is_empty(), "{second:?}");
     }
 
     #[test]
@@ -481,32 +592,61 @@ mod tests {
         );
     }
 
-    /// What the demo strips give: `SELECT APPS` only on a virtual, non-default
-    /// input (`_update_app_btn_visibility`), which is worth 23 px of fader.
+    /// `SELECT APPS` is only *drawn* on a virtual, non-default input
+    /// (`_update_app_btn_visibility`), but its row is always **reserved**: Qt
+    /// hid the widget, it did not remove it from the layout, so every input kept
+    /// the same height and the faders of a section stayed aligned.  The height
+    /// model has no notion of the button's visibility any more — that is the
+    /// regression this guards.
     #[test]
-    fn the_optional_apps_row_is_worth_its_height_and_its_gap() {
+    fn every_input_reserves_the_apps_row_so_the_faders_line_up() {
         let t = Theme::holaf_dark();
-        let with = rows_before_fader(&t, StripType::Input, true, 3);
-        let without = rows_before_fader(&t, StripType::Input, false, 3);
-        assert_eq!(with - without, t.dimensions.combo_height + row_gap(&t));
-        // Same strip height, the shorter layout hands 23 px to the fader.
-        let a = fader_height_for_case(&t, StripType::Input, true, 3, 532.0);
-        let b = fader_height_for_case(&t, StripType::Input, false, 3, 532.0);
-        assert_eq!(b - a, 23.0);
-        // `fader_height_for` is the worst case, so it matches the full layout.
-        assert_eq!(a, fader_height_for(&t, StripType::Input, 3, 532.0));
+        // The row is worth its own height plus one gap, for all inputs.
+        let inputs = rows_before_fader(&t, StripType::Input, 3);
+        let outputs = rows_before_fader(&t, StripType::Output, 3);
+        // "Default Sink" + "SELECT APPS" + the routing plate instead of the
+        // "BUS MASTER" label, plus the two extra row gaps.
+        assert_eq!(
+            inputs - outputs,
+            t.dimensions.checkbox_height + t.dimensions.combo_height + 68.0 - BUS_MASTER_HEIGHT
+                + 2.0 * row_gap(&t)
+        );
+        // Same strip height ⇒ same fader for every input, and the model is what
+        // `views::strip` debug-asserts against.
+        assert_eq!(
+            fader_height_for(&t, StripType::Input, 3, 532.0),
+            rows_fader(&t, StripType::Input, 3, 532.0)
+        );
+        // …and an output strip only differs because its rows differ (BUS MASTER
+        // instead of checkbox + apps + plate), never by a hidden button.
+        assert_eq!(
+            fader_height_for(&t, StripType::Output, 3, 532.0),
+            532.0 - 175.0
+        );
+    }
+
+    /// The fader height the drawn rows imply, computed independently of
+    /// [`fader_height_for`] so the two can be compared.
+    fn rows_fader(t: &Theme, kind: StripType, route_targets: usize, strip_height: f32) -> f32 {
+        let fixed = rows_before_fader(t, kind, route_targets)
+            + strip_rows_after_fader(t)
+            + t.dimensions.strip_padding
+            + t.dimensions.strip_padding_bottom;
+        (strip_height - fixed).max(MIN_FADER_HEIGHT)
     }
 
     #[test]
     fn the_fader_absorbs_the_window_height() {
         let t = Theme::holaf_dark();
-        // A 600 px window: 600 - 40 (header) - 10 (margin) - 18 (status line).
-        assert_eq!(available_strip_height(&t, 600.0), 532.0);
+        // A 600 px window: 600 - 40 (header) - 10 (margin).  There is no status
+        // line reserved at the bottom any more (it was removed in favour of a
+        // transient notice), so the strips get those 18 px.
+        assert_eq!(available_strip_height(&t, 600.0), 550.0);
         let short = fader_height_for(&t, StripType::Input, 3, available_strip_height(&t, 600.0));
-        assert_eq!(short, 532.0 - 265.0);
+        assert_eq!(short, 550.0 - 265.0);
         // A 900 px window gives the fader 300 px more, nothing else moves.
         let tall = fader_height_for(&t, StripType::Input, 3, available_strip_height(&t, 900.0));
-        assert_eq!(tall, 832.0 - 265.0);
+        assert_eq!(tall, 850.0 - 265.0);
         assert_eq!(tall - short, 300.0);
         // Both sections are the same height: an output strip just has a
         // shorter fixed part, so *its* fader is the one that is longer.
@@ -528,7 +668,7 @@ mod tests {
         assert!((405.0..425.0).contains(&natural), "{natural}");
         assert_eq!(strip_min_height(&t, StripType::Input, 3), natural - 110.0);
         // The minimum window height is the one that still fits that strip.
-        assert_eq!(minimum_window_height(&t, 3), 40.0 + 305.0 + 10.0 + 18.0);
+        assert_eq!(minimum_window_height(&t, 3), 40.0 + 305.0 + 10.0);
         assert!(minimum_window_height(&t, 3) < 600.0);
         // The window floor is narrower than any real configuration.
         assert_eq!(minimum_window_width(), 320.0);

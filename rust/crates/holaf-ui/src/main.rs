@@ -41,6 +41,14 @@ struct HolafApp {
     /// Whether the window is currently shown.  The tray's Show/Hide entry toggles
     /// it; egui hides/shows the viewport with `ViewportCommand::Visible`.
     window_visible: bool,
+    /// Set by the tray's Quit (or anything else that means "really leave"):
+    /// the close request that follows must **not** be turned into a hide.
+    ///
+    /// This is what made "Quit" from the tray do nothing: it asked the window to
+    /// close, the close request came back on the next frame, `close_action()`
+    /// answered `Hide` (a tray exists and the preference is on) and the app went
+    /// back to the tray instead of quitting.
+    quitting: bool,
     /// The MIDI controller this window drives (`--features midi` only).
     #[cfg(feature = "midi")]
     midi: MidiDevice,
@@ -108,17 +116,21 @@ impl HolafApp {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         // Starting geometry.  Width: exactly what the strip count requires
-        // (Qt's `setFixedWidth(Σ section_width)`), re-asserted every frame by
-        // `holaf_ui::layout::enforce_window_width`.  Height: the one saved in
-        // `config.json` (`window.height`), else the theme's, free for the user
-        // to drag from then on.
+        // (Qt's `setFixedWidth(Σ section_width)`), pinned by the size hints so a
+        // horizontal drag cannot move it (`layout::size_hints`; re-asserted every
+        // frame by `layout::enforce_window_width`).  Height: the one saved in
+        // `config.json` (`window.height`), else the theme's, free for the user to
+        // drag from then on.
         let theme = &state.theme.theme;
         let (_, outputs) = holaf_ui::layout::counts(&state.strips);
+        let (min_size, max_size) = holaf_ui::layout::size_hints(
+            holaf_ui::layout::required_width_for(&state.strips),
+            holaf_ui::layout::minimum_window_height(theme, outputs),
+        );
         cc.egui_ctx
-            .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                holaf_ui::layout::minimum_window_width(),
-                holaf_ui::layout::minimum_window_height(theme, outputs),
-            )));
+            .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(max_size));
         let height = state
             .geometry()
             .map(|geometry| geometry.height.max(200.0))
@@ -139,6 +151,7 @@ impl HolafApp {
             state,
             frames: 0,
             window_visible: true,
+            quitting: false,
             #[cfg(feature = "midi")]
             midi,
         }
@@ -149,8 +162,10 @@ impl eframe::App for HolafApp {
     /// Close button: quit, unless a tray icon is available *and* the user asked
     /// for hide-on-close (Qt's `closeEvent` rule, see [`holaf_ui::tray`]).
     ///
-    /// This build has no tray (the crate needs GTK3, absent here), so the window
-    /// closes and the app exits — hiding it would leave an unreachable process.
+    /// Whether closing hides or quits is decided in [`Self::intercept_close`]
+    /// by `tray::available()`: with no tray icon (no StatusNotifier host, or a
+    /// build without the `tray` feature) the close is allowed and the app
+    /// exits — hiding it would leave an unreachable process.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Shutdown mirrors `make_shutdown_all`: pending config write, engine
         // `Shutdown`, join — no PipeWire object or capture child survives.
@@ -186,7 +201,9 @@ impl HolafApp {
         if !requested {
             return;
         }
-        match self.state.close_action() {
+        // `quitting` is the tray's Quit entry: it always means "quit", even
+        // when closing the window would only hide it (`close_action_with`).
+        match self.state.close_action(self.quitting) {
             holaf_ui::tray::CloseAction::Hide => {
                 log::info!("ui: close requested - hiding to the tray");
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -194,7 +211,14 @@ impl HolafApp {
                 self.window_visible = false;
             }
             holaf_ui::tray::CloseAction::Quit => {
-                log::info!("ui: close requested - quitting (no tray)");
+                log::info!(
+                    "ui: close requested - quitting ({})",
+                    if self.quitting {
+                        "tray Quit"
+                    } else {
+                        "no tray"
+                    }
+                );
             }
         }
     }
@@ -224,7 +248,11 @@ impl HolafApp {
                     log::info!("tray: quit");
                     // `ViewportCommand::Close` runs the normal exit path
                     // (`on_exit` → `AppState::shutdown`): no PipeWire object or
-                    // capture child survives.
+                    // capture child survives.  The `quitting` flag is what keeps
+                    // `intercept_close` from turning this close request back into
+                    // "hide to the tray" — the bug that made the Quit entry do
+                    // nothing at all.
+                    self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -238,7 +266,20 @@ impl HolafApp {
     /// a crash.
     fn pump_midi(&mut self, #[allow(unused_variables)] ctx: &egui::Context) {
         #[cfg(feature = "midi")]
-        self.midi.pump(&mut self.state, std::time::Instant::now());
+        {
+            // Hand the context to the reader thread the first time (the port may
+            // be opened later, at any point of the session).
+            if self.midi.ctx.is_none() {
+                self.midi.ctx = Some(ctx.clone());
+            }
+            if self.midi.pump(&mut self.state, std::time::Instant::now()) {
+                // A controller message is user input, exactly like a mouse move:
+                // repaint **now** instead of waiting for the next 40 ms meter
+                // tick, otherwise a knob sweep is drawn in 40 ms steps and feels
+                // "saccadé" while the mouse stays smooth.
+                ctx.request_repaint();
+            }
+        }
         #[cfg(not(feature = "midi"))]
         {
             // Without the `midi` feature the mappings still load, show and save
@@ -287,6 +328,11 @@ struct MidiDevice {
     /// The last port-list failure, so a missing ALSA sequencer is logged once per
     /// change instead of twice a second.
     list_error: Option<String>,
+    /// The window's `egui::Context`, handed to the MIDI reader thread so a
+    /// message can wake the UI at once (`MidiPort::open_with_wake`).  Set on the
+    /// first frame: without it, a knob would only be *seen* on the next vumeter
+    /// tick (40 ms), which is exactly what made MIDI feel jerky next to the mouse.
+    ctx: Option<egui::Context>,
 }
 
 #[cfg(feature = "midi")]
@@ -298,12 +344,17 @@ impl MidiDevice {
             next_probe: None,
             next_sync: std::time::Instant::now(),
             list_error: None,
+            ctx: None,
         }
     }
 
     /// One frame of MIDI work: follow the selection, (re)connect, move messages
     /// and LEDs, keep the status line honest.
-    fn pump(&mut self, state: &mut AppState, now: std::time::Instant) {
+    ///
+    /// Returns `true` when at least one controller message was applied this
+    /// frame: the shell then asks for an immediate repaint, so a knob sweep is
+    /// drawn as fast as the controller sends it instead of once per meter tick.
+    fn pump(&mut self, state: &mut AppState, now: std::time::Instant) -> bool {
         // 1. The user may have picked another port (menu, picker, --midi).
         if self.runtime.set_desired(state.midi_port_request.clone()) {
             self.close(state, "controller changed");
@@ -331,7 +382,7 @@ impl MidiDevice {
         }
 
         // 4. Messages in, LEDs out.
-        self.drain_events(state, now);
+        let handled = self.drain_events(state, now);
         if self.port.is_some() && now >= self.next_sync {
             self.next_sync = now + std::time::Duration::from_secs(1);
             // A mute toggled from the mouse, a strip added, a label changed: the
@@ -354,6 +405,7 @@ impl MidiDevice {
                 }
             }
         }
+        handled
     }
 
     /// Read the port list; returns whether it could be read.
@@ -391,7 +443,7 @@ impl MidiDevice {
     }
 
     fn open(&mut self, state: &mut AppState, name: &str) {
-        match holaf_ui::midi::MidiPort::open(name) {
+        match holaf_ui::midi::MidiPort::open_with_wake(name, self.ctx.clone()) {
             Ok(port) => {
                 log::info!("midi: listening on {name:?}");
                 self.port = Some(port);
@@ -425,12 +477,21 @@ impl MidiDevice {
         }
     }
 
-    fn drain_events(&mut self, state: &mut AppState, now: std::time::Instant) {
-        let Some(port) = &self.port else { return };
+    /// Apply everything the controller has queued.  Returns how many messages
+    /// were handled (the shell repaints at once when it is not zero).
+    ///
+    /// The port's reader thread fills a channel as the messages arrive, so this
+    /// drain is the only latency between the knob and the fader — there is no
+    /// throttle left in the path (`midi::decode` applies every message, the
+    /// engine side coalesces to 25 Hz with last-value-wins).
+    fn drain_events(&mut self, state: &mut AppState, now: std::time::Instant) -> bool {
+        let Some(port) = &self.port else { return false };
+        let mut handled = false;
         for event in port.drain() {
             match event {
                 holaf_ui::midi::MidiEvent::Message(message) => {
                     state.handle_midi_message(message, now);
+                    handled = true;
                 }
                 holaf_ui::midi::MidiEvent::Opened(name) => {
                     log::info!("midi: port {name:?} opened");
@@ -438,10 +499,11 @@ impl MidiDevice {
                 holaf_ui::midi::MidiEvent::Error(reason) => {
                     log::warn!("midi: {reason}");
                     self.close(state, &reason);
-                    return;
+                    return handled;
                 }
             }
         }
+        handled
     }
 }
 
@@ -573,10 +635,11 @@ fn main() -> ExitCode {
     // the "always on top" flag is a *stored preference* here instead of the
     // unconditional `WindowStaysOnTopHint` the Qt build set.
     //
-    // The tray itself is behind the `tray` feature (GTK3 + libappindicator).
-    // `install()` never panics: a missing GTK/host logs a warning and
+    // The tray itself is behind the `tray` feature (ksni: a D-Bus
+    // StatusNotifierItem, no GTK).  `install()` never panics: a missing
+    // StatusNotifier host, session bus or display logs a warning and
     // `available()` stays `false`, so closing the window quits — the safe
-    // fallback on a bare Wayland session with no appindicator host.
+    // fallback on a bare Wayland session with no tray host.
     holaf_ui::tray::install();
     log::info!(
         "ui: always_on_top={}, tray={}",
@@ -650,13 +713,25 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("holaf-ui: cannot open a window: {err}");
-            let headless = std::env::var_os("DISPLAY").is_none()
-                && std::env::var_os("WAYLAND_DISPLAY").is_none();
-            if headless {
+            let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+            let x11 = std::env::var_os("DISPLAY").is_some();
+            if !wayland && !x11 {
                 eprintln!("holaf-ui: no display server (DISPLAY / WAYLAND_DISPLAY are unset).");
                 eprintln!("           To render the UI to a PNG instead:");
                 eprintln!(
                     "           cargo run -p holaf-ui --bin holaf-ui-snapshot -- --out /tmp/holaf-ui.png"
+                );
+            } else if !wayland {
+                // This build targets Wayland (see `crates/holaf-ui/Cargo.toml`):
+                // there is no X11 backend compiled in, so an X11-only session
+                // cannot show it.  Say so, and say how to get one.
+                eprintln!(
+                    "holaf-ui: this build is Wayland-only (no X11 backend compiled in), \
+                     and WAYLAND_DISPLAY is unset."
+                );
+                eprintln!(
+                    "           For an X11-only session, rebuild with: cargo build -p holaf-ui \
+                     --features x11"
                 );
             }
             ExitCode::FAILURE

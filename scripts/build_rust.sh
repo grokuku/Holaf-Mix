@@ -23,7 +23,16 @@
 #  ou si la compilation échoue, le build continue en Python+Qt seul (le lanceur
 #  se rabat sur l'UI Qt au démarrage).
 #
-#  Si `holaf-ui` ne compile pas (libs X11/wayland absentes de la machine de
+#  L'interface est une cliente **Wayland** (feature cargo `wayland` de `eframe`,
+#  sans X11 : c'est ce qui évite l'icône « X11 » et la demande de serveur X sous
+#  Wayland).  Dépendances de build/runtime :
+#      Arch   : wayland, wayland-protocols, libxkbcommon
+#      Debian : libwayland-dev, wayland-protocols, libwayland-bin,
+#               libxkbcommon-dev
+#  Elles sont `dlopen`ées au run (invisibles dans `ldd`).  Une machine X11-only
+#  doit compiler avec `--features x11` (HOLAF_UI_X11=1 ci-dessous).
+#
+#  Si `holaf-ui` ne compile pas (libpipewire/wayland absentes de la machine de
 #  build), le script retombe sur holafd+holafctl afin de ne pas perdre le
 #  daemon : c'est un warning, pas une erreur.
 #
@@ -33,12 +42,16 @@
 #      ./scripts/build_rust.sh /tmp/my-dist    # destination personnalisée
 #      HOLAFD_BIN_OUT=dist ./scripts/build_rust.sh
 #      HOLAF_NO_TRAY=1 ./scripts/build_rust.sh # SANS l'icône de tray
+#      HOLAF_UI_X11=1 ./scripts/build_rust.sh  # + backend X11 (session X11-only)
 #
 #  L'icône de zone de notification (feature cargo `tray`) est **activée par
 #  défaut** : c'est ce que le paquet distribué doit contenir (décision du
-#  2026-11-14).  Elle réclame GTK3 dev au build et libayatana-appindicator + un
-#  hôte appindicator au runtime — d'où l'échappatoire `HOLAF_NO_TRAY=1` (et
-#  `HOLAF_TRAY=0`, historique) pour une machine de build sans GTK3.
+#  2026-11-14).  Depuis la migration vers le backend **ksni** (D-Bus
+#  StatusNotifierItem, 2026-11-15) elle ne réclame PLUS NI GTK3 NI
+#  libayatana-appindicator : aucun paquet système à installer au build, et au
+#  runtime il suffit d'un hôte StatusNotifier (KDE/Plasma, waybar, swaybar,
+#  gnome-shell-extension-appindicator).  `HOLAF_NO_TRAY=1` (ou `HOLAF_TRAY=0`)
+#  reste là pour livrer un binaire sans icône.
 #
 #  Dans TOUS les cas, si la compilation avec `--features tray` échoue, le script
 #  réessaie **sans** la feature (on garde holaf-ui, on perd juste l'icône) et
@@ -93,12 +106,29 @@ fi
 #   HOLAF_NO_TRAY=1        -> pas de tray (la façon recommandée)
 #   HOLAF_TRAY=0           -> idem (l'ancienne variable, conservée pour les
 #                             scripts/CI existants qui la mettaient à 0)
-# Elle exige GTK3 dev (`gtk3`, ou `libgtk-3-dev`) au build et l'appindicator au
-# runtime ; si la compilation avec la feature échoue, on réessaie sans (voir
-# plus bas) pour ne jamais perdre holaf-ui.
-UI_FEATURES=(--features tray)
+# Backend par défaut = `ksni` (D-Bus pur, zéro GTK) ; `HOLAF_TRAY_GTK=1` force
+# l'ancien backend `libappindicator` (feature `tray-gtk`, qui exige `gtk3` +
+# `libayatana-appindicator` au build) — filet de sécurité, pas le défaut.
+# Si la compilation avec la feature échoue, on réessaie sans (voir plus bas)
+# pour ne jamais perdre holaf-ui.
+# Features cargo de holaf-ui :
+#   tray  l'icône de zone de notification (voir ci-dessus)
+#   x11   backend X11 **en plus** de Wayland (opt-in, jamais dans le paquet :
+#         l'app cible Wayland, cf. rust/README.md § « Serveur graphique »)
+TRAY_FEATURE="tray"
+if [[ "${HOLAF_TRAY_GTK:-0}" == "1" ]]; then
+    TRAY_FEATURE="tray-gtk"
+fi
+UI_FEATURES=(--features "$TRAY_FEATURE")
 if [[ "${HOLAF_NO_TRAY:-0}" == "1" || "${HOLAF_TRAY:-1}" == "0" ]]; then
     UI_FEATURES=()
+fi
+if [[ "${HOLAF_UI_X11:-0}" == "1" ]]; then
+    if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
+        UI_FEATURES+=("x11")
+    else
+        UI_FEATURES=(--features x11)
+    fi
 fi
 
 build_all() {
@@ -111,17 +141,18 @@ build_all() {
 
 log "Building holaf-ui + holafd + holafctl (release) in $RUST_DIR ..."
 if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
-    log "  + cargo feature: tray (needs gtk3 + libayatana-appindicator)"
+    log "  + cargo feature: $TRAY_FEATURE (ksni/D-Bus by default — no GTK)"
 else
     log "  tray feature DISABLED (HOLAF_NO_TRAY/HOLAF_TRAY=0) - no notification icon"
 fi
 if ! build_all; then
     if [[ ${#UI_FEATURES[@]} -gt 0 ]]; then
-        warn "WARNING: build with --features tray FAILED (GTK3/appindicator missing?)"
+        warn "WARNING: build with --features $TRAY_FEATURE FAILED"
         warn "         retrying WITHOUT the tray icon - holaf-ui is kept, but the"
         warn "         packaged app will have NO notification icon."
-        warn "         Install gtk3 (+ libayatana-appindicator) or set HOLAF_NO_TRAY=1"
-        warn "         to make this explicit and silence this warning."
+        warn "         (ksni needs no system package; if you forced HOLAF_TRAY_GTK=1,"
+        warn "         install gtk3 + libayatana-appindicator, or set HOLAF_NO_TRAY=1"
+        warn "         to make this explicit and silence this warning.)"
         UI_FEATURES=()
     fi
     if ! build_all; then

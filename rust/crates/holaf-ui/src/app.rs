@@ -65,6 +65,15 @@ pub const ENGINE_RESTART_DEBOUNCE: Duration = Duration::from_millis(200);
 /// one is live, so the drag is coalesced instead).
 pub const FX_PARAMS_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// How long a status message stays on screen as a transient notice.
+///
+/// The Qt build had a permanent status bar at the bottom of the window; the user
+/// did not want that chrome (`"engine ready"` was all it ever said).  A real
+/// notice — a failed write, a learned MIDI mapping, a removed strip — is still
+/// shown, but it fades out on its own after this long, and nothing is drawn when
+/// there is nothing to say.
+pub const STATUS_NOTICE: Duration = Duration::from_secs(4);
+
 /// How many undo records are kept for rollback.  A failure is reported within
 /// one engine round-trip, so a handful would do; 64 is cheap insurance.
 const UNDO_DEPTH: usize = 64;
@@ -311,8 +320,15 @@ pub struct AppState {
     meter_missing: HashSet<String>,
     /// Actions the views produced this frame, waiting for the engine.
     pending_actions: Vec<UiAction>,
-    /// Last status message (status bar).
+    /// Last status message.  It is **not** a permanent status bar any more (the
+    /// Qt build had one, the user did not want it): [`crate::views::main_window`]
+    /// shows it as a short-lived notice at the bottom of the window, and only
+    /// while it is fresh ([`Self::transient_status`]).
     pub status: Option<String>,
+    /// The last `status` value `tick` saw, so a change can be timestamped.
+    status_seen: Option<String>,
+    /// When `status` last changed (the notice's age).
+    status_at: Instant,
     /// `Some((uid, target))` while a MIDI learn is armed.
     pub midi_learning: Option<(String, MidiTarget)>,
     /// `Some(uid)` while the rename dialog is open.
@@ -408,9 +424,6 @@ pub struct AppState {
     pub midi_map: MidiMap,
     /// LED messages waiting to be written to the controller.
     pub midi_feedback: Vec<MidiMessage>,
-    /// Per-strip volume throttle for a knob that sends faster than the model
-    /// needs to change.
-    midi_last_volume: HashMap<(String, MidiTarget), Instant>,
     /// The MIDI input the user selected (`None` = no controller).
     pub midi_port_name: Option<String>,
     /// The MIDI input the user **wants** (`ui_rust.midi_port`, or the automatic
@@ -428,7 +441,7 @@ pub struct AppState {
     /// Why the port list is empty, when the shell could not read it.
     pub midi_ports_error: Option<String>,
     /// Is a controller answering right now?  Maintained by the shell (the
-    /// library never touches a device): the picker and the status line need it.
+    /// library never touches a device): the picker and the status notice need it.
     pub midi_connected: bool,
     /// The port picker dialog, when open.
     pub midi_port_picker: Option<crate::dialogs::MidiPortPicker>,
@@ -571,6 +584,8 @@ impl AppState {
             meter_missing: HashSet::new(),
             pending_actions: Vec::new(),
             status: None,
+            status_seen: None,
+            status_at: now,
             midi_learning: None,
             renaming: None,
             rename_buffer: String::new(),
@@ -611,7 +626,6 @@ impl AppState {
             midi_bindings: HashMap::new(),
             midi_map: MidiMap::default(),
             midi_feedback: Vec::new(),
-            midi_last_volume: HashMap::new(),
             midi_port_name: None,
             midi_port_request: None,
             midi_port_auto: true,
@@ -632,8 +646,8 @@ impl AppState {
     /// | situation | result |
     /// |---|---|
     /// | file present and valid | strips + geometry + theme, persisted on change |
-    /// | file absent | **no strips**, no write (the window is then the 160+160 minimum), warning in the status bar |
-    /// | file corrupt | same, with the parse error in the status bar and a `log::warn!` |
+    /// | file absent | **no strips**, no write (the window is then the 160+160 minimum), warning in the status notice |
+    /// | file corrupt | same, with the parse error in the status notice and a `log::warn!` |
     ///
     /// No panic, and never an empty `apply_snapshot` pushed to a running daemon
     /// when there was no config to load (see [`Self::attach_engine`]).
@@ -1011,8 +1025,6 @@ impl AppState {
                     self.app_assignments.remove(&removed.uid);
                     self.midi_bindings.remove(&removed.uid);
                     self.midi_map = MidiMap::from_strips(&self.strips, &self.midi_bindings);
-                    self.midi_last_volume
-                        .retain(|(uid, _), _| uid != &removed.uid);
                     // A learn armed on the strip that just disappeared would
                     // otherwise store a mapping nobody can ever use.
                     if self.is_midi_learning(&removed.uid) {
@@ -1467,7 +1479,11 @@ impl AppState {
             match event {
                 EngineEvent::Ready => {
                     self.engine = EngineState::Connected;
-                    self.status = Some("engine ready".to_string());
+                    // Not a status message: "engine ready" is the normal state,
+                    // and a banner saying "everything works" is exactly the
+                    // status bar the user did not ask for.  It belongs in the
+                    // log, where a bug report can find it.
+                    log::info!("engine: ready");
                 }
                 EngineEvent::Levels(levels) => event_levels.extend(levels),
                 EngineEvent::Applied(what) => {
@@ -1783,7 +1799,7 @@ impl AppState {
     /// [`apps::ENFORCE_INTERVAL`] and right after the dialog is confirmed — so
     /// the plan is always computed from a list that was just read.  Each move is
     /// one [`EngineCommand::AppMove`]; a refused move is reported by the bridge
-    /// (`Failed`) and shows up in the status line, never as a silent no-op.
+    /// (`Failed`) and shows up in the status notice, never as a silent no-op.
     pub fn enforce_applications(&mut self) {
         if self.app_list.stub {
             log::debug!("apps: the engine cannot move applications (stub payload)");
@@ -1834,7 +1850,7 @@ impl AppState {
     ///
     /// The work happens on the engine thread (it blocks for as long as PipeWire
     /// needs), and it is **not** re-entrant: a second click while one restart
-    /// runs is refused with a status line, exactly like Qt's
+    /// runs is refused with a status notice, exactly like Qt's
     /// `_full_restart_running`.  Two concurrent restarts would race on the same
     /// audio graph.
     pub fn restart_engine(&mut self, now: Instant) {
@@ -1954,18 +1970,16 @@ impl AppState {
     /// the engine and rolled back on failure like any mouse action), and a
     /// mute/mono toggle queues the LED feedback.
     pub fn handle_midi_message(&mut self, message: MidiMessage, now: Instant) {
+        // The message is handled *here*, between two ticks (the shell drains the
+        // controller before painting), so the frame clock must be current before
+        // `apply` uses it for the throttles: a stale `self.now` can only make a
+        // fader move look late.
+        self.now = now;
         let learning = self
             .midi_learning
             .as_ref()
             .map(|(uid, target)| (uid.as_str(), *target));
-        let outcome = crate::midi::decode(
-            &self.midi_map,
-            message,
-            learning,
-            &self.strips,
-            &mut self.midi_last_volume,
-            now,
-        );
+        let outcome = crate::midi::decode(&self.midi_map, message, learning, &self.strips);
         match outcome {
             MidiOutcome::Action(action) => {
                 let target = match &action {
@@ -2145,11 +2159,38 @@ impl AppState {
     /// engine, flush the throttles, write the config if due.
     pub fn tick(&mut self, now: Instant) {
         self.now = now;
+        self.tick_status(now);
         self.poll_engine_at(now);
         self.flush_engine(now);
         self.tick_app_enforcement(now);
         self.tick_midi_flash(now);
         self.save_pending(now);
+    }
+
+    /// Timestamp every change of [`Self::status`], so the window can show it as a
+    /// short-lived notice instead of a permanent bar.
+    fn tick_status(&mut self, now: Instant) {
+        if self.status != self.status_seen {
+            self.status_seen = self.status.clone();
+            self.status_at = now;
+        }
+    }
+
+    /// The status message, while it is fresh enough to be worth showing.
+    ///
+    /// `None` when there is nothing to say (the normal case) or when the last
+    /// message is older than [`STATUS_NOTICE`].  This is what replaced the Qt
+    /// status bar: permanent chrome nobody asked for, gone; a real notice (a
+    /// failed config write, "MIDI: learned…", "Removed HP") still reaches the
+    /// user, briefly.
+    pub fn transient_status(&self) -> Option<&str> {
+        let message = self.status.as_deref()?;
+        let age = self.now.saturating_duration_since(self.status_at);
+        if age < STATUS_NOTICE {
+            Some(message)
+        } else {
+            None
+        }
     }
 
     /// Expire the learn confirmation painted on a strip's MIDI button.
@@ -2195,14 +2236,20 @@ impl AppState {
             .map(|flash| flash.text.clone())
     }
 
-    /// What the window's close button (or the tray's Quit, or the WM close) must
-    /// do: **hide** when a tray icon exists and the user asked for it, otherwise
-    /// **quit** (Qt's `closeEvent` rule, see [`crate::tray::close_action`]).
+    /// What a close request must do: **hide** when a tray icon exists and the
+    /// user asked for it, otherwise **quit** (Qt's `closeEvent` rule, see
+    /// [`crate::tray::close_action_with`]).
     ///
     /// The shell calls this on `close_requested`; `Quit` lets the close proceed
     /// (`on_exit` → [`Self::shutdown`]), `Hide` cancels it and hides the window.
-    pub fn close_action(&self) -> crate::tray::CloseAction {
-        crate::tray::close_action(crate::tray::available(), self.tray_hide_on_close)
+    /// `explicit_quit` is the tray's `Quit` entry: it always quits, whatever the
+    /// hide preference says (that is the difference between "close" and "quit").
+    pub fn close_action(&self, explicit_quit: bool) -> crate::tray::CloseAction {
+        crate::tray::close_action_with(
+            explicit_quit,
+            crate::tray::available(),
+            self.tray_hide_on_close,
+        )
     }
 
     /// Stop the engine and flush what must not be lost.
@@ -2421,7 +2468,7 @@ pub fn is_persistent(action: &UiAction) -> bool {
     )
 }
 
-/// The label of a strip, for a status line (its uid when it no longer exists).
+/// The label of a strip, for a status message (its uid when it no longer exists).
 fn strip_label(state: &AppState, uid: &str) -> String {
     state
         .strips
@@ -2436,9 +2483,17 @@ pub fn render(state: &mut AppState, ui: &mut egui::Ui) {
     let time = ui.input(|i| i.time).max(0.0);
     let now = Instant::now();
     // Horizontal rule: the width is derived from the strip count, not chosen by
-    // the user.  Done here (and not in the eframe shell) so the app, the
-    // headless snapshot and the tests all go through the same geometry code.
-    crate::layout::enforce_window_width(ui.ctx(), &state.strips);
+    // the user (min_inner_size == max_inner_size, plus a correction when a
+    // compositor ignores the hint).  Done here (and not in the eframe shell) so
+    // the app, the headless snapshot and the tests all go through the same
+    // geometry code.  The height floor comes from the theme because the eframe
+    // shell's `with_min_inner_size` is only a starting value.
+    let (_, outputs) = crate::layout::counts(&state.strips);
+    crate::layout::enforce_window_width(
+        ui.ctx(),
+        &state.strips,
+        crate::layout::minimum_window_height(&state.theme.theme, outputs),
+    );
     let screen = ui.ctx().content_rect();
     state.note_window_size(screen.width(), screen.height(), now);
     state.tick(now);
@@ -2613,7 +2668,7 @@ mod tests {
         assert!(s.config.is_some());
         // Nothing is disconnected: no bridge was attached.
         assert_eq!(s.engine, EngineState::None);
-        // The status bar has no warning for a valid config.
+        // A valid config raises no notice.
         assert!(s.status.is_none(), "{:?}", s.status);
         // Dropping the state must NOT rewrite the fixture (nothing is dirty).
         let path = s.config.as_ref().unwrap().path().to_path_buf();
@@ -4397,8 +4452,9 @@ mod tests {
         assert_eq!(entry["midi_volume"]["control"], 21);
         assert_eq!(entry["midi_volume"]["channel"], 4);
 
-        // The mapping now drives the fader: `value / 127`, and the knob burst is
-        // throttled so the model does not follow 400 messages per second.
+        // The mapping now drives the fader: `value / 127`, applied as it
+        // arrives (the engine side coalesces; dropping messages here lost the
+        // last position of a sweep).
         let before = s.strips[s.strip_index(&uid).unwrap()].volume;
         assert!(before != 0.5);
         s.handle_midi_message(
@@ -4422,6 +4478,96 @@ mod tests {
         );
         assert!((s.strips[s.strip_index(&uid).unwrap()].volume - volume).abs() < 1e-6);
         s.strips = Vec::new();
+        s.config.as_mut().unwrap().cancel_save();
+    }
+
+    // --- status notice -----------------------------------------------------
+
+    /// The Qt status bar is gone: nothing is shown while everything is fine, and
+    /// a real message is a short-lived notice (`STATUS_NOTICE`) rather than
+    /// permanent chrome at the bottom of the window.
+    #[test]
+    fn a_status_message_is_a_transient_notice_not_a_status_bar() {
+        let mut s = state();
+        let start = Instant::now();
+        s.set_clock(start);
+        s.tick(start);
+        assert_eq!(s.transient_status(), None, "nothing to say by default");
+        // "engine ready" is not a message any more (it is the normal state).
+        s.status = Some("engine ready".to_string());
+        s.tick(start + Duration::from_millis(20));
+        s.status = None;
+        s.tick(start + Duration::from_millis(40));
+        assert_eq!(s.transient_status(), None, "the normal state says nothing");
+
+        // A real notice appears at once and expires on its own.
+        s.status = Some("Removed HP".to_string());
+        s.tick(start + Duration::from_secs(1));
+        assert_eq!(s.transient_status(), Some("Removed HP"));
+        s.tick(start + Duration::from_secs(2));
+        assert_eq!(s.transient_status(), Some("Removed HP"), "still fresh");
+        s.tick(start + Duration::from_secs(2) + STATUS_NOTICE);
+        assert_eq!(
+            s.transient_status(),
+            None,
+            "a notice must not become a status bar"
+        );
+        // A *new* message restarts the clock instead of inheriting the old age.
+        s.status = Some("Config saved".to_string());
+        s.tick(start + Duration::from_secs(30));
+        assert_eq!(s.transient_status(), Some("Config saved"));
+    }
+
+    // --- MIDI latency ------------------------------------------------------
+
+    /// A knob sweep must not lose its **last** message: that is what made a MIDI
+    /// volume change look jerky and stop short of where the knob was.
+    #[test]
+    fn a_midi_knob_burst_ends_on_the_last_message() {
+        let path = scratch_config("midi-burst");
+        let mut s = AppState::from_config(&path);
+        let uid = s
+            .strips
+            .iter()
+            .find(|strip| strip.label == "Web")
+            .map(|strip| strip.uid.clone())
+            .expect("the fixture has a Web strip");
+        let start = Instant::now();
+        s.set_clock(start);
+        s.midi_learn(&uid, MidiTarget::Volume);
+        s.handle_midi_message(
+            crate::midi::MidiMessage::Control {
+                channel: 0,
+                control: 40,
+                value: 10,
+            },
+            start,
+        );
+        assert!(s.midi_bindings[&uid].contains(&(MidiTarget::Volume, Binding::control(0, 40))));
+        // 101 messages inside one frame — a fast sweep.  Every one is applied
+        // (the model is the truth), and the engine sees the last value.
+        for value in 0..=100u8 {
+            s.handle_midi_message(
+                crate::midi::MidiMessage::Control {
+                    channel: 0,
+                    control: 40,
+                    value,
+                },
+                start,
+            );
+        }
+        let volume = s.strips[s.strip_index(&uid).unwrap()].volume;
+        assert!(
+            (volume - crate::midi::cc_to_volume(100)).abs() < 1e-6,
+            "the last message wins, got {volume}"
+        );
+        // The engine command is coalesced (25 Hz) but carries that same value:
+        // the fader cannot arrive short of the knob.
+        assert_eq!(
+            s.volumes.peek(&uid).copied(),
+            Some(crate::midi::cc_to_volume(100)),
+            "the pending engine value must be the last one"
+        );
         s.config.as_mut().unwrap().cancel_save();
     }
 

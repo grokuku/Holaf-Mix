@@ -1,7 +1,38 @@
-# Pinned to known-compatible versions. Major-version bounds allow safe
-# patch/minor upgrades without risk of breaking API changes.
+# Python dependencies of the Holaf-Mix **Python layer** (the residual Qt UI and
+# the measurement tools in `tools/`), plus the one build tool that `build.sh`
+# needs.  The app's window is the Rust UI (`holaf-ui`) — see
+# `docs/migration-to-pure-rust.md`.
+#
+# What this file is NOT: a pin of the exact versions the release is built
+# against.  It is a **compatible range** per package: the lower bound is the
+# oldest version the code is known to work with, the upper bound is the next
+# major (where an API break would land).  `build.sh`/the CI install these
+# packages unpinned, so a green build here only guarantees "inside these
+# ranges".  Reproducible output comes from PyInstaller's own analysis, not from
+# this file.
+#
+# Python >= 3.10 is required (3.13/3.14 is what current Arch ships; the
+# PyInstaller bundle is built with the *system* interpreter).
+
+# --- runtime: Qt fallback UI (`HOLAF_UI=python`) ---------------------------
+PySide6>=6.6.0,<7.0.0
+
+# --- runtime: audio/MIDI plumbing of the Python layer ----------------------
+sounddevice>=0.4.6,<1.0.0
 mido>=1.3.0,<2.0.0
 python-rtmidi>=1.5.0,<2.0.0
-PySide6>=6.6.0,<7.0.0
-sounddevice>=0.4.6,<1.0.0
-numpy>=1.24.0,<2.0.0
+
+# `numpy>=1.24,<2.0` was a TRAP: the last 1.x release is 1.26.4 and it has no
+# wheels past CPython 3.12, so on Arch (3.13/3.14) or any recent Debian the
+# install would try to build numpy from source and fail.  The code only uses
+# stable numpy APIs (`sqrt`/`mean`/`arange`/`frombuffer`/`stack`/`clip`), which
+# are unchanged in 2.x — and 2.x is what the CI and a modern distro install
+# anyway.  Bound below 3 to keep the "next major = review" rule.
+numpy>=2.0.0,<3.0.0
+
+# --- build tool ------------------------------------------------------------
+# PyInstaller is what `build.sh`/`packaging/holaf-mix.spec` invoke; it was
+# missing here while build.sh claimed to match this file.  It is AUR-only on
+# Arch (no `python-pyinstaller` package), which is exactly why pip installs it.
+# Build-time only: nothing imports PyInstaller at runtime.
+pyinstaller>=6.0.0,<7.0.0

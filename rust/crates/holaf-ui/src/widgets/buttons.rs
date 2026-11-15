@@ -203,12 +203,6 @@ pub fn button_in(
     response
 }
 
-/// Allocate `size` on the current row and paint a button in it.
-fn button_alloc(ui: &mut Ui, text: &str, size: Vec2, look: &ButtonLook) -> Response {
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    button_in(ui, text, rect, text, look)
-}
-
 // ---------------------------------------------------------------------------
 // FX toggles
 // ---------------------------------------------------------------------------
@@ -468,12 +462,23 @@ pub fn round_add_button(ui: &mut Ui, salt: impl Hash + std::fmt::Debug, theme: &
 /// A flat utility button ("SELECT APPS", `background-color: #555`, hover
 /// `#777`).
 pub fn flat_button(ui: &mut Ui, label: &str, size: Vec2, theme: &Theme) -> Response {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    flat_button_in(ui, label, rect, theme)
+}
+
+/// [`flat_button`] painted into an **already allocated** rect.
+///
+/// The strip needs it for `SELECT APPS`: Qt kept the button in the layout and
+/// only hid it (`setVisible(false)`), so its row height stayed reserved on every
+/// input and the faders of a section lined up.  Reserving the space means
+/// allocating the row first and painting into it afterwards.
+pub fn flat_button_in(ui: &Ui, label: &str, rect: Rect, theme: &Theme) -> Response {
     let c = &theme.colors;
     let look = ButtonLook::new(c.apps_button_bg, c.widget_text)
         .with_font_size(theme.typography.small)
         .with_radius(3.0)
         .with_hover(c.apps_button_bg_hover, c.widget_text);
-    button_alloc(ui, label, size, &look)
+    button_in(ui, label, rect, label, &look)
 }
 
 /// A device selector that only *displays* the current device.

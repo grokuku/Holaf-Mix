@@ -19,36 +19,42 @@
 //! * **tray: behind the `tray` cargo feature**, which the SHIPPED build enables
 //!   (`scripts/build_rust.sh` passes `--features tray` unless `HOLAF_NO_TRAY=1`)
 //!   but which is not in the crate's `default` feature set, so a bare
-//!   `cargo build -p holaf-ui` / `cargo test --workspace` stays hermetic.  The
-//!   cross-platform crate is `tray-icon`, and on Linux it links **GTK3 +
-//!   libappindicator** (Arch: `gtk3` + `libayatana-appindicator` — Arch has no
-//!   `libappindicator-gtk3`, that name is AUR-only; Debian: `libgtk-3-dev` +
-//!   `libayatana-appindicator3-dev`).  When the libraries are missing the build
-//!   script retries without the feature: [`available`] returns `false` and
-//!   closing the window quits (see [`close_action`]).
+//!   `cargo build -p holaf-ui` / `cargo test --workspace` stays hermetic.
+//!
+//!   The backend is **`ksni`** (cargo feature `tray`): a pure D-Bus
+//!   `org.kde.StatusNotifierItem`, i.e. **no GTK3, no `libappindicator`, no
+//!   GMainLoop**.  That is the native mechanism of the user's desktop
+//!   (KDE/Plasma on Wayland), and it removes `gtk 0.18` — a closed line with no
+//!   possible update — from the dependency graph (see
+//!   `docs/dependency-audit.md`).  `tray-gtk` (libappindicator + GTK3) is kept
+//!   as an escape hatch: `cargo build -p holaf-ui --features tray-gtk`.
 //!
 //!   `tray-icon` is pulled with `default-features = false`, which drops its
-//!   `libxdo` feature (only the predefined Copy/Paste items use it) — so no
-//!   `libxdo` build dep and no runtime `dlopen` of it.
+//!   default `libappindicator` backend (and `libxdo`, only used by the
+//!   predefined Copy/Paste items) — so the default tray links no GTK at all.
 //!
 //!   The *policy* (which entries the menu holds, what closing does), the
 //!   **icon itself** ([`icon_rgba`], drawn pixel by pixel) and the event mapping
 //!   (a menu id to a [`TrayEvent`]) are all pure and unit-tested here — in every
-//!   feature configuration.  Only the GTK/libappindicator I/O lives in
-//!   [`gtk_impl`], so wiring is one `poll` per frame and never touches GTK from
-//!   the UI thread.
+//!   feature configuration.  Only the tray-icon/D-Bus I/O lives in [`backend`],
+//!   so wiring is one `poll` per frame and never blocks the UI thread.
 //!
-//! # Wayland caveat
+//! # StatusNotifier host detection
 //!
-//! A tray icon needs an appindicator/StatusNotifier **host**:
-//! `gnome-shell-extension-appindicator`, KDE's `kstatusnotifieritem`, or
-//! `swaybar`'s `tray`.  On a bare Wayland session without one, libappindicator
-//! still "succeeds" but nothing is drawn — and on GNOME/Wayland `TrayIconEvent`
-//! clicks are not delivered at all (X11-only in `tray-icon`).  That is exactly
-//! why the reliable interaction is the **menu** (Show/Hide, not a
-//! toggle-on-click), why `with_menu_on_left_click(true)` opens that menu on a
-//! left click, and why closing must NOT hide the window unless a tray is
-//! genuinely there.
+//! A tray icon needs a StatusNotifier **host** on the session bus
+//! (`kstatusnotifieritem`/plasma, waybar, `swaybar`'s tray,
+//! `gnome-shell-extension-appindicator`).  Qt's `isSystemTrayAvailable()` asks
+//! D-Bus for `org.kde.StatusNotifierWatcher`; [`host_probe::plan`] does the same
+//! here, because **`tray-icon`'s ksni backend deliberately does not**: it spawns
+//! with `assume_sni_available(true)`, so it "succeeds" with no host and nothing
+//! would ever be drawn.  Without that check, "close hides the window" becomes a
+//! trap: the window disappears and there is no icon to bring it back.
+//!
+//! So [`available`] is `false` — and closing therefore **quits** — when the
+//! watcher name has no owner, or when the bus cannot be reached at all (no
+//! `DBUS_SESSION_BUS_ADDRESS`, a headless CI run, a bare tty).  An inconclusive
+//! probe (an error that says nothing about the host) still builds the icon:
+//! only a definite "no host" is treated as no host.
 
 /// The tray menu entries, in the Qt order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +111,25 @@ pub fn close_action(tray_available: bool, hide_on_close: bool) -> CloseAction {
     }
 }
 
+/// [`close_action`] for a close request that may be an **explicit quit** (the
+/// tray's `Quit` entry, `_force_quit` in Qt).
+///
+/// `explicit_quit` wins over everything: "quit" must quit even when closing the
+/// window only hides it.  Without that rule the tray entry did nothing at all —
+/// it asked the window to close, the close request came back, and the hide rule
+/// turned it into "go back to the tray".
+pub fn close_action_with(
+    explicit_quit: bool,
+    tray_available: bool,
+    hide_on_close: bool,
+) -> CloseAction {
+    if explicit_quit {
+        CloseAction::Quit
+    } else {
+        close_action(tray_available, hide_on_close)
+    }
+}
+
 /// One thing the tray can ask the app to do.  The UI shell turns each into the
 /// matching [`crate::app::AppState`] call / viewport command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +170,8 @@ pub fn entry_for_id(id: &str) -> Option<TrayEntry> {
 
 /// Map a menu id to the action the app must perform (pure).
 ///
-/// This is the whole "GTK → AppState" adapter: the shell polls `muda`'s event
+/// This is the whole "tray backend → AppState" adapter: the shell polls
+/// `muda`'s event
 /// receiver each frame, looks the id up here, and never has to know about menu
 /// widgets.  An unknown id (another application's tray, or a future item) is
 /// ignored instead of mishandled.
@@ -153,16 +179,63 @@ pub fn menu_action(id: &str) -> Option<TrayEvent> {
     entry_for_id(id).map(TrayEntry::event)
 }
 
+/// The result of asking D-Bus whether a StatusNotifier **host** exists.
+///
+/// Qt's `QSystemTrayIcon::isSystemTrayAvailable()` is the behaviour being
+/// ported; the check matters because `tray-icon`'s ksni backend spawns with
+/// `assume_sni_available(true)` — it reports success even with no host, and an
+/// app that then hides its window on close is unreachable forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostProbe {
+    /// `org.kde.StatusNotifierWatcher` has an owner: an icon will be drawn.
+    Present,
+    /// The name has no owner, or the session bus could not be reached: no host
+    /// can exist, so no icon can be drawn.
+    Absent,
+    /// The lookup failed in a way that says nothing about the host (a D-Bus
+    /// quirk): build the icon and let `tray-icon` decide.
+    Unknown,
+}
+
+impl HostProbe {
+    /// Classify a D-Bus name-owner lookup — **pure**, hence unit-tested.
+    ///
+    /// `Ok(true)` = the watcher name is owned, `Ok(false)` = it is not,
+    /// `Err(())` = the question could not be asked (no session bus, timeout,
+    /// permission).  A bus we cannot reach means no host exists, which is why
+    /// that case is [`HostProbe::Absent`] and not `Unknown`.
+    pub fn from_lookup(result: Result<bool, ()>) -> Self {
+        match result {
+            Ok(true) => HostProbe::Present,
+            Ok(false) => HostProbe::Absent,
+            Err(()) => HostProbe::Absent,
+        }
+    }
+
+    /// Is the probe inconclusive (build anyway, let `tray-icon` decide)?
+    ///
+    /// Reachable from the backend when the bus exists but answering the
+    /// question fails; `from_lookup` never returns it (it is conservative).
+    pub fn is_unknown(self) -> bool {
+        matches!(self, HostProbe::Unknown)
+    }
+
+    /// Should the icon be built?  Only a **definite** "no host" skips it.
+    pub fn build_icon(self) -> bool {
+        !matches!(self, HostProbe::Absent)
+    }
+}
+
 /// Is a tray icon available in this build (and did it initialise)?
 ///
 /// `false` unless the `tray` feature is compiled **and** the icon was actually
-/// created at startup (see [`gtk_impl::install`]).  Call sites never change.
+/// created at startup (see [`backend::install`]).  Call sites never change.
 pub fn available() -> bool {
-    #[cfg(feature = "tray")]
+    #[cfg(any(feature = "tray", feature = "tray-gtk"))]
     {
-        gtk_impl::available()
+        backend::available()
     }
-    #[cfg(not(feature = "tray"))]
+    #[cfg(not(any(feature = "tray", feature = "tray-gtk")))]
     {
         false
     }
@@ -177,24 +250,24 @@ pub fn show_commands(visible: bool) -> [egui::ViewportCommand; 1] {
 /// Try to start the tray icon (no-op without the `tray` feature).
 ///
 /// Returns once the outcome is known: never panics, never blocks beyond a short
-/// handshake.  A failure (no GTK, no libappindicator, no display, headless) is
+/// handshake.  A failure (no StatusNotifier host, no session bus, headless) is
 /// logged as a `warn` and [`available`] stays `false`, so closing still quits.
 pub fn install() {
-    #[cfg(feature = "tray")]
-    gtk_impl::install();
-    #[cfg(not(feature = "tray"))]
+    #[cfg(any(feature = "tray", feature = "tray-gtk"))]
+    backend::install();
+    #[cfg(not(any(feature = "tray", feature = "tray-gtk")))]
     log::debug!("tray: not compiled (rebuild with --features tray for the tray icon)");
 }
 
 /// Drain pending tray events (no-op without the `tray` feature).  Called once
 /// per UI frame, like the MIDI pump; it only reads `muda`'s channel, so it never
-/// touches GTK from the UI thread.
+/// blocks.
 pub fn poll() -> Vec<TrayEvent> {
-    #[cfg(feature = "tray")]
+    #[cfg(any(feature = "tray", feature = "tray-gtk"))]
     {
-        gtk_impl::poll()
+        backend::poll()
     }
-    #[cfg(not(feature = "tray"))]
+    #[cfg(not(any(feature = "tray", feature = "tray-gtk")))]
     {
         Vec::new()
     }
@@ -285,37 +358,118 @@ fn set_px(rgba: &mut [u8], n: u32, x: u32, y: u32, color: [u8; 4]) {
     rgba[i..i + 4].copy_from_slice(&color);
 }
 
-/// The real `tray-icon` + GTK implementation (compiled only under `--features
-/// tray`).
+/// The real `tray-icon` implementation (compiled under `tray` = ksni/D-Bus, or
+/// under `tray-gtk` = libappindicator).
 ///
-/// On Linux `tray-icon` is libappindicator, which needs a **running GTK main
-/// loop on its own thread** — eframe owns the process's main thread, so the icon
-/// is built and kept alive on a dedicated thread that calls `gtk::main()`.  The
-/// only cross-thread traffic is `muda`'s global `MenuEvent` channel, which is
-/// `Send`, and the `available` flag (an atomic).
-#[cfg(feature = "tray")]
-pub mod gtk_impl {
+/// # Threading
+///
+/// eframe owns the process's main thread, so the icon is built and **kept
+/// alive** on a dedicated `holaf-tray` thread:
+///
+/// * with `tray` (ksni) that thread only has to hold the `TrayIcon` handle —
+///   `ksni` runs its own D-Bus worker — so it parks;
+/// * with `tray-gtk` (libappindicator) `gtk::init()` and a **running
+///   `gtk::main()`** are required on that same thread.
+///
+/// The only cross-thread traffic is `muda`'s global `MenuEvent` channel (which
+/// is `Send`), the [`HostProbe`] verdict and the `available` flag (an atomic).
+/// Nothing here ever touches the UI thread.
+#[cfg(any(feature = "tray", feature = "tray-gtk"))]
+pub mod backend {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{entries, menu_action, TrayEvent};
+    use super::{entries, menu_action, HostProbe, TrayEvent};
 
     /// Whether the icon was created successfully (read by [`super::available`]).
     static AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+    /// Which backend this build links — logged once, and handy in a bug report.
+    /// `ksni` wins when both features are on, matching `tray-icon`'s own `cfg`.
+    pub const BACKEND: &str = if cfg!(feature = "tray") {
+        "ksni (D-Bus StatusNotifierItem, no GTK)"
+    } else {
+        "libappindicator (GTK3)"
+    };
+
+    /// The StatusNotifier watcher's well-known name (SNI spec, and what
+    /// `isSystemTrayAvailable()` uses): its owner *is* the host that draws the
+    /// icon.
+    const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
 
     /// Did the icon get created?
     pub fn available() -> bool {
         AVAILABLE.load(Ordering::Relaxed)
     }
 
+    /// Ask D-Bus whether a StatusNotifier **host** exists.
+    ///
+    /// Only compiled for the ksni backend: `tray-icon`'s ksni impl spawns with
+    /// `assume_sni_available(true)`, so it would otherwise claim success with no
+    /// host at all.  The libappindicator backend does its own availability
+    /// check inside GTK, so this is not needed there.
+    #[cfg(feature = "tray")]
+    fn probe_host() -> HostProbe {
+        // Step 1: a session bus at all.  Without one no host can exist (a
+        // StatusNotifier host is itself a D-Bus client), and the distinction
+        // matters for the log: "no bus" is a headless/CI situation, "no host"
+        // is a desktop without a tray host.  Checking it separately also keeps
+        // the classification independent of `zbus`'s error variants, which is
+        // what a single `match` on the whole chain got wrong.
+        let connection = match zbus::blocking::Connection::session() {
+            Ok(connection) => connection,
+            Err(err) => {
+                log::debug!("tray: no D-Bus session bus ({err})");
+                return HostProbe::from_lookup(Err(()));
+            }
+        };
+
+        // Step 2: `NameHasOwner` on the standard `org.freedesktop.DBus`
+        // interface — the cheapest question that answers "is a host there?"
+        // (no activation, no introspection, no traffic to the host itself).
+        let owned = (|| -> zbus::Result<bool> {
+            let dbus = zbus::blocking::fdo::DBusProxy::new(&connection)?;
+            let name = zbus::names::BusName::try_from(WATCHER_NAME)
+                .map_err(|err| zbus::Error::Failure(err.to_string()))?;
+            Ok(dbus.name_has_owner(name)?)
+        })();
+        match owned {
+            Ok(owned) => HostProbe::from_lookup(Ok(owned)),
+            Err(err) => {
+                // The bus exists but would not answer: say nothing about the
+                // host and let `tray-icon` try (see `HostProbe::Unknown`).
+                log::debug!("tray: could not ask D-Bus for {WATCHER_NAME}: {err}");
+                HostProbe::Unknown
+            }
+        }
+    }
+
+    /// The libappindicator backend needs no probe of its own: GTK reports it.
+    #[cfg(all(feature = "tray-gtk", not(feature = "tray")))]
+    fn probe_host() -> HostProbe {
+        HostProbe::Unknown
+    }
+
     /// Start the tray thread and wait (briefly) for its verdict.
     ///
-    /// The thread inits GTK, builds the icon + menu, reports success/failure on
-    /// a channel, then parks the thread in `gtk::main()`.  A missing GTK or
-    /// libappindicator makes `gtk::init`/`build` fail: the error is returned to
-    /// the caller, logged as a warning there, and `available()` stays `false`.
+    /// A missing StatusNotifier host, a missing session bus or a failing build
+    /// is logged as a `warn`: `available()` then stays `false` and closing the
+    /// window quits.
     pub fn install() {
+        let probe = probe_host();
+        if !probe.build_icon() {
+            log::warn!(
+                "tray: unavailable (no StatusNotifier host: {WATCHER_NAME} has no \
+                 owner) - closing the window will quit, not hide. Hosts: KDE Plasma, \
+                 waybar, swaybar's tray, gnome-shell-extension-appindicator"
+            );
+            return;
+        }
+        if probe.is_unknown() {
+            log::debug!("tray: host presence unknown ({BACKEND}) - building the icon anyway");
+        }
+
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("holaf-tray".to_string())
@@ -328,26 +482,25 @@ pub mod gtk_impl {
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {
                 AVAILABLE.store(true, Ordering::Relaxed);
-                log::info!("tray: icon created ({} menu entries)", entries().len());
+                log::info!(
+                    "tray: icon created with {BACKEND} ({} menu entries)",
+                    entries().len()
+                );
             }
             Ok(Err(err)) => {
-                log::warn!(
-                    "tray: unavailable ({err}) - closing the window will quit, not hide"
-                );
+                log::warn!("tray: unavailable ({err}) - closing the window will quit, not hide");
             }
             Err(_) => {
-                log::warn!(
-                    "tray: the tray thread did not answer in 5 s - assuming unavailable"
-                );
+                log::warn!("tray: the tray thread did not answer in 5 s - assuming unavailable");
             }
         }
     }
 
     /// Drain `muda`'s menu events into [`TrayEvent`]s.
     ///
-    /// `MenuEvent::receiver` is a global, `Send` channel filled by the GTK
-    /// thread; reading it here (UI thread) is the supported pattern.  Unknown ids
-    /// are dropped.
+    /// `MenuEvent::receiver` is a global, `Send` channel filled by the backend
+    /// (the ksni D-Bus worker or the GTK thread); reading it here (UI thread) is
+    /// the supported pattern.  Unknown ids are dropped.
     pub fn poll() -> Vec<TrayEvent> {
         use tray_icon::menu::MenuEvent;
         let mut events = Vec::new();
@@ -360,10 +513,13 @@ pub mod gtk_impl {
         events
     }
 
-    /// The GTK thread body.  Reports its verdict once, then serves the icon.
+    /// The tray thread body: build the icon, report its verdict once, then serve
+    /// it until the process exits.
     fn run_tray(tx: mpsc::Sender<Result<(), String>>) {
-        // 1. A GTK context on *this* thread — libappindicator requires it, and it
-        //    must be the same thread that runs the main loop.
+        // 1. libappindicator needs a GTK context on *this* thread, and it must be
+        //    the same thread that runs the main loop.  The ksni backend needs
+        //    neither (no GTK in the build at all).
+        #[cfg(all(feature = "tray-gtk", not(feature = "tray")))]
         if let Err(err) = gtk::init() {
             let _ = tx.send(Err(format!("gtk::init failed: {err}")));
             return;
@@ -381,10 +537,17 @@ pub mod gtk_impl {
             }
         };
 
-        // 3. Keep the icon alive and the loop running.  `gtk::main` blocks until
-        //    the process ends; holding `tray` in this scope keeps the handle
-        //    (and its AppIndicator) alive for the whole run.
+        // 3. Keep the icon alive for the whole run: dropping `tray` unregisters
+        //    the StatusNotifier item (and, with libappindicator, destroys the
+        //    AppIndicator).  With GTK we must also pump the loop.
         let _keep_alive = tray;
+        #[cfg(feature = "tray")]
+        loop {
+            // Nothing to run: ksni's D-Bus worker is its own thread.  `park`
+            // can return spuriously, hence the loop.
+            std::thread::park();
+        }
+        #[cfg(all(feature = "tray-gtk", not(feature = "tray")))]
         gtk::main();
     }
 
@@ -415,8 +578,9 @@ pub mod gtk_impl {
             .with_menu(Box::new(menu))
             .with_tooltip("Holaf-Mix")
             .with_icon(icon)
-            // Linux delivers no click events, so a left click opens the menu
-            // with Show/Hide (the only reliable interaction there).
+            // Linux delivers no click events through this backend, so a left
+            // click opens the menu with Show/Hide (the only reliable
+            // interaction there).
             .with_menu_on_left_click(true)
             .build()
             .map_err(|err| format!("TrayIconBuilder::build failed: {err}"))
@@ -424,8 +588,8 @@ pub mod gtk_impl {
 
     /// Wrap [`super::icon_rgba`] into the icon type `tray-icon` expects.
     ///
-    /// 32 px is the size AppIndicator/StatusNotifier hosts ask for; the host
-    /// scales it for HiDPI itself.
+    /// 32 px is the size StatusNotifier hosts ask for; the host scales it for
+    /// HiDPI itself.
     fn load_icon() -> Result<tray_icon::Icon, String> {
         let (rgba, width, height) = super::icon_rgba(32);
         tray_icon::Icon::from_rgba(rgba, width, height)
@@ -454,6 +618,23 @@ mod tests {
         assert_eq!(close_action(true, true), CloseAction::Hide);
         // A tray but the preference off ⇒ quit.
         assert_eq!(close_action(true, false), CloseAction::Quit);
+    }
+
+    /// The tray's `Quit` must quit, even when the window's close button only
+    /// hides (the bug: the entry sent `ViewportCommand::Close`, the close request
+    /// came back, and the hide rule swallowed it — the app stayed in the tray).
+    #[test]
+    fn an_explicit_quit_wins_over_the_hide_on_close_rule() {
+        // A tray is available and the preference says "hide on close"…
+        assert_eq!(close_action(true, true), CloseAction::Hide);
+        // …but an explicit Quit still quits.
+        assert_eq!(close_action_with(true, true, true), CloseAction::Quit);
+        // A plain close (no explicit quit) keeps the Qt rule.
+        assert_eq!(close_action_with(false, true, true), CloseAction::Hide);
+        assert_eq!(close_action_with(false, true, false), CloseAction::Quit);
+        // No tray: both quit.
+        assert_eq!(close_action_with(false, false, true), CloseAction::Quit);
+        assert_eq!(close_action_with(true, false, true), CloseAction::Quit);
     }
 
     #[test]
@@ -487,10 +668,10 @@ mod tests {
     #[test]
     fn without_the_feature_there_is_no_tray_and_polling_is_empty() {
         // The policy must hold in both builds: no tray ⇒ close quits, and the
-        // event pump is harmless.  With `--features tray` but no display/GTK
-        // host, `install()` fails gracefully and `available()` stays false too;
+        // event pump is harmless.  With `--features tray` but no host/session
+        // bus, `install()` fails gracefully and `available()` stays false too;
         // either way nothing here panics and `poll()` never blocks.
-        #[cfg(not(feature = "tray"))]
+        #[cfg(not(any(feature = "tray", feature = "tray-gtk")))]
         {
             assert!(!available());
             assert!(poll().is_empty());
@@ -500,6 +681,29 @@ mod tests {
         if !available() {
             assert_eq!(close_action(available(), true), CloseAction::Quit);
         }
+    }
+
+    /// A tray is only claimed when a **host** can draw it.
+    ///
+    /// `tray-icon`'s ksni backend spawns with `assume_sni_available(true)`, so
+    /// "build returned Ok" does not mean "an icon is visible".  Without this
+    /// rule the app would hide its window on close while no icon exists — the
+    /// unreachable-app bug the Qt `isSystemTrayAvailable()` check prevents.
+    #[test]
+    fn only_a_definite_absence_of_a_host_skips_the_icon() {
+        // The watcher name has an owner ⇒ build, no second-guessing.
+        assert_eq!(HostProbe::from_lookup(Ok(true)), HostProbe::Present);
+        assert!(HostProbe::Present.build_icon());
+        assert!(!HostProbe::Present.is_unknown());
+        // No owner ⇒ no host ⇒ no icon (and closing will quit).
+        assert_eq!(HostProbe::from_lookup(Ok(false)), HostProbe::Absent);
+        assert!(!HostProbe::Absent.build_icon());
+        // No session bus at all: no host can exist.  Conservative on purpose.
+        assert_eq!(HostProbe::from_lookup(Err(())), HostProbe::Absent);
+        assert!(!HostProbe::from_lookup(Err(())).build_icon());
+        // An inconclusive probe still builds: only a definite "no host" skips.
+        assert!(HostProbe::Unknown.build_icon());
+        assert!(HostProbe::Unknown.is_unknown());
     }
 
     #[test]
@@ -572,7 +776,7 @@ mod tests {
     /// With the feature on but **no display** (the CI/headless case, and a bare
     /// Wayland session), `install()` must fail *gracefully*: a warning, no panic,
     /// and `available()` still `false` so closing quits.
-    #[cfg(feature = "tray")]
+    #[cfg(any(feature = "tray", feature = "tray-gtk"))]
     #[test]
     fn install_without_a_display_degrades_to_no_tray_instead_of_panicking() {
         // Only meaningful where there is genuinely no display server; skip on a
@@ -584,12 +788,16 @@ mod tests {
         }
         // Must not panic, and must report "no tray" so `close_action` quits.
         install();
-        assert!(
-            !available(),
-            "with no display the tray cannot be created"
-        );
-        assert_eq!(close_action(available(), true), CloseAction::Quit);
-        // And the pump is a harmless no-op.
-        assert!(poll().is_empty());
+        // A headless run has no session bus (or, with one, no StatusNotifier
+        // host): either way there is nothing to draw an icon with.
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            assert!(
+                !available(),
+                "with no display and no session bus the tray cannot be created"
+            );
+            assert_eq!(close_action(available(), true), CloseAction::Quit);
+            // And the pump is a harmless no-op.
+            assert!(poll().is_empty());
+        }
     }
 }

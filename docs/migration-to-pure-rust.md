@@ -18,7 +18,7 @@ production.
 | # | Prérequis | Pourquoi | Comment le vérifier |
 |---|---|---|---|
 | 1 | **B1 validé par l'utilisateur sur sa machine** (pas seulement en CI) | une régression de layout, de routage ou de MIDI ne se voit pas dans un conteneur sans écran ni carte son | une session complète : 7 strips, faders, FX, routage, apps, MIDI Mix, diagnostic, config conservée |
-| 2 | **Le tray est tranché** (B2) | c'était la seule fonction Qt encore sans équivalent ; supprimer `src/ui/**` supprime aussi la seule implémentation de tray existante | **fait (2026-11-14)** : tray Rust (GTK3 + libappindicator, icône générée en RGBA donc **sans dépendance fichier**), politique (menu, « fermer = cacher seulement si un tray existe ») toujours compilée et testée ; **activé par défaut au build** (`scripts/build_rust.sh` ; `HOLAF_NO_TRAY=1` pour l'enlever, repli automatique sans la feature si GTK3 manque), la pile GTK3/GLib restant celle du système (retirée du bundle PyInstaller).  Le repli (pas de display, pas d'hôte appindicator) est testé : `available() == false` ⇒ fermer quitte | `cargo test -p holaf-ui --features tray` (dont `install_without_a_display_degrades_to_no_tray_instead_of_panicking`) + `cargo build --features tray` en CI |
+| 2 | **Le tray est tranché** (B2) | c'était la seule fonction Qt encore sans équivalent ; supprimer `src/ui/**` supprime aussi la seule implémentation de tray existante | **fait (2026-11-14, backend `ksni`/D-Bus depuis le 2026-11-15 — sans GTK)** : tray Rust (icône générée en RGBA donc **sans dépendance fichier**), politique (menu, « fermer = cacher seulement si un tray existe ») toujours compilée et testée ; **activé par défaut au build** (`scripts/build_rust.sh` ; `HOLAF_NO_TRAY=1` pour l'enlever, repli automatique sans la feature si elle ne compile pas), et depuis la migration ksni il n'y a **plus de dépendance GTK au build** (la pile GTK3/GLib encore retirée du bundle PyInstaller ne vient plus que du fallback Qt).  Le repli (pas de display, pas de bus, pas d'hôte StatusNotifier) est testé : `available() == false` ⇒ fermer quitte | `cargo test -p holaf-ui --features tray` (dont `install_without_a_display_degrades_to_no_tray_instead_of_panicking` et `tests/tray_live.rs`) + `cargo build --features tray` en CI |
 | 3 | **Le bundle packagé démarre l'UI Rust** | le lanceur se rabat sur Qt quand `holaf-ui` manque, donc un bundle cassé *fonctionne* — en Qt | `dist/holaf-mix` sans `HOLAF_UI=python` doit afficher la fenêtre Rust (`smoke test` CI + un lancement réel) |
 | 4 | **`config.json` partagé vérifié** | le lanceur passe `--config` avec le fichier de l'UI Qt ; si ce chemin change, l'utilisateur perd ses réglages | lancer l'UI Rust puis l'UI Qt : même fichier, mêmes valeurs |
 | 5 | **Le MIDI réel validé** | `midir` (Rust) remplace `mido`/`rtmidi` ; en conteneur il n'y a pas de séquenceur ALSA | AKAI MIDI Mix : learn volume/mute/mono, LEDs, reconnexion |
@@ -62,7 +62,7 @@ confiance de l'utilisateur.
 |---|---:|---|
 | `main.py` | 404 | devient inutile quand l'UI Rust est le seul point d'entrée → remplacé par `packaging/holaf-mix.desktop` (`Exec=holaf-ui`) et par l'installation de `/usr/bin/holaf-ui`.  Décision à prendre : garder un lanceur minimal (résolution `$PATH` + `--config`) ou pas de lanceur du tout |
 | `src/launcher.py` | 323 | **reste** tant que `main.py` existe ; à fusionner dans `main.rs` (résolution du `config.json` + `exec`) si on supprime le lanceur Python |
-| `packaging/holaf-mix.spec` + PyInstaller | — | un bundle PyInstaller n'a plus de sens sans Python : le produit devient `tar.gz` de binaires + paquet distro (`PKGBUILD` déjà prêt) |
+| `packaging/holaf-mix.spec` + PyInstaller | — | un bundle PyInstaller n'a plus de sens sans Python : le produit devient `tar.gz` de binaires (déjà l'artefact principal de la CI) + paquet distro optionnel (`packaging/PKGBUILD`, maintenu — voir `BUILD.md` §4) |
 | `requirements.txt` | — | plus de PySide6 / sounddevice / mido / rtmidi / numpy (⚠ `tools/` en dépend peut-être : vérifier) |
 
 ### 1.4 Ce qui **reste** (côté Rust, hors périmètre de suppression)
@@ -149,8 +149,12 @@ vérifier avant de le sortir de `requirements.txt`.
 * **B7 — journal dans le diagnostic** : ring buffer de 500 lignes
   (`holaf-ui/src/logbuf.rs`) alimenté par un `log::Log` qui relaie vers
   `env_logger`, et 5ᵉ onglet « Journal » (monospace, auto-scroll) ;
-* **B2 — tray** : `holaf-ui/src/tray.rs` porte désormais la vraie icône
-  (`tray-icon 0.19` + `gtk 0.18`, donc GTK3 + libappindicator au build).  Elle
+* **B2 — tray** : `holaf-ui/src/tray.rs` porte désormais la vraie icône —
+  depuis le 2026-11-15 **`tray-icon 0.26` avec la feature `ksni`** : un
+  `org.kde.StatusNotifierItem` en **D-Bus pur**, donc **plus de GTK3 ni de
+  libappindicator** (l'ancien montage `0.19` + `gtk 0.18` reste disponible via
+  `--features tray-gtk` ; voir [`dependency-audit.md`](dependency-audit.md)).
+  Elle
   est **activée par défaut au build** (`scripts/build_rust.sh` passe
   `--features tray` ; `HOLAF_NO_TRAY=1` pour l'enlever, et le script retombe
   sans la feature si GTK3 manque), donc le PKGBUILD, le tarball et la CI
@@ -159,11 +163,13 @@ vérifier avant de le sortir de `requirements.txt`.
   (`Show/Hide`, `Restart audio engine`, `Quit`) ; l'icône est **générée en RGBA
   dans le code** (`tray::icon_rgba(size)`), jamais lue depuis `dist/icons/` qui
   est gitignoré — sinon un checkout CI propre n'aurait pas le PNG.  `install()`
-  ne panique jamais : sans display ou sans hôte appindicator il journalise un
-  avertissement et `available()` reste `false`, donc fermer la fenêtre
-  **quitte** au lieu de cacher une fenêtre inatteignable.  La pile GTK3/GLib
-  n'est **pas** embarquée par PyInstaller (le spec la retire de `a.binaries`) :
-  l'app utilise celle du système, comme pour libpipewire ;
+  ne panique jamais : sans display, sans bus de session ou sans hôte
+  StatusNotifier (sondé sur D-Bus, comme `QSystemTrayIcon::isSystemTrayAvailable`)
+  il journalise un avertissement et `available()` reste `false`, donc fermer la
+  fenêtre **quitte** au lieu de cacher une fenêtre inatteignable.  La pile
+  GTK3/GLib n'est **pas** embarquée par PyInstaller (le spec la retire de
+  `a.binaries`) — depuis ksni elle ne vient plus que du **fallback Qt**
+  (`libqgtk3.so` de PySide6) :
 * **Routage applicatif** : `holaf-pw::app_list`/`app_move` ne sont plus des
   stubs (déplacement réel + read-back, prouvé par
   `holaf-pw/tests/app_routing_live.rs`) ;

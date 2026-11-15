@@ -12,6 +12,9 @@
 //!   (`_on_slider_move`), so the fader speaks the same unit as the model;
 //! * dragging *and* clicking anywhere on the rail set the level (Qt jumps to
 //!   the clicked position);
+//! * **the primary (left) button only** moves the fader.  A right click/drag is
+//!   an empty gesture here so the caller can open the context menu with it —
+//!   egui would otherwise let a secondary drag move the handle;
 //! * the VU gradient is anchored to the **whole** rail and only revealed up to
 //!   the current level, exactly like `VUMeterWidget.paintEvent` (which sets the
 //!   gradient's start/stop from the widget rect, then clips by painting a
@@ -160,7 +163,16 @@ fn fader_inner(
     // Qt jumps to the clicked position and then follows the drag; `dragged()`
     // covers both because egui reports a drag for a click that moved, so we
     // also honour a plain click.
-    let interacting = response.dragged() || response.clicked();
+    //
+    // **Primary button only.**  egui's interaction layer starts a drag on *any*
+    // mouse button and marks the widget `clicked` whatever the button was, so
+    // `dragged()` alone let a right-drag move the fader.  `dragged_by` /
+    // `clicked_by` keep the secondary button free for the context menu (the
+    // caller opens it — `views::strip`), exactly like Qt's `QSlider`, which only
+    // follows the left button and lets the right one bubble to
+    // `contextMenuEvent`.
+    let interacting = response.dragged_by(egui::PointerButton::Primary)
+        || response.clicked_by(egui::PointerButton::Primary);
     if interacting {
         if let Some(pointer) = response.interact_pointer_pos() {
             let span = rail_rect.height();
@@ -229,7 +241,7 @@ fn fader_inner(
     );
     // Qt only changes the cursor on hover; here the handle also gets a faint
     // dark outline so it stays visible against the light "loaded" groove.
-    if response.hovered() || response.dragged() {
+    if response.hovered() || response.dragged_by(egui::PointerButton::Primary) {
         painter.rect_stroke(
             handle_rect,
             paint::corner(3.0),
@@ -378,5 +390,79 @@ mod tests {
     #[test]
     fn default_style_is_the_built_in_theme() {
         assert_eq!(FaderStyle::default(), style());
+    }
+
+    /// Drive a whole gesture (move → press → move → release) on one fader and
+    /// report whether it changed the volume.
+    fn gesture(button: egui::PointerButton) -> (bool, f32) {
+        let ctx = crate::test_support::headless_context();
+        let style = style();
+        let mut volume = 0.5_f32;
+        let mut changed = false;
+        let run = |volume: &mut f32, changed: &mut bool, time: f64, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(44.0, 104.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                let fader = fader_with_vu(ui, "test", volume, [0.0, 0.0], &style, 100.0);
+                if fader.changed {
+                    *changed = true;
+                }
+            });
+            output.textures_delta.clear();
+        };
+        let press = egui::pos2(20.0, 20.0);
+        let release = egui::pos2(20.0, 80.0);
+        let button_at = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        run(
+            &mut volume,
+            &mut changed,
+            1.0,
+            vec![egui::Event::PointerMoved(press)],
+        );
+        run(&mut volume, &mut changed, 1.1, vec![button_at(press, true)]);
+        run(
+            &mut volume,
+            &mut changed,
+            1.2,
+            vec![egui::Event::PointerMoved(release)],
+        );
+        run(
+            &mut volume,
+            &mut changed,
+            1.3,
+            vec![button_at(release, false)],
+        );
+        (changed, volume)
+    }
+
+    /// **The primary button only.**  egui starts a drag on any button, so the
+    /// old `response.dragged()` let a right-drag move the fader — and the same
+    /// widget then swallowed the secondary click, which is why the context menu
+    /// stopped opening.
+    #[test]
+    fn a_right_drag_does_not_move_the_fader() {
+        let (changed, volume) = gesture(egui::PointerButton::Secondary);
+        assert!(!changed, "a right drag must not change the volume");
+        assert_eq!(volume, 0.5);
+        // The middle button neither.
+        let (changed, volume) = gesture(egui::PointerButton::Middle);
+        assert!(!changed, "a middle drag must not change the volume");
+        assert_eq!(volume, 0.5);
+        // The primary button does — the fader is still a fader.
+        let (changed, volume) = gesture(egui::PointerButton::Primary);
+        assert!(changed, "a left drag must change the volume");
+        assert!(volume < 0.5, "dragging down lowers the level: {volume}");
     }
 }

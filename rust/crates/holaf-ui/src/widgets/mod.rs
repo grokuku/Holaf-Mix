@@ -11,8 +11,8 @@ pub mod buttons;
 pub mod fader;
 
 pub use buttons::{
-    button_in, combo_display, flat_button, fx_button, fx_button_in, fx_button_sized, fx_look,
-    midi_button, midi_button_in, round_add_button, route_button, route_button_in, route_look,
-    state_button, state_button_in, ButtonLook, MidiButtonState,
+    button_in, combo_display, flat_button, flat_button_in, fx_button, fx_button_in,
+    fx_button_sized, fx_look, midi_button, midi_button_in, round_add_button, route_button,
+    route_button_in, route_look, state_button, state_button_in, ButtonLook, MidiButtonState,
 };
 pub use fader::{fader_with_vu, FaderOutput, FaderStyle};

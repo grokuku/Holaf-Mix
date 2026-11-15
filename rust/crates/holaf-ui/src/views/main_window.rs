@@ -35,6 +35,9 @@ use crate::views::{strip_ui, text_centered};
 /// never hides a control.
 pub const ENGINE_BANNER_HEIGHT: f32 = 18.0;
 
+/// Gap between the bottom edge of the window and a transient notice.
+pub const NOTICE_MARGIN: f32 = 12.0;
+
 /// Draw the whole window into `ui`.
 pub fn render(state: &mut AppState, ui: &mut Ui) {
     // `ui.max_rect()` is the *available* area (5000 × 5000 in a root Ui), not
@@ -276,26 +279,44 @@ pub fn render(state: &mut AppState, ui: &mut Ui) {
         );
     }
 
-    // Status line, drawn last so it sits on top of everything.
-    if let Some(status) = state.status.clone() {
+    // A transient notice, drawn last so it sits on top of everything.
+    //
+    // There is **no status bar**: the Qt build had a permanent 18 px strip at the
+    // bottom of the window and the user never asked for it (all it said was
+    // "engine ready").  A real message — a failed config write, a learned MIDI
+    // mapping, "Removed HP" — is still shown, as a small pill centred at the
+    // bottom, and it disappears on its own ([`crate::app::STATUS_NOTICE`]).  When
+    // there is nothing to say, nothing is drawn and the strips keep that space.
+    if let Some(status) = state.transient_status() {
         let theme = &state.theme.theme;
-        let bar = Rect::from_min_size(
-            egui::pos2(screen.left(), screen.bottom() - layout::FOOTER_HEIGHT),
-            Vec2::new(screen.width(), layout::FOOTER_HEIGHT),
-        );
         let painter = ui.painter().with_clip_rect(screen);
+        let font = egui::FontId::proportional(theme.typography.small);
+        let galley = painter.layout_no_wrap(
+            status.to_string(),
+            font,
+            theme.colors.text_primary.color32(),
+        );
+        let pad = Vec2::new(10.0, 4.0);
+        let size = galley.size() + pad * 2.0;
+        let pill = Rect::from_center_size(
+            egui::pos2(
+                screen.center().x,
+                screen.bottom() - size.y / 2.0 - NOTICE_MARGIN,
+            ),
+            size,
+        );
         painter.rect_filled(
-            bar,
-            egui::CornerRadius::ZERO,
-            egui::Color32::from_black_alpha(160),
+            pill,
+            paint::corner(pill.height() / 2.0),
+            egui::Color32::from_black_alpha(200),
         );
-        painter.text(
-            egui::pos2(bar.left() + 8.0, bar.center().y),
-            egui::Align2::LEFT_CENTER,
-            status,
-            egui::FontId::proportional(theme.typography.small),
-            theme.colors.text_secondary.color32(),
+        painter.rect_stroke(
+            pill,
+            paint::corner(pill.height() / 2.0),
+            egui::Stroke::new(1.0, theme.colors.combo_border.color32()),
+            egui::StrokeKind::Inside,
         );
+        painter.galley(pill.min + pad, galley, theme.colors.text_primary.color32());
     }
 
     // Keep the VU meters moving at 25 Hz, like `METER_POLL_INTERVAL_MS`.
@@ -399,20 +420,22 @@ mod tests {
     }
 
     /// Strips fill the window: taller window, taller strip, and never past the
-    /// status line.  (Both sections get this same number — that invariant is
+    /// bottom margin.  (Both sections get this same number — that invariant is
     /// what keeps the two columns aligned.)
     #[test]
     fn the_strip_height_follows_the_window_height() {
         let t = Theme::holaf_dark();
         let mut previous = 0.0;
-        // 373 = `layout::minimum_window_height(&t, 3)`: the shortest window the
-        // WM is allowed to make, in which the fader still has its 40 px.
-        for window_h in [373.0_f32, 420.0, 600.0, 900.0, 1440.0] {
+        // `minimum_window_height` is the shortest window the compositor is
+        // allowed to make, and the fader still has its 40 px there.
+        let floor = layout::minimum_window_height(&t, 3);
+        for window_h in [floor, 420.0, 600.0, 900.0, 1440.0] {
             let h = layout::strip_height_for(&t, window_h, 3);
             assert!(h >= layout::strip_min_height(&t, StripType::Input, 3));
-            assert!(h > previous, "{h} must grow with the window ({window_h})");
-            // Strip top (header) + strip + bottom margin + status line = window.
-            assert!((40.0 + h + 10.0 + 18.0 - window_h).abs() < 0.01);
+            assert!(h >= previous, "{h} must grow with the window ({window_h})");
+            // Strip top (header) + strip + bottom margin = window.  There is no
+            // status bar reserved any more.
+            assert!((40.0 + h + 10.0 - window_h).abs() < 0.01);
             previous = h;
         }
         // Below the floor the strip stops shrinking (the fader keeps 40 px).
@@ -421,6 +444,58 @@ mod tests {
         assert_eq!(
             squeezed,
             layout::strip_fixed_height(&t, StripType::Input, 3) + 40.0
+        );
+    }
+
+    /// There is **no status bar** any more.  Two renders of the same state, one
+    /// with nothing to say and one with a fresh notice: only the pill area (and
+    /// nothing along the bottom edge where the Qt bar used to be) may differ.
+    #[test]
+    fn there_is_no_status_bar_only_a_transient_notice() {
+        use crate::raster::{render as rasterize, Framebuffer, Textures};
+        use egui::Color32;
+
+        let paint = |status: Option<&str>| {
+            let ctx = crate::test_support::headless_context();
+            let mut state = AppState::demo();
+            state.status = status.map(str::to_string);
+            let primitives =
+                crate::test_support::run_pass(&ctx, Vec2::new(794.0, 600.0), 1.0, |ui| {
+                    render(&mut state, ui)
+                });
+            let textures = Textures::from_context(&ctx);
+            let mut fb = Framebuffer::new(794, 600, Color32::BLACK);
+            rasterize(&mut fb, &primitives, &textures, 1.0);
+            fb
+        };
+        let quiet = paint(None);
+        let notice = paint(Some("Removed HP"));
+        let differs = |x: usize, y: usize| {
+            let a = quiet.pixels[y * 794 + x];
+            let b = notice.pixels[y * 794 + x];
+            (a[0] - b[0]).abs() > 1e-3 || (a[1] - b[1]).abs() > 1e-3
+        };
+        // The Qt status bar was a FULL-WIDTH band along the bottom edge, its
+        // text starting at the far left: none of that may react to a message any
+        // more.  (A pill is centred, so the corners stay untouched.)
+        let left_edge: usize = (582..600)
+            .map(|y| (0..40).filter(|x| differs(*x, y)).count())
+            .sum();
+        assert_eq!(
+            left_edge, 0,
+            "a full-width status bar is back at the bottom edge"
+        );
+        // The notice itself must be visible: a small pill, centred at the bottom.
+        let pill: usize = (560..600)
+            .map(|y| {
+                (794 / 2 - 120..794 / 2 + 120)
+                    .filter(|x| differs(*x, y))
+                    .count()
+            })
+            .sum();
+        assert!(
+            pill > 200,
+            "the transient notice is not painted ({pill} px)"
         );
     }
 

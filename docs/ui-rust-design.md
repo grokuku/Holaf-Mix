@@ -19,7 +19,8 @@ l'**architecture** et le **plan de migration**, pas les constantes.
 > **choix du contrôleur MIDI**
 > (`--dialog` du binaire de capture), menus contextuels fenêtre / strip / FX,
 > always-on-top, MIDI (contrôleur, learn, LED, reconnexion).  L'**icône de tray**
-> est **activée par défaut au build** (feature `tray`, GTK3 + libappindicator ;
+> est **activée par défaut au build** (feature `tray` — backend **`ksni`**, un
+> D-Bus StatusNotifierItem, donc plus de GTK3/libappindicator ;
 > `HOLAF_NO_TRAY=1` pour l'enlever) — voir §10quater.
 
 ![Capture de l'UI Rust — fenêtre courte 800 × 600](ui-rust-snapshot.png)
@@ -68,7 +69,8 @@ tests.  Il n'y a pas de « mode capture » qui pourrait diverger du mode réel.
 
 ```
 rust/crates/holaf-ui/
-├── Cargo.toml            eframe/egui 0.37 (glow, x11, default_fonts), image 0.25, holaf-core
+├── Cargo.toml            eframe/egui 0.37 (glow, **wayland**, default_fonts ;
+│                         `x11` = feature opt-in), image 0.25, holaf-core
 │                         [[bin]] holaf-ui (eframe) + holaf-ui-snapshot (headless)
 ├── src/
 │   ├── lib.rs            vue d'ensemble + helpers de test (`test_support`)
@@ -602,7 +604,7 @@ Règles, calquées sur celles déjà en place pour le moteur
 | Packaging | PyInstaller existant | l'UI Rust sera un binaire séparé embarqué dans le bundle |
 
 Le MIDI n'est plus dans cette liste : le port est fait (§10ter), et l'**icône de
-tray** l'est aussi (§10quater) — **activée par défaut au build** (elle ajoute
+tray** l'est aussi (§10quater) — **activée par défaut au build**, backend `ksni` sans GTK (elle ajoute
 GTK3 + libappindicator, que le script de build sait contourner en réessayant
 sans la feature).
 
@@ -615,8 +617,8 @@ sans la feature).
 | **2 (fait)** | parité d'**écriture** : `holaf-ui` pilote `PipeWireBackend` en direct (`default = ["engine-pw"]`), VU réels par capture `pw-cat`, rollback sur refus, mode déconnecté | volume/MUTE/MONO/FX/routage/device agissent sur le graphe ; `tests/engine_live.rs` vert |
 | **3 (fait)** | dialogues : renommer, ajout/suppression, paramètres FX, choix de device, **sélection d'applications**, **diagnostic** ; menus contextuels fenêtre/strip/FX ; always-on-top | aucune fonction Qt perdue (checklist de `ui-inventory.md` §9) |
 | **4 (fait)** | MIDI complet : mapping CC/note, **learn par propriété** (menu du bouton MIDI), feedback LED, **choix du port** + reconnexion automatique, `midi` dans les features par défaut | un AKAI MIDI Mix pilote le mixeur sans re-apprentissage (§10ter) |
-| **5 (fait, B1)** | bascule du défaut à `HOLAF_UI=rust`, `HOLAF_UI=python` en échappatoire ; `holaf-ui` packagé (spec, tarball, PKGBUILD, `.desktop`, CI) | une release complète sans régression signalée (en attente de validation utilisateur) |
-| **6 (fait, B2)** | **icône de tray** (feature `tray`, **activée par défaut au build** depuis le 2026-11-14) : menu Qt, « fermer = cacher » seulement si un tray existe, icône **générée** en RGBA (aucune dépendance fichier), repli sans display testé, pile GTK3/GLib **retirée du bundle PyInstaller** (le système fournit la sienne) | `cargo test -p holaf-ui --features tray` vert + `cargo build --features tray` en CI (§10quater) |
+| **5 (fait, B1)** | bascule du défaut à `HOLAF_UI=rust`, `HOLAF_UI=python` en échappatoire ; `holaf-ui` packagé (spec, tarball, PKGBUILD, `.desktop`, CI) | aucune régression signalée sur l'artefact CI (le tarball `holaf-mix-<version>-<arch>.tar.gz`) ; le paquet Arch (PKGBUILD) reste une option de distribution, non exercée par la CI |
+| **6 (fait, B2)** | **icône de tray** (feature `tray`, **activée par défaut au build** depuis le 2026-11-14 ; backend **`ksni`**/D-Bus depuis le 2026-11-15, donc **sans GTK**) : menu Qt, « fermer = cacher » seulement si un tray existe **et** qu'un hôte StatusNotifier est présent, icône **générée** en RGBA (aucune dépendance fichier), repli sans display testé, pile GTK3/GLib **retirée du bundle PyInstaller** (le système fournit celle du fallback Qt) | `cargo test -p holaf-ui --features tray` vert (dont `tray_live` : enregistrement D-Bus + menu publié) + `cargo build --features tray` en CI (§10quater) |
 
 Chaque étape ajoute des tests **sans** toucher aux 207 tests Python
 (`python -m unittest discover -s tests` reste la référence) ; le workspace Rust
@@ -631,7 +633,7 @@ pour le port, `engine_live` pour le moteur — + 1 doctest), et **343** avec
 
 | Manque | Effet visible | Étape |
 |---|---|---|
-| **tray icon** | **fait** (2026-11-14), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte appindicator, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Avec un tray réel, `close_action()` cache la fenêtre (préférence `ui_rust.tray_hide_on_close`, défaut `true`). Sous GNOME/Wayland les **clics** ne sont pas livrés : le **menu** reste la voie d'interaction. Voir §10quater | fait |
+| **tray icon** | **fait** (2026-11-14, backend **ksni**/D-Bus depuis le 2026-11-15 — plus de GTK), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte StatusNotifier, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Avec un tray réel, `close_action()` cache la fenêtre (préférence `ui_rust.tray_hide_on_close`, défaut `true`). Sous GNOME/Wayland les **clics** ne sont pas livrés : le **menu** reste la voie d'interaction. Voir §10quater | fait |
 | `pw-dump` dans le diagnostic | le port Rust ne lit pas `pw-dump` : le **démon** publie déjà son propre graphe (`status().holaf_nodes`, `strips[].node_name`, `pending`), ce qui couvre les constats utiles. En revanche le **quantum** est publié (`status.timing`, depuis `pw-metadata -n settings` : `rate`, `quantum`, `force-quantum`, min/max) et `small_quantum` (< 256) est actif ; les compteurs **ERR** ne sont disponibles que si `pw-top -b` existe (PipeWire ≥ 0.3.66) — en 0.3.65 le binaire n'a pas de mode batch, donc `pwt_errors` reste muet et `pw_top_unavailable` (info) affiche la raison exacte. Rien n'est inventé | assumé |
 | routage applicatif côté démon | **fait** : `Backend::app_list` liste les flux de sortie audio (`pactl -f json list sink-inputs` + `list sinks` pour résoudre le `node.name` du bus) en excluant les flux du démon (son pid, ses enfants — les `pw-cat` de métrage —, ses nœuds `Holaf_*` et l'app Qt), et `app_move` déplace le flux via le gestionnaire de session (`pactl move-sink-input`) **puis relit** la liste pour vérifier que le flux est bien sur le bus ; `stub: true` n'est plus renvoyé | fait |
 | apprentissage MIDI par propriété | **fait** : le bouton MIDI d'un strip ouvre le menu Qt (`Learn Volume` / `Learn Mute` / `Learn Mono`, `Clear Mappings`, plus `Cancel learn` quand un learn est armé) ; voir §10ter | fait |
@@ -920,7 +922,33 @@ re-apprentissage** : c'est ce que verrouille `tests/midi_config.rs`.
 
 Le tray est la dernière brique Qt portée.  Il vit dans `src/tray.rs` et se
 découpe en deux : une **politique** toujours compilée (pure, testée en toutes
-configurations) et une **I/O GTK** derrière la feature `tray`.
+configurations) et une **I/O** derrière la feature `tray`.
+
+> **MISE À JOUR 2026-11-15 — le backend est `ksni`, plus GTK.**
+> `tray-icon` est passé de 0.19 + `libappindicator`/`gtk 0.18` à **0.26 +
+> feature `ksni`** : un `org.kde.StatusNotifierItem` en **D-Bus pur**.  Ce qui
+> change pour le lecteur des sections ci-dessous, qui décrivent l'état du
+> 2026-11-14 :
+>
+> * **plus de `gtk::init()` ni de `gtk::main()`** — ksni a son propre worker
+>   D-Bus ; le thread `holaf-tray` ne fait plus que garder le `TrayIcon` vivant
+>   (il `park`), et la feature n'ajoute **aucune** bibliothèque système ;
+> * **plus de paquets `gtk3` / `libayatana-appindicator`** dans le PKGBUILD, la
+>   CI, `build.sh` ou `BUILD.md` ; `ldd holaf-ui | grep -i gtk` est **vide**, et
+>   `gtk 0.18` (ligne fermée) sort du graphe de dépendances, ce qui élimine
+>   aussi RUSTSEC-2024-0370 (`proc-macro-error`, tiré par `gtk3-macros`) ;
+> * l'hôte appindicator devient un **hôte StatusNotifier** (mêmes bureaux :
+>   KDE/Plasma, waybar, `swaybar`, `gnome-shell-extension-appindicator`) ;
+> * **nouveauté** : l'app interroge D-Bus (`org.kde.StatusNotifierWatcher`) au
+>   démarrage — l'équivalent de `isSystemTrayAvailable()` — parce que le backend
+>   ksni, lui, se déclare disponible même sans hôte ; sans hôte, `available()`
+>   reste `false` et fermer **quitte** ;
+> * la pile GTK3/GLib reste retirée du bundle PyInstaller, mais désormais
+>   **uniquement pour le fallback Qt** (`libqgtk3.so` de PySide6) ;
+> * `--features tray-gtk` conserve l'ancien backend libappindicator comme filet
+>   de sécurité (jamais activé par défaut).
+>
+> Détail des décisions et preuves : [`dependency-audit.md`](dependency-audit.md).
 
 ### 10quater.1 Activation et dépendances
 
@@ -941,24 +969,25 @@ cargo build -p holaf-ui                      # défaut : pas d'icône, tout le r
 ```
 
 La feature n'est **pas** dans les `default` de la crate (`default = ["engine-pw",
-"midi"]`) : un `cargo build` brut ne l'inclut pas, c'est le script de build qui
-l'ajoute.  Ça garde `cargo test --workspace` (et les 569 tests) hermitique sur
-une machine sans GTK3, sans renoncer à livrer l'icône.
+"midi", "clipboard", "system_fonts"]`) : un `cargo build` brut ne l'inclut pas,
+c'est le script de build qui l'ajoute.  Ça garde `cargo test --workspace`
+hermitique sans renoncer à livrer l'icône.
 
 | Dépendance | Rôle | Particularité |
 |---|---|---|
-| `tray-icon 0.19` (`default-features = false`) | icône + menu (`muda` ré-exporté) | `default-features = false` **retire `libxdo`** : cette feature ne sert qu'aux items prédéfinis Copy/Paste, que l'app n'utilise pas.  Aucune dépendance de build ni `dlopen` de `libxdo` au runtime |
-| `gtk 0.18` | boucle GTK sur le thread du tray | version alignée sur celle qu'exige `tray-icon 0.19` |
+| `tray-icon 0.26` (`default-features = false`, feature `ksni`) | icône + menu (`muda 0.21` ré-exporté, feature `snapshot`) | `default-features = false` retire le backend `libappindicator` **et** `libxdo` ; le menu est publié en `com.canonical.dbusmenu` |
+| `zbus 5` | sondage `org.kde.StatusNotifierWatcher` | même crate que celle qu'utilise `ksni` : zéro compilation en plus |
+| `--features tray-gtk` *(repli)* | `gtk 0.18` + `tray-icon/libappindicator` | l'ancien backend, à ne sélectionner qu'à la place de `tray` ; exige `gtk3` + `libayatana-appindicator` |
 
-Paquets système : **`gtk3`** (build + link : `libgtk-3.pc`, `libgdk-3.pc`,
-`pango`, `cairo`) et **`libayatana-appindicator`** (runtime :
-`libappindicator-sys` `dlopen()` `libayatana-appindicator3.so.1` ; Arch n'a pas
-de `libappindicator-gtk3`, c'est AUR-only).  Un hôte appindicator est nécessaire
-pour que l'icône **s'affiche** : `gnome-shell-extension-appindicator`,
-`kstatusnotifieritem` (KDE), ou le `tray` de `swaybar`.  Les deux premiers sont
-en `depends` du PKGBUILD, l'hôte en `optdepends`.
+Paquets système : **aucun** pour le backend par défaut.  Un **hôte
+StatusNotifier** est nécessaire pour que l'icône **s'affiche** :
+`kstatusnotifieritem` (KDE/Plasma), `waybar`, le `tray` de `swaybar`, ou
+`gnome-shell-extension-appindicator` (GNOME) — ce dernier est le seul en
+`optdepends` du PKGBUILD.
 
-**Ces bibliothèques ne sont jamais embarquées dans le bundle** :
+**Ces bibliothèques ne sont jamais embarquées dans le bundle** (mesure faite à
+l'époque où `holaf-ui` liait GTK ; depuis le passage à ksni, c'est **PySide6**
+qui tire cette pile, et l'exclusion reste pour le fallback Qt) :
 `packaging/holaf-mix.spec` retire de `a.binaries` la pile GTK3/GLib
 (`libgtk-3`, `libgdk-3`, `libgdk_pixbuf`, `libpango*`, `libcairo*`, `libatk*`,
 `libatspi`, `libepoxy`, `libharfbuzz`, `libglib/gobject/gio/gmodule/gthread`,
@@ -974,13 +1003,16 @@ libpipewire, en pire).
 
 ### 10quater.2 Threading
 
-libappindicator exige une **boucle GTK qui tourne**, et eframe possède le thread
-principal.  `install()` lance donc un thread `holaf-tray` qui fait
-`gtk::init()` → construit l'icône + le menu → `gtk::main()`, et rend son verdict
-sur un canal (timeout 5 s).  Seuls deux objets traversent les threads : le canal
-global `muda::MenuEvent` (`Send`) et le drapeau `available()` (un atome).
-`poll()` — appelé **une fois par frame** par le shell, comme la pompe MIDI — vide
-ce canal, donc **l'UI thread ne touche jamais GTK**.
+eframe possède le thread principal, donc `install()` lance un thread
+`holaf-tray` qui construit l'icône + le menu et rend son verdict sur un canal
+(timeout 5 s), puis **garde le `TrayIcon` vivant** pour tout le run.  Avec le
+backend `ksni` il n'y a plus de boucle à faire tourner (ksni a son propre worker
+D-Bus) : le thread se contente de `park()`.  Avec le repli `tray-gtk`, il fait
+`gtk::init()` puis `gtk::main()` — libappindicator exige une boucle GTK sur ce
+thread-là.  Seuls deux objets traversent les threads : le canal global
+`muda::MenuEvent` (`Send`) et le drapeau `available()` (un atome).  `poll()` —
+appelé **une fois par frame** par le shell, comme la pompe MIDI — vide ce canal :
+**l'UI thread ne touche jamais le backend**.
 
 ### 10quater.3 Menu, fermeture, événements
 
@@ -1015,7 +1047,16 @@ transparentes, présence des trois capuchons, clamp `8..=256`) : ces tests
 
 ### 10quater.5 Ce qui n'est pas vérifiable ici (Wayland)
 
-Sous Wayland sans hôte appindicator, libappindicator « réussit » mais rien ne
+> **2026-11-15** : le cas « pas d'hôte » n'est plus silencieux — l'app sonde
+> `org.kde.StatusNotifierWatcher` et journalise
+> `tray: unavailable (no StatusNotifier host: … has no owner)`.  Ce qui reste
+> non vérifiable dans le conteneur, c'est le **rendu** de l'icône dans un panneau
+> réel et la géométrie du menu ; l'enregistrement D-Bus et le **contenu du menu
+> publié**, eux, sont testés de bout en bout par
+> `rust/crates/holaf-ui/tests/tray_live.rs` (bus de session privé + faux
+> watcher).
+
+Sous Wayland sans hôte, libappindicator « réussit » mais rien ne
 s'affiche ; et `tray-icon` ne livre **aucun** événement de clic hors X11 (côté
 GNOME/Wayland, les clics sur l'icône sont ignorés).  C'est pourquoi
 l'interaction fiable est le **menu** (pas un toggle au clic) et pourquoi
@@ -1031,6 +1072,30 @@ window will quit, not hide`), ne panique pas, `available()` reste `false` et
 bundle), démarre, et échoue proprement sur « no display server ».  Le rendu réel
 de l'icône dans un panneau (GNOME + extension, KDE, sway/swaybar) et la
 réception des clics sous X11 restent à confirmer sur une session graphique.
+
+---
+
+## 10quinquies. Retour du premier essai sur machine réelle (8 correctifs)
+
+Premier lancement sur une session **Wayland** (CachyOS, PipeWire 1.6, PreSonus
+Studio 26c, AKAI MIDI Mix).  Huit défauts rapportés, tous corrigés ; ce qui les
+rend vérifiables est noté à chaque fois.
+
+| # | Symptôme | Cause | Correctif |
+|---|---|---|---|
+| 3 | icône « X11 », « réclame un serveur X », pas de Wayland | `eframe` compilé avec la feature `x11` et **sans** `wayland` | `features = ["glow", "wayland", "default_fonts"]` ; `x11` devient une **feature cargo opt-in** (`--features x11`) jamais livrée.  Garde-fou CI : `cargo tree` sans crate `x11` + `cargo check --features x11` |
+| 8 | vumètres noirs | `pw-cat --target <source>.monitor` (vocabulaire **PulseAudio** que rend `meter_sources()`) ne résout **aucun nœud** : le flux retombait **silencieusement** sur la source par défaut.  `stderr` était jeté, d'où zéro trace | `capture_target()` retire `.monitor` et ajoute `-P '{"stream.capture.sink":true}'` (sans lui, viser un sink lie quand même la source par défaut) ; `stderr` de `pw-cat` journalisé ; slot de board suivi et capture relancée si le slot change.  Test `a_live_capture_feeds_the_board` (opt-in, vrai PipeWire) : RMS 0.3497 au lieu de 0.0000 |
+| 4 | changement de volume MIDI « saccadé » (souris fluide) | deux étages : `midi::decode` **jetait** les messages < 10 ms (donc le **dernier** d'un sweep) et l'UI ne redessinait qu'au tick vumètre de 40 ms | plus aucun throttle dans `decode` (le throttle 25 Hz last-value-wins du moteur suffit) + `ctx.request_repaint()` dès qu'un message MIDI a été appliqué.  Tests : burst de 101 messages → volume final = dernier message, valeur envoyée au moteur = la même |
+| 5 | « Quit » du tray ne quittait pas | `Quit` envoyait `ViewportCommand::Close`, la requête revenait, `close_action()` répondait `Hide` (tray présent) → retour dans le tray | état `quitting` dans la coquille + `tray::close_action_with(explicit_quit, …)` : un quit explicite gagne toujours.  Test unitaire des 6 combinaisons |
+| 6 | clic droit sans menu, et il bougeait le fader | `Response::dragged()` d'egui est vrai pour **n'importe quel** bouton, et le widget consommait le clic secondaire | fader sur `dragged_by`/`clicked_by(Primary)` uniquement ; un clic droit sur le fader/VU ouvre le menu du strip (`ContextMenuKind::Strip`).  Tests : geste droit/milieu → volume inchangé, geste gauche → volume modifié ; clic droit sur le fader → `OpenContextMenu`, jamais `Volume` |
+| 1 | strips de hauteurs différentes, faders désalignés | `SELECT APPS` n'était **pas alloué** quand le bouton était masqué (Qt gardait le widget dans le layout) | la ligne est toujours allouée sur une entrée (`flat_button_in` ne peint que si le bouton s'applique) ; `layout::rows_before_fader` ne dépend plus de la visibilité.  Tests : même hauteur de fader pour toutes les entrées + `debug_assert` dessin/modèle |
+| 2 | resize horizontal non bloqué (corrigé après coup) | seul `ViewportCommand::InnerSize` était utilisé, donc la fenêtre s'étirait puis revenait | deux couches : `min_inner_size.width == max_inner_size.width` (bloque le geste, X11 `WM_NORMAL_HINTS` / Wayland `xdg_toplevel.set_min_size|max_size`) envoyés **au changement seulement**, + la correction `InnerSize` en filet.  Test : les hints partent une fois, pas à chaque frame |
+| 7 | barre de statut « engine ready » | chrome Qt permanent que personne n'avait demandé | barre supprimée (et les 18 px rendus aux faders) ; `status` devient une **notice transitoire** (`STATUS_NOTICE` = 4 s, pastille centrée) et « engine ready » n'est plus un message (c'est l'état normal, il va au log).  Test pixel : le bord bas gauche ne bouge plus, la pastille existe ; test `transient_status` (expiration) |
+
+Limite assumée : le conteneur de dev n'a **ni Wayland ni MIDI**, donc le rendu
+réel sous Wayland (icône, verrou de largeur pendant le drag), la fluidité MIDI
+sur un vrai contrôleur et le menu du tray restent à confirmer sur la machine de
+l'utilisateur.  Tout ce qui *décide* est testé sans session graphique.
 
 ---
 
