@@ -172,6 +172,11 @@ pub struct StripFacts {
     /// Effects that are *active* (what should have a chain).
     pub active_effects: Vec<String>,
     pub volume: f32,
+    /// Is the strip muted?  A muted strip's VU bar is dark **by design**
+    /// (`app::feed_from_board` forces zero), so a report that shows seven bars
+    /// at 0.000 must say how many strips were muted — otherwise the user reads
+    /// “the metering is broken” on a perfectly healthy chain.
+    pub mute: bool,
 }
 
 /// One row of the engine's `timing.pw_top` block (a `pw-top -b` sample).
@@ -323,8 +328,11 @@ pub struct RecorderProbe {
 }
 
 impl RecorderProbe {
-    /// `pw-cat → /usr/bin/pw-cat (version 1.6.11)` / `pw-cat → NOT FOUND in
+    /// `pw-cat -> /usr/bin/pw-cat (version 1.6.11)` / `pw-cat -> NOT FOUND in
     /// PATH` — the one line the CAPTURES section opens with.
+    ///
+    /// ASCII on purpose: this string is also painted by the Graph tab, and the
+    /// bundled egui font has no `→` (it draws a tofu box).
     pub fn summary(&self) -> String {
         let command = if self.command.is_empty() {
             DEFAULT_RECORDER
@@ -332,8 +340,8 @@ impl RecorderProbe {
             self.command.as_str()
         };
         let mut line = match &self.path {
-            Some(path) => format!("{command} → {path}"),
-            None => format!("{command} → NOT FOUND in PATH"),
+            Some(path) => format!("{command} -> {path}"),
+            None => format!("{command} -> NOT FOUND in PATH"),
         };
         if let Some(version) = &self.version {
             line.push_str(&format!(" (version {version})"));
@@ -1429,12 +1437,24 @@ impl Report {
                 Finding::new(
                     "metering_silent",
                     Severity::Info,
-                    format!(
-                        "the {} capture(s) do receive blocks ({} decoded) but every VU bar reads \
-                         0.000: the recorded buses carry silence right now",
-                        captures.sources.len(),
-                        captures.blocks
-                    ),
+                    {
+                        let muted = engine.strips.iter().filter(|strip| strip.mute).count();
+                        let mut message = format!(
+                            "the {} capture(s) do receive blocks ({} decoded) but every VU bar \
+                             reads 0.000: the recorded buses carry silence right now",
+                            captures.sources.len(),
+                            captures.blocks
+                        );
+                        if muted > 0 {
+                            message.push_str(&format!(
+                                " ({} of {} strip(s) are MUTED — a muted strip's bar is dark by \
+                                 design)",
+                                muted,
+                                engine.strips.len()
+                            ));
+                        }
+                        message
+                    },
                 )
                 .with_hint(
                     "strips muted or faders at zero, or the captured node carries no signal \
@@ -1674,11 +1694,12 @@ impl Report {
             lines.push(format!("  strips ({}):", self.engine.strips.len()));
             for strip in &self.engine.strips {
                 lines.push(format!(
-                    "    - {:<24} bus={:<28} device={:<40} vol={:.3} fx={}",
+                    "    - {:<24} bus={:<28} device={:<40} vol={:.3}{} fx={}",
                     strip.label,
                     strip.node_name.as_deref().unwrap_or("?"),
                     strip.device_name.as_deref().unwrap_or("-"),
                     strip.volume,
+                    if strip.mute { " MUTED" } else { "" },
                     if strip.active_effects.is_empty() {
                         "-".to_string()
                     } else {
@@ -1998,6 +2019,7 @@ fn engine_facts(status: Option<&Value>, error: Option<&str>, strips: &[Strip]) -
                             .map(str::to_string),
                         active_effects,
                         volume: entry.get("volume").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                        mute: entry.get("mute").and_then(Value::as_bool).unwrap_or(false),
                     })
                 })
                 .collect()
@@ -2191,7 +2213,12 @@ pub fn recorder_probe() -> RecorderProbe {
     }
 }
 
-/// First line of `<command> --version`, when the tool answers and succeeds.
+/// The version line of `<command> --version`, when the tool answers.
+///
+/// `pw-cat --version` prints its name first and the library it links second
+/// (“pw-cat”, “Compiled with libpipewire 0.3.65”, “Linked with libpipewire
+/// 0.3.65”), so the *last line carrying a number* is the informative one — the
+/// first line alone would only repeat the command name.
 fn recorder_version(command: &str) -> Option<String> {
     let output = std::process::Command::new(command)
         .arg("--version")
@@ -2201,11 +2228,25 @@ fn recorder_version(command: &str) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    let lines: Vec<&str> = stdout
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|line| line.chars().any(|c| c.is_ascii_digit()))
+        .or_else(|| lines.first())?;
+    // “Linked with libpipewire 0.3.65” → `0.3.65`: the number is what a report
+    // reader compares with their installed PipeWire.
+    let token = line
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.'))
+        .find(|word| {
+            word.starts_with(|c: char| c.is_ascii_digit()) && word.contains('.')
+        });
+    Some(token.unwrap_or(line).to_string())
 }
 
 /// `pkg-config --modversion libpipewire-0.3`, when the tool exists.
@@ -2634,6 +2675,46 @@ mod tests {
         );
     }
 
+    /// A muted strip's bar is dark **by design** (`app::feed_from_board` forces
+    /// zero), so the “nothing moves” info has to say it: seven dark bars on a
+    /// muted mixer is not a broken metering chain.
+    #[test]
+    fn a_muted_mixer_is_named_in_the_silence_info() {
+        let mut status = healthy_status();
+        status["strips"][0]["mute"] = json!(true);
+        status["strips"][1]["mute"] = json!(true);
+        let strips = strips();
+        let streaming = capture_facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 42);
+        let captures = summary_of(vec![streaming]);
+        let levels = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [0.0_f32, 0.0]),
+            ("out-casque".to_string(), "Casque".to_string(), [0.0, 0.0]),
+        ];
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &levels,
+            captures: Some(&captures),
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_silent")
+            .expect("metering_silent");
+        assert!(
+            finding.message.contains("2 of 2 strip(s) are MUTED"),
+            "{}",
+            finding.message
+        );
+        // The ENGINE table carries the flag too, so a pasted report is readable
+        // without cross-checking the window.
+        assert!(report.text().contains("MUTED"), "{}", report.text());
+        // A mute is never an *error*: the chain is healthy.
+        assert_eq!(report.errors(), 0, "{:?}", report.findings);
+    }
+
     /// The CAPTURES section must be **self-explanatory**: which recorder, whether
     /// it exists, what each capture targets, its pid/state/blocks and what
     /// `pw-cat` said.  It is the section the user will paste.
@@ -2661,7 +2742,7 @@ mod tests {
         assert!(captures_at < devices_at, "CAPTURES sits before DEVICES");
 
         // The recorder line: the command, its resolved path and the env var.
-        assert!(text.contains("recorder        : pw-cat →"), "{text}");
+        assert!(text.contains("recorder        : pw-cat ->"), "{text}");
         assert!(text.contains(RECORDER_ENV), "{text}");
         // Global counters, with the reject reason spelled out.
         assert!(text.contains("210 accepted, 3 rejected (3 partial)"), "{text}");
@@ -2803,7 +2884,7 @@ mod tests {
         assert!(line.contains(&probe.command), "{line}");
         assert!(line.contains(RECORDER_ENV), "{line}");
         if probe.found() {
-            assert!(line.contains("→"), "{line}");
+            assert!(line.contains("->"), "{line}");
         } else {
             assert!(line.contains("NOT FOUND in PATH"), "{line}");
         }

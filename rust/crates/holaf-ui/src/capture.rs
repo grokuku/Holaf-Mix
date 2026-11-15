@@ -1067,6 +1067,114 @@ mod tests {
         assert!(detect_sample_format(&[0_u8; BLOCK_BYTES]).starts_with("unknown"));
     }
 
+    /// A recorder that picks its payload from the `--target` it was given, so one
+    /// [`MeterCapture`] (one recorder) can run two captures with **different**
+    /// levels — what the slot-mapping test needs.
+    fn fake_recorder_by_target(tag: &str, loud: &[u8], quiet: &[u8]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "holaf-capture-targets-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let loud_path = dir.join("loud.bin");
+        let quiet_path = dir.join("quiet.bin");
+        std::fs::write(&loud_path, loud).unwrap();
+        std::fs::write(&quiet_path, quiet).unwrap();
+        let script = dir.join("recorder.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\npayload='{quiet}'\ncase \"$*\" in\n  *Holaf_Bus_Loud*) payload='{loud}' ;;\nesac\nwhile :; do cat \"$payload\"; done\n",
+                loud = loud_path.display(),
+                quiet = quiet_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// A `-20 dBFS` sine block, duplicated to both channels.
+    fn sine_block(amplitude: f32) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(BLOCK_BYTES);
+        for n in 0..BLOCK_FRAMES {
+            let sample =
+                amplitude * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+            payload.extend_from_slice(&sample.to_le_bytes());
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        payload
+    }
+
+    /// **H3 — the slot mapping.**  Each capture publishes into the slot the board
+    /// gave its *uid*, so a level can never land on somebody else's bar.  The
+    /// dangerous moment is a **reassignment** (a strip added/removed/reordered
+    /// after an FX chain was created): the reader thread is restarted, and if it
+    /// kept its old slot the bars would silently swap — every strip showing
+    /// another one's audio.
+    #[test]
+    fn a_level_never_lands_on_another_strips_bar_after_a_reassignment() {
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder_by_target(
+            "slots",
+            &sine_block(0.1),  // −20 dBFS → level ≈ 0.56
+            &sine_block(0.01), // −40 dBFS → level ≈ 0.26
+        ));
+        let mut wanted = HashMap::new();
+        wanted.insert("loud".to_string(), "Holaf_Bus_Loud.monitor".to_string());
+        wanted.insert("quiet".to_string(), "Holaf_Bus_Quiet.monitor".to_string());
+
+        let expect = |board: &MeterBoard, loud_slot: usize, quiet_slot: usize| {
+            let read = |slot: usize| board.read_slot(slot)[0];
+            let loud = read(loud_slot);
+            let quiet = read(quiet_slot);
+            assert!(
+                (loud - 0.56).abs() < 0.03,
+                "the −20 dBFS capture must read 0.56, got {loud}"
+            );
+            assert!(
+                (quiet - 0.26).abs() < 0.03,
+                "the −40 dBFS capture must read 0.26, got {quiet}"
+            );
+        };
+
+        // First assignment: loud = slot 0, quiet = slot 1.
+        let slots = board.assign(&["loud".to_string(), "quiet".to_string()]);
+        assert_eq!((slots["loud"], slots["quiet"]), (0, 1));
+        capture.sync(&wanted, &slots, &board);
+        assert!(
+            wait_until(|| board.read_slot(0)[0] > 0.1 && board.read_slot(1)[0] > 0.1),
+            "both captures must publish: {:?}",
+            capture.stats().summary()
+        );
+        expect(&board, 0, 1);
+        // …and by uid, which is what the UI reads.
+        assert!((board.read("loud").unwrap()[0] - 0.56).abs() < 0.03);
+        assert!((board.read("quiet").unwrap()[0] - 0.26).abs() < 0.03);
+
+        // A strip was inserted before them: both slots move.  The readers must be
+        // restarted (a stale slot index would paint the wrong bar).
+        let slots = board
+            .assign(&["new".to_string(), "loud".to_string(), "quiet".to_string()]);
+        assert_eq!((slots["loud"], slots["quiet"]), (1, 2));
+        capture.sync(&wanted, &slots, &board);
+        assert!(
+            wait_until(|| board.read_slot(1)[0] > 0.1 && board.read_slot(2)[0] > 0.1),
+            "the restarted captures must publish into their new slots: {:?}",
+            capture.stats().summary()
+        );
+        expect(&board, 1, 2);
+        assert!((board.read("loud").unwrap()[0] - 0.56).abs() < 0.03);
+        assert!((board.read("quiet").unwrap()[0] - 0.26).abs() < 0.03);
+        // Every capture reports the slot it really writes into.
+        let summary = capture.stats().summary();
+        assert_eq!(summary.sources.len(), 2);
+        capture.stop_all();
+    }
+
     /// Silence stays silence (a real zero-filled f32 stream, not a misread one).
     #[test]
     fn a_zero_filled_stream_is_dark() {

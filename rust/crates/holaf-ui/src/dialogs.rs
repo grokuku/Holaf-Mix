@@ -602,9 +602,11 @@ fn draw_diagnostics(state: &mut AppState, ui: &mut Ui) {
                                 .color(colour),
                             );
                             for facts in &report.captures.sources {
+                                // `->` rather than `→`: the arrow is missing from
+                                // the bundled font and would paint as a tofu box.
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} → {} · {}",
+                                        "{} -> {} · {}",
                                         facts.source,
                                         facts.target,
                                         facts.describe()

@@ -103,6 +103,11 @@ struct Args {
     /// devices, so the device picker's geometry can be checked for a short and a
     /// long list (3 devices versus 10, the two cases the user asked about).
     devices: Option<usize>,
+    /// `--captures CASE`: fill the report's CAPTURES section with a simulated
+    /// capture state (`dead`, `misread` or `live`).  The mock engine spawns no
+    /// `pw-cat`, so without this the section can only say “no capture is
+    /// running” — and the whole point of the section is the *broken* cases.
+    captures: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -117,6 +122,7 @@ fn parse_args() -> Result<Args, String> {
         dialog: None,
         dialog_tab: None,
         devices: None,
+        captures: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -138,6 +144,7 @@ fn parse_args() -> Result<Args, String> {
             "--config" | "-c" => args.config = Some(PathBuf::from(value()?)),
             "--dialog" => args.dialog = Some(value()?),
             "--dialog-tab" => args.dialog_tab = Some(value()?),
+            "--captures" => args.captures = Some(value()?),
             "--devices" => {
                 args.devices = Some(
                     value()?
@@ -153,7 +160,7 @@ fn parse_args() -> Result<Args, String> {
                      [--config CONFIG.json] [--dialog diagnostics|apps|fx|device|add|delete|\
                      menu|midi-port|midi-port-none|midi-learn|midi-menu] \
                      [--dialog-tab summary|engine|graph|system|journal] \
-                     [--devices N]"
+                     [--devices N] [--captures dead|misread|live]"
                         .to_string(),
                 )
             }
@@ -213,6 +220,29 @@ fn main() -> ExitCode {
     if let Some(kind) = &args.dialog {
         match open_dialog(&mut state, kind, args.dialog_tab.as_deref()) {
             Ok(()) => log::info!("snapshot: dialog {kind:?} opened"),
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // `--captures CASE`: the mock engine spawns no `pw-cat`, so the report's
+    // CAPTURES section would only ever say “no capture is running”.  This fills
+    // it with the state a broken chain really reports — the section exists to
+    // explain “every VU bar reads 0.000”, which only the broken cases show.
+    if let Some(case) = &args.captures {
+        let Some(diagnostics) = &mut state.diagnostics else {
+            eprintln!("--captures needs --dialog diagnostics");
+            return ExitCode::FAILURE;
+        };
+        match simulated_captures(case) {
+            Ok(captures) => {
+                diagnostics.report.captures = captures;
+                // The findings are derived from the facts, so they must be
+                // recomputed: a capture case without its finding would be a lie.
+                diagnostics.report.findings = diagnostics.report.detect();
+            }
             Err(message) => {
                 eprintln!("{message}");
                 return ExitCode::FAILURE;
@@ -360,6 +390,97 @@ fn simulated_devices(count: usize) -> Vec<holaf_ui::engine_json::DeviceInfo> {
 /// deterministic payloads (see `crate::bridge`), which is exactly the "what does
 /// the dialog look like when the engine answers" case — and it needs no daemon,
 /// so a capture stays reproducible.
+/// A capture state a broken chain really produces, for `--captures`.
+///
+/// Three cases, each one a diagnosis the report exists to name: the recorder
+/// missing altogether, a recorder writing something that is not `f32le`, and a
+/// healthy chain (so the section is also shown when nothing is wrong).
+fn simulated_captures(case: &str) -> Result<holaf_ui::diagnostics::CaptureSummary, String> {
+    use holaf_ui::diagnostics::{
+        CaptureFacts, CaptureState, CaptureSummary, RejectReason, STDERR_TAIL,
+    };
+    let facts = |uid: &str, source: &str, state: CaptureState, blocks: u64| CaptureFacts {
+        uid: uid.to_string(),
+        source: source.to_string(),
+        target: source.trim_end_matches(".monitor").to_string(),
+        monitor: source.ends_with(".monitor"),
+        pid: Some(4211),
+        state,
+        blocks,
+        rejected: 0,
+        last_rms: (blocks > 0).then_some([0.0219, 0.0217]),
+        last_peak: (blocks > 0).then_some([0.0341, 0.0338]),
+        since_last_block: (blocks > 0).then(|| std::time::Duration::from_millis(20)),
+        stderr_tail: Vec::new(),
+        format_guess: None,
+    };
+    let mut summary = CaptureSummary {
+        recorder: holaf_ui::diagnostics::default_recorder(),
+        ..CaptureSummary::default()
+    };
+    match case.to_lowercase().as_str() {
+        "dead" => {
+            // What Arch shows when `pipewire-audio` (which ships `pw-cat`) is
+            // missing: every spawn fails with ENOENT, so every bar reads 0.000.
+            let mut mic = facts(
+                "in-mic",
+                "Holaf_Bus_Mic.monitor",
+                CaptureState::Failed {
+                    reason: "pw-cat: No such file or directory (os error 2)".to_string(),
+                },
+                0,
+            );
+            mic.pid = None;
+            let mut casque = facts(
+                "out-casque",
+                "alsa_output.usb-PreSonus_Studio_26c-00.analog-surround-40.monitor",
+                CaptureState::Failed {
+                    reason: "pw-cat: No such file or directory (os error 2)".to_string(),
+                },
+                0,
+            );
+            casque.pid = None;
+            summary.sources = vec![mic, casque];
+        }
+        "misread" => {
+            // Blocks arrive but every one is refused (peak ≈ −1.6e31 as f32):
+            // the recorder writes s16le, not f32le.
+            let mut mic = facts(
+                "in-mic",
+                "Holaf_Bus_Mic.monitor",
+                CaptureState::Waiting,
+                0,
+            );
+            mic.rejected = 1240;
+            mic.format_guess = Some("s16le (peak 0.750)".to_string());
+            summary.sources = vec![mic];
+            summary.rejected = 1240;
+            summary
+                .rejects
+                .insert(RejectReason::Implausible.name().to_string(), 1240);
+        }
+        "live" => {
+            // The nominal chain: blocks decoded, levels drawn, nothing wrong.
+            summary.sources = vec![
+                facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 4210),
+                facts(
+                    "out-casque",
+                    "alsa_output.usb-PreSonus_Studio_26c-00.analog-surround-40.monitor",
+                    CaptureState::Waiting,
+                    0,
+                ),
+            ];
+            summary.sources[1].stderr_tail = vec![
+                "stream is not linked to the target yet (waiting for the device)".to_string(),
+            ];
+            summary.sources[1].stderr_tail.truncate(STDERR_TAIL);
+            summary.blocks = 4210;
+        }
+        other => return Err(format!("unknown --captures {other:?} (dead|misread|live)")),
+    }
+    Ok(summary)
+}
+
 fn open_dialog(state: &mut AppState, kind: &str, tab: Option<&str>) -> Result<(), String> {
     // A virtual input strip is the one that can take applications over.
     let virtual_input = state
