@@ -518,6 +518,45 @@ fn draw_diagnostics(state: &mut AppState, ui: &mut Ui) {
                                 report.meter_missing.join(", ")
                             ));
                         }
+                        // What the VU bars draw right now — the Python dialog
+                        // printed “L=0.030 R=0.029” per strip, and without it a
+                        // “VU stuck at full scale” report cannot be read (a real
+                        // level and a capture that never arrived look identical).
+                        if !report.meter_levels.is_empty() {
+                            ui.separator();
+                            ui.label(format!("meter levels ({})", report.meter_levels.len()));
+                            for (uid, label, [left, right]) in &report.meter_levels {
+                                let colour = if *left >= 0.999 && *right >= 0.999 {
+                                    egui::Color32::from_rgb(0xd0, 0x60, 0x60)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                let source =
+                                    if report.meter_missing.iter().any(|missing| missing == uid) {
+                                        "  (no capture source)"
+                                    } else {
+                                        ""
+                                    };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{label:<20} L={left:.3} R={right:.3}{source}"
+                                    ))
+                                    .color(colour),
+                                );
+                            }
+                            // The scale, so 0.73 is readable as “−12 dBFS RMS”.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "scale: {:.0} dBFS → 0.00, 0 dBFS → {:.2}, \
+                                     +{:.0} dBFS → 1.00",
+                                    crate::meters::LEVEL_FLOOR_DB,
+                                    crate::meters::level_from_amplitude(1.0),
+                                    crate::meters::OVERLOAD_HEADROOM_DB
+                                ))
+                                .size(10.0)
+                                .weak(),
+                            );
+                        }
                         ui.separator();
                         ui.label(format!(
                             "Holaf_* nodes ({})",

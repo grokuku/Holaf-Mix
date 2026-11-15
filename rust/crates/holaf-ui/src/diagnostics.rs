@@ -319,6 +319,14 @@ pub struct Report {
     pub missing_devices: Vec<(String, String, String)>,
     /// Uids the meter capture has no source for.
     pub meter_missing: Vec<String>,
+    /// What the VU bars are drawing right now: `(uid, label, [left, right])`,
+    /// in strip order, as `AppState::levels_for` returns them (0.0–1.0).
+    ///
+    /// This is the section the user missed in the first report (“L=0.030
+    /// R=0.029” per strip in the Python one): without it, “les VU sont à fond”
+    /// cannot be told apart from “the levels never arrive”.  It is the *drawn*
+    /// value — envelope included — so it is exactly what is on screen.
+    pub meter_levels: Vec<(String, String, [f32; 2])>,
     pub system: SystemFacts,
     pub findings: Vec<Finding>,
 }
@@ -388,6 +396,9 @@ pub struct Inputs<'a> {
     pub missing_devices: &'a [(String, String, String)],
     /// Uids the meter capture has no source for.
     pub meter_missing: &'a [String],
+    /// `(uid, label, [left, right])` the VU bars currently draw (see
+    /// [`Report::meter_levels`]).
+    pub meter_levels: &'a [(String, String, [f32; 2])],
     pub config_path: Option<&'a Path>,
     /// Unix seconds; `0` means "now" (a test fixes it instead).
     pub now_unix: u64,
@@ -406,6 +417,7 @@ impl<'a> Inputs<'a> {
             strips,
             missing_devices: &[],
             meter_missing: &[],
+            meter_levels: &[],
             config_path: None,
             now_unix: 0,
             daemon_pids: Some(Vec::new()),
@@ -427,6 +439,7 @@ impl Report {
                 .collect(),
             missing_devices: inputs.missing_devices.to_vec(),
             meter_missing: inputs.meter_missing.to_vec(),
+            meter_levels: inputs.meter_levels.to_vec(),
             system: SystemFacts {
                 app_version: APP_VERSION.to_string(),
                 app_pid: std::process::id(),
@@ -774,6 +787,38 @@ impl Report {
                 ),
             );
         }
+        // **Every bar glued at the top** is not a mix: it is either a signal far
+        // over full scale (a bus summing several strips, a doubled route) or a
+        // capture read with the wrong sample format.  Both used to look like “the
+        // VUs are always full”; the METERING section tells them apart (a level of
+        // exactly 1.000 means +6 dBFS or more).
+        let drawn: Vec<&(String, String, [f32; 2])> = self
+            .meter_levels
+            .iter()
+            .filter(|(uid, _, _)| !self.meter_missing.iter().any(|missing| missing == uid))
+            .collect();
+        if drawn.len() >= 2
+            && drawn
+                .iter()
+                .all(|(_, _, [l, r])| *l >= 0.999 && *r >= 0.999)
+        {
+            findings.push(
+                Finding::new(
+                    "metering_pinned",
+                    Severity::Warning,
+                    format!(
+                        "all {} VU bars are at full scale (level 1.000 = at least +{:.0} dBFS)",
+                        drawn.len(),
+                        crate::meters::OVERLOAD_HEADROOM_DB
+                    ),
+                )
+                .with_hint(
+                    "either the buses carry far more than full scale (sum of several strips, or a \
+                     doubled route) or a capture is being read with the wrong sample format — \
+                     the log says “impossible block” in that case",
+                ),
+            );
+        }
 
         // --- clock / processing errors (the crackle signature) ----------------
         //
@@ -1038,6 +1083,33 @@ impl Report {
             for node in &self.engine.holaf_nodes {
                 lines.push(format!("    - {node}"));
             }
+        }
+        lines.push(String::new());
+
+        lines.push("METERING".to_string());
+        if self.meter_levels.is_empty() {
+            lines.push("  (no strip is drawing a level)".to_string());
+        } else {
+            lines.push("  levels as the VU bars draw them (0.00-1.00):".to_string());
+            for (uid, label, [left, right]) in &self.meter_levels {
+                let source = if self.meter_missing.iter().any(|missing| missing == uid) {
+                    "  (no capture source)"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "    - {:<24} L={left:.3} R={right:.3}{source}",
+                    label
+                ));
+            }
+            // The dBFS the bar means: what a report reader needs to tell “this
+            // strip is loud” from “this strip is at the top of the scale”.
+            lines.push(format!(
+                "  scale: {:.0} dBFS -> 0.00, 0 dBFS -> {:.2}, +{:.0} dBFS (overload) -> 1.00",
+                crate::meters::LEVEL_FLOOR_DB,
+                crate::meters::level_from_amplitude(1.0),
+                crate::meters::OVERLOAD_HEADROOM_DB
+            ));
         }
         lines.push(String::new());
 
@@ -1526,6 +1598,99 @@ mod tests {
         assert_eq!(report.warnings(), 0, "{:?}", report.findings);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(report.text().contains("(none — everything looks healthy)"));
+    }
+
+    /// **The METERING section** — the one the first report was missing, which
+    /// made “the VUs are full” indistinguishable from “the levels never arrive”.
+    /// It prints the level each bar draws, the strips without a capture source,
+    /// and the dBFS the scale means.
+    #[test]
+    fn the_report_shows_what_every_vu_bar_draws() {
+        let status = healthy_status();
+        let strips = strips();
+        let levels = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [0.301_f32, 0.299]),
+            ("out-casque".to_string(), "Casque".to_string(), [0.0, 0.0]),
+        ];
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &levels,
+            meter_missing: &["out-casque".to_string()],
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        let text = report.text();
+        assert!(text.contains("\nMETERING"), "{text}");
+        assert!(
+            text.contains("Mic") && text.contains("L=0.301 R=0.299"),
+            "{text}"
+        );
+        // A strip with no capture source says so instead of showing a fake level.
+        assert!(
+            text.contains("Casque") && text.contains("(no capture source)"),
+            "{text}"
+        );
+        // The scale is spelled out, so a reader can tell 0.73 from “full”.
+        assert!(text.contains("0 dBFS -> 0.91"), "{text}");
+
+        // A report with no strips drawing anything says so (never an empty
+        // heading that reads like a truncated report).
+        let empty = Report::collect(&Inputs::empty(&[]));
+        assert!(
+            empty.text().contains("(no strip is drawing a level)"),
+            "{}",
+            empty.text()
+        );
+    }
+
+    /// **Every bar glued at the top** is a diagnosis, not a mix: it means at
+    /// least +6 dBFS everywhere (a summed bus, a doubled route) or a capture read
+    /// with the wrong sample format.  The report must say it instead of leaving
+    /// the user with “les VU sont toujours à fond”.
+    #[test]
+    fn every_bar_at_full_scale_is_reported_as_a_finding() {
+        let status = healthy_status();
+        let strips = strips();
+        let pinned = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [1.0_f32, 1.0]),
+            ("out-casque".to_string(), "Casque".to_string(), [1.0, 1.0]),
+        ];
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &pinned,
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.id == "metering_pinned")
+            .expect("metering_pinned");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.message.contains("+6 dBFS"), "{}", finding.message);
+
+        // A normal mix (anything below the top) raises nothing.
+        let normal = vec![
+            ("in-mic".to_string(), "Mic".to_string(), [0.73_f32, 0.70]),
+            ("out-casque".to_string(), "Casque".to_string(), [0.66, 0.65]),
+        ];
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &normal,
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.id == "metering_pinned"),
+            "{:?}",
+            report.findings
+        );
     }
 
     /// The `timing` block the daemon publishes (`pw-metadata -n settings`), by

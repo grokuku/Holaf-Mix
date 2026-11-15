@@ -354,8 +354,11 @@ Points de conception :
    que *nommer* les sources ; le thread moteur ouvre une capture `pw-cat
    --record --target <source>.monitor --format f32 -` par source
    ([`capture`](../rust/crates/holaf-ui/src/capture.rs)), calcule RMS et peak par
-   bloc de 10 ms ([`meters`](../rust/crates/holaf-ui/src/meters.rs)) et publie
-   `min(1, rms·5)` dans un `Arc<[AtomicU32]>` (la règle du moteur Python).  L'UI
+   bloc de 10 ms ([`meters`](../rust/crates/holaf-ui/src/meters.rs)) et publie le
+   **niveau dBFS** (`−60 dBFS → 0`, `+6 dBFS → 1`, voir §10sexies.2) dans un
+   `Arc<[AtomicU32]>`.  Un bloc **impossible** (pic > +40 dBFS : flux relu avec
+   le mauvais format d'échantillon) est rejeté — barre noire + une ligne de
+   journal — au lieu d'être collé à 1.0.  L'UI
    lit ces atomes à 25 Hz et applique `level = max(new, prev·0.85)` (par 40 ms,
    indépendant du framerate) pour que les barres redescendent.
 6. **UI optimiste avec rollback.** Chaque changement réversible est enregistré
@@ -633,7 +636,7 @@ pour le port, `engine_live` pour le moteur — + 1 doctest), et **343** avec
 
 | Manque | Effet visible | Étape |
 |---|---|---|
-| **tray icon** | **fait** (2026-11-14, backend **ksni**/D-Bus depuis le 2026-11-15 — plus de GTK), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte StatusNotifier, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Avec un tray réel, `close_action()` cache la fenêtre (préférence `ui_rust.tray_hide_on_close`, défaut `true`). Sous GNOME/Wayland les **clics** ne sont pas livrés : le **menu** reste la voie d'interaction. Voir §10quater | fait |
+| **tray icon** | **fait** (2026-11-14, backend **ksni**/D-Bus depuis le 2026-11-15 — plus de GTK), **activé par défaut au build** (`scripts/build_rust.sh`, donc PKGBUILD/tarball/CI ; `HOLAF_NO_TRAY=1` pour l'enlever) : sans hôte StatusNotifier, ou sans display, il n'y a pas d'icône et fermer la fenêtre **quitte** — choix sûr, cacher rendrait l'app inatteignable. Depuis le 2026-11-15 il porte **tout** le menu applicatif (l'ancien menu clic droit de la fenêtre n'existe plus) : `Show/Hide`, `MIDI port...`, `Restart audio engine`, `Debug window`, `Open project page`, `Quit`. La croix **quitte** par défaut (cacher sur Wayland est impossible : `Visible(false)` y est un no-op) ; cacher reste possible via `ui_rust.tray_hide_on_close` (défaut `false`). Voir §10quater | fait |
 | `pw-dump` dans le diagnostic | le port Rust ne lit pas `pw-dump` : le **démon** publie déjà son propre graphe (`status().holaf_nodes`, `strips[].node_name`, `pending`), ce qui couvre les constats utiles. En revanche le **quantum** est publié (`status.timing`, depuis `pw-metadata -n settings` : `rate`, `quantum`, `force-quantum`, min/max) et `small_quantum` (< 256) est actif ; les compteurs **ERR** ne sont disponibles que si `pw-top -b` existe (PipeWire ≥ 0.3.66) — en 0.3.65 le binaire n'a pas de mode batch, donc `pwt_errors` reste muet et `pw_top_unavailable` (info) affiche la raison exacte. Rien n'est inventé | assumé |
 | routage applicatif côté démon | **fait** : `Backend::app_list` liste les flux de sortie audio (`pactl -f json list sink-inputs` + `list sinks` pour résoudre le `node.name` du bus) en excluant les flux du démon (son pid, ses enfants — les `pw-cat` de métrage —, ses nœuds `Holaf_*` et l'app Qt), et `app_move` déplace le flux via le gestionnaire de session (`pactl move-sink-input`) **puis relit** la liste pour vérifier que le flux est bien sur le bus ; `stub: true` n'est plus renvoyé | fait |
 | apprentissage MIDI par propriété | **fait** : le bouton MIDI d'un strip ouvre le menu Qt (`Learn Volume` / `Learn Mute` / `Learn Mono`, `Clear Mappings`, plus `Cancel learn` quand un learn est armé) ; voir §10ter | fait |
@@ -907,7 +910,7 @@ cargo run -p holaf-ui -- --midi "MIDI Mix:MIDI Mix MIDI 1 24:0"
 #    → "Learn Volume" → bouger le fader voulu → le bouton affiche "CC 19"
 #    → le fader du mixeur suit ; survoler le bouton liste les mappings
 
-# 5. changer de contrôleur : menu fenêtre (clic droit sur le fond) → "MIDI port..."
+# 5. changer de contrôleur : menu du tray (icône) → "MIDI port..."
 
 # 6. débrancher/rebrancher : reconnexion automatique en 2 s, état dans la barre
 #    (`MIDI: <port> unavailable (...) - retrying every 2 s`)
@@ -1016,17 +1019,39 @@ appelé **une fois par frame** par le shell, comme la pompe MIDI — vide ce can
 
 ### 10quater.3 Menu, fermeture, événements
 
+Le menu clic droit de la fenêtre a été **supprimé** (demande utilisateur du
+2026-11-15 : « je ne veux plus d'action au click droit sur la fenêtre, je veux
+que le contenu du menu soit déplacé au click sur le tray icon »).  Son contenu
+est *déplacé*, pas recopié : `crate::menus::ContextMenuKind::Window` reste la
+description unique des entrées, et `tray::menu_layout()` la publie.
+
 | Entrée | Id stable | Action |
 |---|---|---|
-| `Show/Hide` | `holaf.tray.show_hide` | `ViewportCommand::Visible(!window_visible)` |
-| `Restart audio engine` | `holaf.tray.restart_engine` | `AppState::restart_engine` (même action que le menu contextuel) |
+| `Show/Hide` | `holaf.tray.show_hide` | `Visible(!window_visible)` + `Minimized(window_visible)` |
+| — séparateur — | | |
+| `MIDI port...` | `holaf.tray.midi_port` | fenêtre montrée, puis `UiAction::OpenMidiPortPicker` |
+| `Restart audio engine` | `holaf.tray.restart_engine` | `AppState::restart_engine` |
+| `Debug window` | `holaf.tray.diagnostics` | fenêtre montrée, puis `UiAction::OpenDiagnostics` |
+| `Open project page` | `holaf.tray.project_page` | `UiAction::OpenProjectPage` |
+| — séparateur — | | |
 | `Quit` | `holaf.tray.quit` | `ViewportCommand::Close` → `on_exit` → `AppState::shutdown()` |
+
+Les menus **contextuels** restent (strip : `Rename`/`Delete`, bouton FX :
+`Effect settings`, bouton MIDI : learn) : ils portent sur *un* strip et ne sont
+atteignables que depuis lui.  Leur règle de fermeture exempte la frame
+d'ouverture (`opened_at`), sinon le clic qui les ouvre les referme
+instantanément — d'où le test `a_menu_survives_the_idle_frames_after_it_opened`.
 
 `close_action(available, hide_on_close)` encode la règle de `closeEvent` de Qt :
 **cacher** seulement si `available()` **et** la préférence
-`ui_rust.tray_hide_on_close` (défaut `true`) ; sinon **quitter**.  Cacher sans
-moyen de revenir laisserait un processus inatteignable — c'est précisément ce que
-le code Qt évitait avec `isSystemTrayAvailable()`.
+`ui_rust.tray_hide_on_close` ; sinon **quitter**.  Le défaut est passé à `false`
+le 2026-11-15 : sur Wayland un client **ne peut pas** cacher son toplevel
+(`ViewportCommand::Visible(false)` n'a pas d'équivalent dans le protocole), donc
+« cacher » annulait la fermeture sans rien cacher — « la croix ne ferme plus la
+fenêtre ».  Quand la préférence est active, `send_visible()` envoie aussi
+`Minimized`, qui marche sur les deux backends.  Cacher sans moyen de revenir
+laisserait un processus inatteignable — c'est précisément ce que le code Qt
+évitait avec `isSystemTrayAvailable()`.
 
 `menu_action(id)` est une fonction pure : un id inconnu (menu d'une autre app,
 entrée future) est **ignoré**, jamais mal routé.
@@ -1163,15 +1188,51 @@ multiplie donc **jamais** le niveau par le volume du strip.
 La vraie cause du « à fond » était donc l'**échelle** : `min(1, rms × 5)`
 (parité Qt) sature à RMS 0.2 = **−14 dBFS**, donc tout morceau ou toute voix
 normale collait les deux barres en haut.  L'échelle est maintenant en dBFS
-(`meters::level_from_amplitude`) : −60 dBFS → 0, 0 dBFS → 1.
+(`meters::level_from_amplitude`) : −60 dBFS → 0, **+6 dBFS → 1**.
 
-| RMS | dBFS | avant (`rms×5`) | maintenant |
+**Deuxième tour (2026-11-15, « il reste les vu-mètres toujours à fond »)** :
+une échelle −60…**0** dBFS ne suffisait pas, parce qu'un morceau normal vit
+entre −20 et −6 dBFS RMS : 0.67…0.85, soit le dernier cinquième de la barre, et
+un bus qui somme plusieurs strips dépasse 0 dBFS et **colle** à 1.00.  Le haut de
+l'échelle est donc réservé à la **surcharge** (`OVERLOAD_HEADROOM_DB` = 6 dB
+audessus du plein niveau) : 0 dBFS → 0.91, 1.00 veut dire « au moins +6 dBFS ».
+Mesuré de bout en bout sur le bac à sable (capture `pw-cat` réelle → board →
+enveloppe → la valeur que le fader dessine) :
+
+| signal | RMS | avant (−60…0) | après (−60…+6) |
 |---|---|---|---|
-| 0.354 (sinus −6 dBFS) | −9 | 1.00 | 0.85 |
-| 0.2 | −14 | **1.00** | 0.77 |
-| 0.1 | −20 | 0.50 | 0.67 |
-| 0.0316 | −30 | 0.16 | 0.50 |
-| 0.00316 | −50 | 0.02 | 0.17 |
+| silence | 0 | 0.00 | 0.00 |
+| sinus −30 dBFS | 0.022 | 0.45 | 0.41 |
+| sinus −20 dBFS | 0.071 | 0.62 | 0.56 |
+| sinus −9 dBFS | 0.251 | 0.80 | 0.73 |
+| musique −14 dBFS RMS | 0.200 | 0.77 | 0.71 |
+| musique −12 dBFS RMS | 0.251 | 0.81 | **0.74** |
+| musique −9 dBFS RMS | 0.355 | 0.86 | 0.78 |
+| 4 pistes −9 dBFS dans un bus | ≈1.4 | **1.00 (collé)** | 0.92 |
+
+Deuxième cause possible, écartée **par la mesure** mais désormais impossible à
+confondre avec un vrai niveau : si un `pw-cat` écrivait autre chose que du
+`f32le` (l'argument `--format f32` est bien passé, vérifié à l'octet près :
+`00 60 b1 bd …` = −0.08661 par échantillon à −20 dBFS), les octets relus en f32
+donnent des « échantillons » énormes → RMS ≫ 1 → barre collée à 1.00 avec des
+baisses de 15 % de temps en temps (exactement la description de l'utilisateur).
+`MeterSample::is_implausible` (pic > `IMPLAUSIBLE_PEAK` = +40 dBFS) rejette
+ces blocs : la barre reste **noire** et le journal dit « impossible block ».
+Un test de non-régression rejoue les vrais octets d'un flux s16 relu en f32.
+Enfin le rapport de diagnostic a une section **METERING** (et un onglet Graph
+qui affiche `L=… R=…` par strip, comme le rapport Python) : « les VU sont à
+fond » et « les niveaux n'arrivent pas » ne se ressemblent plus.  Un finding
+`metering_pinned` signale « toutes les barres à 1.000 » (= au moins +6 dBFS
+partout : bus trop chaud, route doublée, ou format mal lu).
+
+| RMS | dBFS | avant (`rms×5`) | 1er correctif (−60…0) | maintenant (−60…+6) |
+|---|---|---|---|---|
+| 0.354 (sinus −6 dBFS) | −9 | 1.00 | 0.85 | 0.77 |
+| 0.251 (musique −12 dBFS) | −12 | 1.00 | 0.81 | 0.73 |
+| 0.2 | −14 | **1.00** | 0.77 | 0.70 |
+| 0.1 | −20 | 0.50 | 0.67 | 0.61 |
+| 0.0316 | −30 | 0.16 | 0.50 | 0.45 |
+| 0.00316 | −50 | 0.02 | 0.17 | 0.15 | |
 
 En plus : un strip **mute** force un VU noir (le moteur coupe le monitor d'un bus,
 mais un strip physique enregistre sa *source* de device, dont `monitorMute` n'est

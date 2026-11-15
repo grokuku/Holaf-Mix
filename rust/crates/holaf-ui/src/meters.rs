@@ -23,17 +23,26 @@
 //! which **saturates at an RMS of 0.2 — i.e. −14 dBFS**.  Every ordinary music or
 //! voice signal is above that, so both bars sat pinned at full height: “les
 //! vu-mètres sont toujours à fond, même quand le son est faible” (user report).
-//! The mapping is now a plain dBFS scale — [`LEVEL_FLOOR_DB`] (−60 dBFS) → 0,
-//! 0 dBFS → 1 — so the bar follows the level over the whole usable range:
+//!
+//! The mapping is a plain dBFS scale over [`LEVEL_FLOOR_DB`] (−60 dBFS) → 0 to
+//! [`LEVEL_CEILING_DB`] (**+6** dBFS, the overload headroom) → 1.  Mapping
+//! **0 dBFS to 0.91 instead of 1.0** is what keeps a normal mix off the top of
+//! the bar: the last few pixels are reserved for material that really is over
+//! full scale, which is the only thing a meter can say about a signal that is
+//! already clipped (measured on the headless sandbox, see the table below —
+//! ordinary −12 dBFS music lands at 0.73, not 0.81 as with a 0…−60 scale):
 //!
 //! | RMS | dBFS | level |
 //! |---|---|---|
-//! | 1.0 (square) | 0 | 1.00 |
-//! | 0.354 (a −6 dBFS sine) | −9 | 0.85 |
-//! | 0.2 (the old saturation point) | −14 | 0.77 |
-//! | 0.1 | −20 | 0.67 |
-//! | 0.0316 | −30 | 0.50 |
-//! | 0.00316 | −50 | 0.17 |
+//! | 2.0 | +6 (overload) | 1.00 |
+//! | 1.0 (square / full-scale) | 0 | 0.91 |
+//! | 0.5 | −6 | 0.82 |
+//! | 0.354 (a −6 dBFS sine) | −9 | 0.77 |
+//! | 0.251 (−12 dBFS music, RMS) | −12 | 0.73 |
+//! | 0.2 (the old saturation point) | −14 | 0.70 |
+//! | 0.1 | −20 | 0.61 |
+//! | 0.0316 | −30 | 0.45 |
+//! | 0.00316 | −50 | 0.15 |
 //! | 0 | −∞ | 0.00 |
 //!
 //! The **capture is post-fader**, and that was measured rather than assumed: the
@@ -74,8 +83,29 @@ pub const BLOCK_FRAMES: usize = 480;
 /// instead of pinning it.
 pub const LEVEL_FLOOR_DB: f32 = -60.0;
 
-/// Top of the level scale (0 dBFS = 1.0 on the bar).
-pub const LEVEL_CEILING_DB: f32 = 0.0;
+/// Top of the level scale: this many dB **above full scale** map to 1.0.
+///
+/// Not 0 dBFS on purpose.  A digital meter whose top is 0 dBFS spends its last
+/// pixels on material that is already at (or over) the ceiling — and a mix bus
+/// fed by several strips is routinely over it — so ordinary music (“loud”, i.e.
+/// −12…−9 dBFS RMS) sat at 80-85 % and read as *pinned*: the user report
+/// “toujours à fond, avec une baisse de 10 % de temps en temps”.  Reserving
+/// [`OVERLOAD_HEADROOM_DB`] decibels above 0 dBFS for the top of the bar moves
+/// music down to ~0.73 and makes a bar at 1.0 mean what it should: *this signal
+/// is 6 dB over full scale*.
+pub const LEVEL_CEILING_DB: f32 = OVERLOAD_HEADROOM_DB;
+
+/// Decibels of headroom drawn **above** 0 dBFS (the overload zone).
+pub const OVERLOAD_HEADROOM_DB: f32 = 6.0;
+
+/// Peak above which a block cannot be real audio and must be a **misread
+/// stream** (a different sample format handed to the f32 reader).
+///
+/// +40 dBFS is 100× full scale: no audio path and no bus sum reaches it, but
+/// s32/NaN garbage reinterpreted as f32 does.  Such a block is never drawn (see
+/// [`MeterSample::is_implausible`]) — publishing it would pin the bar at 1.0 for
+/// ever, which is exactly the “VU à fond” failure.
+pub const IMPLAUSIBLE_PEAK: f32 = 100.0;
 
 /// Channels every capture stream is opened with (`pw-cat --channels 2`).
 pub const METER_CHANNELS: usize = 2;
@@ -120,6 +150,21 @@ impl MeterSample {
         ]
     }
 
+    /// Is this block **impossible** as audio, i.e. certainly a stream read with
+    /// the wrong sample format?
+    ///
+    /// The capture asks `pw-cat` for `f32le`; if a build/version ever writes
+    /// another format to stdout, the reader reinterprets the bytes as f32 and the
+    /// “samples” become garbage — mostly huge values (or NaNs, which
+    /// [`analyse_block`] drops).  Drawing that is what pins a VU bar at 1.0 for
+    /// ever.  Such a block is dropped instead (the bar stays dark) and reported
+    /// once, so the failure is *visible* rather than plausible.
+    pub fn is_implausible(&self) -> bool {
+        self.peak
+            .iter()
+            .any(|peak| !peak.is_finite() || *peak > IMPLAUSIBLE_PEAK)
+    }
+
     /// The `[level, level]` an amplitude (RMS or peak) maps to.
     pub fn is_silent(&self) -> bool {
         self.peak == [0.0, 0.0]
@@ -128,10 +173,11 @@ impl MeterSample {
 
 /// Amplitude (0.0–1.0 linear, RMS or peak) → bar height (0.0–1.0).
 ///
-/// Linear in **decibels** between [`LEVEL_FLOOR_DB`] and [`LEVEL_CEILING_DB`],
-/// which is what a meter is for: a 6 dB drop moves the bar by a fixed amount
-/// wherever it happens, and the top of the scale is reserved for material that
-/// really is near full scale instead of being reached at −14 dBFS.
+/// Linear in **decibels** between [`LEVEL_FLOOR_DB`] (−60 dBFS) and
+/// [`LEVEL_CEILING_DB`] (+6 dBFS), which is what a meter is for: a 6 dB drop
+/// moves the bar by a fixed amount wherever it happens, quiet material still
+/// moves it at all, and the top is reached only by a signal that is really over
+/// full scale.
 pub fn level_from_amplitude(amplitude: f32) -> f32 {
     let db = amplitude_to_db(amplitude);
     if !db.is_finite() {
@@ -383,28 +429,33 @@ mod tests {
         assert!((sample.rms[1] - expected).abs() < 1e-3);
         // A −3 dBFS sine sits just under the top instead of pinning the bar.
         assert!(
-            (sample.level()[0] - 0.95).abs() < 0.01,
+            (sample.level()[0] - 0.87).abs() < 0.01,
             "{:?}",
             sample.level()
         );
-        // Its *peak* is full scale, so that bar does reach 1.0.
+        // Its *peak* is full scale (0 dBFS), so even that bar is not full: the
+        // last 6 dB of the scale are the overload headroom.
         assert!((sample.peak[0] - 1.0).abs() < 1e-3);
-        assert!((sample.peak_level()[0] - 1.0).abs() < 1e-3);
+        assert!((sample.peak_level()[0] - 0.91).abs() < 0.01);
     }
 
     /// The old rule (`min(1, rms × 5)`) saturated at RMS 0.2 = −14 dBFS: every
     /// ordinary mix pinned both bars — “les vu-mètres sont toujours à fond, même
-    /// quand le son est faible”.  The dB scale must keep the whole range usable.
+    /// quand le son est faible”.  The dB scale must keep the whole range usable,
+    /// and its **top must be out of reach for normal material**: 0 dBFS maps to
+    /// 0.91, so 1.0 means “over full scale”.
     #[test]
     fn the_level_scale_is_in_decibels_and_does_not_saturate_at_minus_14() {
         let cases = [
-            (1.0_f32, 1.0_f32),
-            (0.5, 0.90),     // −6 dBFS
-            (0.354, 0.85),   // −9 dBFS (a −6 dBFS sine)
-            (0.2, 0.77),     // −14 dBFS — the old saturation point
-            (0.1, 0.67),     // −20 dBFS
-            (0.0316, 0.50),  // −30 dBFS
-            (0.00316, 0.166),// −50 dBFS
+            (2.0_f32, 1.0_f32), // +6 dBFS: the overload zone
+            (1.0, 0.91),        // 0 dBFS — full scale is NOT the top of the bar
+            (0.5, 0.82),        // −6 dBFS
+            (0.354, 0.77),      // −9 dBFS (a −6 dBFS sine)
+            (0.251, 0.73),      // −12 dBFS: ordinary music, RMS
+            (0.2, 0.70),        // −14 dBFS — the old saturation point
+            (0.1, 0.61),        // −20 dBFS
+            (0.0316, 0.45),     // −30 dBFS
+            (0.00316, 0.15),    // −50 dBFS
         ];
         for (amplitude, expected) in cases {
             let level = level_from_amplitude(amplitude);
@@ -412,7 +463,12 @@ mod tests {
                 (level - expected).abs() < 0.01,
                 "{amplitude} → {level}, expected {expected}"
             );
-            assert!(level < 1.0 || amplitude >= 1.0, "{amplitude} must not pin");
+            // Nothing below full scale may reach the top of the bar.
+            assert!(level < 1.0 || amplitude >= 2.0, "{amplitude} must not pin");
+            // …and ordinary music (≥ −12 dBFS) must keep a visible margin.
+            if (0.2..=1.0).contains(&amplitude) {
+                assert!(level <= 0.91, "{amplitude} → {level} is too close to full");
+            }
         }
         // Monotonic, so a louder signal never draws a shorter bar.
         let mut previous = -1.0_f32;
@@ -435,15 +491,15 @@ mod tests {
     /// that stayed at the top whatever the level.
     #[test]
     fn a_quiet_sine_is_not_pinned() {
-        // 0.02 amplitude → RMS ≈ 0.0141 → −37 dBFS → level ≈ 0.38.
+        // 0.02 amplitude → RMS ≈ 0.0141 → −37 dBFS → level ≈ 0.35.
         let block = sine(METER_RATE as usize / 10, 0.02, 1000.0);
         let sample = analyse_block(&block, 2);
         let level = sample.level()[0];
-        assert!((0.3..0.45).contains(&level), "{level}");
+        assert!((0.25..0.42).contains(&level), "{level}");
         // Ten times quieter is ten times lower on the scale (÷20 dB → −1/3).
         let quieter = analyse_block(&sine(METER_RATE as usize / 10, 0.002, 1000.0), 2);
         assert!(
-            quieter.level()[0] < level - 0.3,
+            quieter.level()[0] < level - 0.25,
             "{:?} vs {level}",
             quieter.level()
         );
@@ -481,15 +537,108 @@ mod tests {
 
     #[test]
     fn saturation_is_clamped_not_wrapped() {
-        // Clipped material: peaks at ±1.0, RMS 1.0 → level exactly 1.0.
+        // Clipped material: peaks at ±1.0 and beyond.  The *peak* bar is deep in
+        // the overload zone (1.0) and the RMS bar is high, never NaN.
         let block = vec![1.0_f32, 1.0, -1.0, -1.0, 3.5, -9.0];
         let sample = analyse_block(&block, 2);
-        assert_eq!(sample.level(), [1.0, 1.0]);
         assert_eq!(sample.peak_level(), [1.0, 1.0]);
+        // A full-scale square wave (RMS exactly 1.0 = 0 dBFS) is high but not
+        // glued to the top: that is the overload headroom doing its job.
+        let square = analyse_block(&[1.0_f32, 1.0, -1.0, -1.0], 2);
+        assert!(
+            (square.level()[0] - 0.91).abs() < 0.01,
+            "{:?}",
+            square.level()
+        );
         // Non-finite samples are dropped (a NaN must never poison the meter).
         let nan = analyse_block(&[f32::NAN, f32::INFINITY, 0.5, 0.5], 2);
         assert!(nan.level()[0].is_finite() && nan.level()[1].is_finite());
         assert!((nan.peak[0] - 0.5).abs() < 1e-6);
+        // …and a block that is nothing but garbage is not "silence": it is
+        // flagged as impossible, so the capture path can refuse to draw it.
+        let garbage = analyse_block(&[f32::NAN, f32::NAN, f32::NAN, f32::NAN], 2);
+        assert!(garbage.is_silent());
+        assert!(!garbage.is_implausible(), "all-NaN is silence, not garbage");
+    }
+
+    /// **H1, the format trap.**  The capture asks `pw-cat` for `f32le`; if a
+    /// build, version or wrapper ever writes another sample format to stdout, the
+    /// reader reinterprets the bytes as f32.  Such a block must never be turned
+    /// into a bar: garbage read as f32 is mostly huge (or NaN), and drawing it
+    /// pins the VU at 1.0 for ever — “toujours à fond, avec une baisse de 10 % de
+    /// temps en temps”.
+    ///
+    /// The numbers here are the *real* bytes of a −20 dBFS sine, read both ways.
+    #[test]
+    fn a_stream_read_with_the_wrong_sample_format_is_never_drawn() {
+        // The exact bytes `pw-cat --record --format f32` writes for a −20 dBFS
+        // 1 kHz sine at 48 kHz (measured on the headless sandbox):
+        // `00 60 b1 bd 00 60 b1 bd 00 30 bd bd …` → −0.08661 every frame.
+        let f32_block = sine(480, 0.1, 1000.0);
+        let real = analyse_block(&f32_block, METER_CHANNELS);
+        assert!((real.rms[0] - 0.0707).abs() < 1e-3, "{:?}", real);
+        assert!(!real.is_implausible(), "the real block is plausible audio");
+        assert!(
+            (real.level()[0] - 0.56).abs() < 0.02,
+            "a −20 dBFS sine (RMS −23 dBFS) → 0.56, got {:?}",
+            real.level()
+        );
+
+        // The same *sine* encoded as **s16le and read as f32**: every four bytes
+        // are two s16 samples, so the f32's exponent comes from a sine sample's
+        // high byte.  Half the frames become denormals and half become enormous
+        // numbers — the RMS ends far above full scale, which is exactly the
+        // garbage that pins a bar at 1.0.
+        let mut s16_bytes = Vec::with_capacity(f32_block.len() * 2);
+        for sample in &f32_block {
+            s16_bytes.extend_from_slice(&((*sample * 32767.0) as i16).to_le_bytes());
+        }
+        let s16_as_f32: Vec<f32> = s16_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        let misread = analyse_block(&s16_as_f32, METER_CHANNELS);
+        assert!(
+            misread.is_implausible(),
+            "s16 read as f32 must be flagged (rms {:?}, peak {:?})",
+            misread.rms,
+            misread.peak
+        );
+        // Undetected, it would have been a bar glued at the top: the symptom.
+        assert_eq!(misread.level(), [1.0, 1.0]);
+
+        // The other direction — a nearly silent s16 stream — becomes denormals:
+        // a **dark** bar, i.e. the meter must not lie in that direction either.
+        let quiet_s16: Vec<u8> = (0..960)
+            .flat_map(|i| (((i as f32 * 0.01).sin() * 3.0) as i16).to_le_bytes())
+            .collect();
+        let quiet_as_f32: Vec<f32> = quiet_s16
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        let dark = analyse_block(&quiet_as_f32, METER_CHANNELS);
+        assert!(!dark.is_implausible(), "denormals are not garbage");
+        assert!(dark.level()[0] < 0.1, "{:?}", dark.level());
+    }
+
+    /// The scale must leave **headroom above full scale** so that a bus fed by
+    /// several strips (their sum is routinely over 0 dBFS) is not glued to the
+    /// top: 0 dBFS → 0.91, +6 dBFS → 1.0.
+    #[test]
+    fn full_scale_is_not_the_top_of_the_bar() {
+        assert!((level_from_amplitude(1.0) - 0.91).abs() < 0.01);
+        assert_eq!(level_from_amplitude(2.0), 1.0);
+        assert!(
+            level_from_amplitude(1.4) < 1.0,
+            "+3 dBFS is not overload yet"
+        );
+        // A summed bus (−3 dBFS RMS) is high but visibly short of the top.
+        let summed = level_from_amplitude(std::f32::consts::FRAC_1_SQRT_2);
+        assert!((summed - 0.87).abs() < 0.01, "{summed}");
     }
 
     #[test]

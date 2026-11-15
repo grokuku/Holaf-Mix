@@ -19,7 +19,7 @@
 //! The geometry itself (widths, row heights, the resize decision) lives in
 //! [`crate::layout`]; this module only paints.
 
-use egui::{Rect, Sense, Ui, UiBuilder, Vec2};
+use egui::{Rect, Ui, UiBuilder, Vec2};
 
 use holaf_core::model::StripType;
 
@@ -45,29 +45,14 @@ pub fn render(state: &mut AppState, ui: &mut Ui) {
     let screen = ui.ctx().content_rect();
     let mut actions: Vec<UiAction> = Vec::new();
 
-    // Right click anywhere that is not a control: the window context menu
-    // ("Restart audio engine" / "Debug window" / "Open project page").
-    //
-    // egui gives a click to the **last** widget registered under the pointer, so
-    // this interaction is registered before every strip and header: a strip's
-    // own widgets keep their clicks and everything else (background, VU meters,
-    // the empty space of a column) falls through to the application menu — the
-    // Qt rule (`contextMenuEvent` + the `DefaultContextMenu` event filter).
-    let background = ui.interact(
-        screen,
-        ui.scope_id().with("holaf-window-background"),
-        Sense::click(),
-    );
-    if background.secondary_clicked() {
-        let pos = ui
-            .ctx()
-            .input(|input| input.pointer.interact_pos())
-            .unwrap_or(screen.center());
-        actions.push(UiAction::OpenContextMenu {
-            kind: crate::menus::ContextMenuKind::Window,
-            pos,
-        });
-    }
+    // **No right-click menu on the window any more** (user request, 2026-11-15:
+    // “je ne veux plus d'action au click droit sur la fenêtre, je veux que le
+    // contenu du menu soit déplacé au click sur le tray icon”).  The entries it
+    // carried — `MIDI port...`, `Restart audio engine`, `Debug window`, `Open
+    // project page` — now live in the tray menu (`crate::tray::menu_layout`), so
+    // the background owns no interaction at all and a right click there does
+    // nothing.  The strip / FX / MIDI menus stay: they are about one strip and
+    // can only be reached from that strip.
 
     // The drawing scope borrows `state.theme` (immutably) and `state.strips`
     // (immutably) while pushing into `state.image_cache` (mutably) — disjoint
@@ -352,12 +337,13 @@ mod tests {
         );
     }
 
-    /// A right click on the window background (here: the 10 px gap between two
-    /// strips) must open the application menu — the Qt `contextMenuEvent` rule.
-    /// The strips' own controls keep their clicks, which is why the background
-    /// interaction is registered *before* them.
+    /// **A right click on the window background opens nothing.**  The window
+    /// context menu was removed on the user's request (“je ne veux plus d'action
+    /// au click droit sur la fenêtre”); its entries live in the tray menu now
+    /// (`crate::tray::menu_layout`).  The test drives the same gesture that used
+    /// to open it, on the same spot between two strips.
     #[test]
-    fn a_right_click_on_the_background_opens_the_window_menu() {
+    fn a_right_click_on_the_background_opens_no_menu() {
         let ctx = crate::test_support::headless_context();
         let mut state = AppState::demo();
         // The demo has 4 inputs (column ends at x≈455 with an 800 px window) and
@@ -400,10 +386,13 @@ mod tests {
                 modifiers: egui::Modifiers::default(),
             }],
         );
-        match &state.context_menu {
-            Some(menu) => assert_eq!(menu.kind, crate::menus::ContextMenuKind::Window),
-            None => panic!("a right click on the background opened no menu"),
-        }
+        assert_eq!(
+            state.context_menu, None,
+            "the window background must not open a menu any more"
+        );
+        // A click on the empty window background does not even steal the click
+        // from the strips: nothing was acted upon either.
+        assert!(state.take_actions().is_empty(), "a background click acted");
     }
 
     #[test]

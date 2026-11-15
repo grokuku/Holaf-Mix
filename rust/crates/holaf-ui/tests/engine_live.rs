@@ -753,8 +753,10 @@ fn the_vu_bar_is_post_fader_and_not_pinned_by_a_normal_level() {
         node_names()
     );
 
-    // A −6 dBFS sine: RMS ≈ 0.354 → −9 dBFS, i.e. exactly the level the old
-    // scale turned into a pinned bar.
+    // A −6 dBFS sine: RMS ≈ 0.354 → −9 dBFS.  On the dBFS scale (−60 dBFS → 0,
+    // +6 dBFS → 1) that is level ≈ 0.77 — measured 0.727 for a −12 dBFS RMS
+    // music-like signal and 0.782 for −9 dBFS RMS, so ordinary material keeps a
+    // visible margin under the top of the bar.
     let wav = dir.join("vu-sine.wav");
     write_sine_wav(&wav, 20.0, 0.5);
     let mut playback = Command::new("pw-cat")
@@ -781,8 +783,9 @@ fn the_vu_bar_is_post_fader_and_not_pinned_by_a_normal_level() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        (0.5..0.95).contains(&loud),
-        "a −9 dBFS tone must be a *high* bar, not a pinned one (level {loud})"
+        (0.6..0.85).contains(&loud),
+        "a −9 dBFS tone must be a *high* bar but not a pinned one (level {loud}, \
+         expected ≈ 0.77: −60 dBFS → 0, +6 dBFS → 1)"
     );
 
     // Fader down to 0.3 → `pulse_linear_gain(0.3)` = 0.027 → −31 dB on the

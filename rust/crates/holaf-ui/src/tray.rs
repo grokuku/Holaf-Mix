@@ -56,37 +56,65 @@
 //! probe (an error that says nothing about the host) still builds the icon:
 //! only a definite "no host" is treated as no host.
 
-/// The tray menu entries, in the Qt order.
+/// The tray menu entries.
+///
+/// The window's right-click menu is **gone** (user request, 2026-11-15: “je ne
+/// veux plus d'action au click droit sur la fenêtre, je veux que le contenu du
+/// menu soit déplacé au click sur le tray icon”), so every entry it carried now
+/// lives here: the MIDI port picker, `Restart audio engine`, `Debug window` and
+/// `Open project page`.  The per-strip menus (`Rename`/`Delete`, FX settings,
+/// MIDI learn) stay contextual — they are about one strip, not the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEntry {
     /// `Show/Hide` — toggles the window (`_toggle_window`).
     ShowHide,
+    /// `MIDI port...` — the controller picker of the (removed) window menu.
+    MidiPort,
     /// `Restart audio engine` — the same action as the context menu.
     RestartEngine,
+    /// `Debug window` — the diagnostics dialog (`UiAction::OpenDiagnostics`).
+    OpenDiagnostics,
+    /// `Open project page` — the repository home page.
+    OpenProjectPage,
     /// `Quit` — `_force_quit`: stop the engine, then leave.
     Quit,
 }
 
 impl TrayEntry {
-    /// The label the tray shows (Python `QAction` texts).
+    /// The label the tray shows (the very strings the menus use, so the two can
+    /// never drift).
     pub fn label(self) -> &'static str {
         match self {
             TrayEntry::ShowHide => "Show/Hide",
-            TrayEntry::RestartEngine => "Restart audio engine",
+            TrayEntry::MidiPort => crate::menus::MENU_MIDI_PORT,
+            TrayEntry::RestartEngine => crate::menus::MENU_RESTART_ENGINE,
+            TrayEntry::OpenDiagnostics => crate::menus::MENU_DEBUG_WINDOW,
+            TrayEntry::OpenProjectPage => crate::menus::MENU_OPEN_PROJECT_PAGE,
             TrayEntry::Quit => "Quit",
         }
     }
 }
 
-/// The tray menu (`_init_tray_icon`): `Show/Hide`, `Quit` in Qt, plus the
-/// restart entry the context menu also offers (so the tray alone is enough to
-/// recover from a dead engine without restoring the window).
-pub fn entries() -> [TrayEntry; 3] {
-    [
-        TrayEntry::ShowHide,
-        TrayEntry::RestartEngine,
-        TrayEntry::Quit,
+/// The tray menu, `None` being a separator: the window toggle alone at the top
+/// (what a user reaches for on a hidden window), then the window menu's content,
+/// then `Quit` kept apart so it is never a mis-click away from `Restart`.
+pub fn menu_layout() -> Vec<Option<TrayEntry>> {
+    vec![
+        Some(TrayEntry::ShowHide),
+        None,
+        Some(TrayEntry::MidiPort),
+        Some(TrayEntry::RestartEngine),
+        Some(TrayEntry::OpenDiagnostics),
+        Some(TrayEntry::OpenProjectPage),
+        None,
+        Some(TrayEntry::Quit),
     ]
+}
+
+/// The entries of [`menu_layout`], separators dropped (the order the labels are
+/// asserted in).
+pub fn entries() -> Vec<TrayEntry> {
+    menu_layout().into_iter().flatten().collect()
 }
 
 /// What the window's close button must do.
@@ -138,6 +166,14 @@ pub enum TrayEvent {
     ToggleWindow,
     /// Restart the audio engine (`AppState::restart_engine`).
     RestartEngine,
+    /// Open the diagnostics window (`UiAction::OpenDiagnostics`); the window is
+    /// shown first, otherwise the dialog would open behind a hidden window.
+    OpenDiagnostics,
+    /// Open the project page (`UiAction::OpenProjectPage`).
+    OpenProjectPage,
+    /// Open the MIDI port picker (`UiAction::OpenMidiPortPicker`) — shown first,
+    /// like the diagnostics dialog (it is a dialog of the window).
+    MidiPortPicker,
     /// Stop the engine and leave (`AppState::shutdown` + close the viewport).
     Quit,
 }
@@ -148,7 +184,10 @@ impl TrayEntry {
     pub fn id(self) -> &'static str {
         match self {
             TrayEntry::ShowHide => "holaf.tray.show_hide",
+            TrayEntry::MidiPort => "holaf.tray.midi_port",
             TrayEntry::RestartEngine => "holaf.tray.restart_engine",
+            TrayEntry::OpenDiagnostics => "holaf.tray.diagnostics",
+            TrayEntry::OpenProjectPage => "holaf.tray.project_page",
             TrayEntry::Quit => "holaf.tray.quit",
         }
     }
@@ -157,7 +196,10 @@ impl TrayEntry {
     pub fn event(self) -> TrayEvent {
         match self {
             TrayEntry::ShowHide => TrayEvent::ToggleWindow,
+            TrayEntry::MidiPort => TrayEvent::MidiPortPicker,
             TrayEntry::RestartEngine => TrayEvent::RestartEngine,
+            TrayEntry::OpenDiagnostics => TrayEvent::OpenDiagnostics,
+            TrayEntry::OpenProjectPage => TrayEvent::OpenProjectPage,
             TrayEntry::Quit => TrayEvent::Quit,
         }
     }
@@ -551,7 +593,7 @@ pub mod backend {
         gtk::main();
     }
 
-    /// Create the tray icon with the Qt menu (Show/Hide, Restart, Quit).
+    /// Create the tray icon with its menu ([`super::menu_layout`]).
     fn build_tray() -> Result<tray_icon::TrayIcon, String> {
         use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
         use tray_icon::TrayIconBuilder;
@@ -560,14 +602,14 @@ pub mod backend {
 
         let menu = Menu::new();
         let mut items: Vec<Box<dyn tray_icon::menu::IsMenuItem>> = Vec::new();
-        for entry in entries() {
-            // A separator above Quit keeps "quit" visually apart from the
-            // toggles, like the Qt menu.
-            if entry == super::TrayEntry::Quit {
-                items.push(Box::new(PredefinedMenuItem::separator()));
+        for entry in super::menu_layout() {
+            match entry {
+                Some(entry) => {
+                    let item = MenuItem::with_id(entry.id(), entry.label(), true, None);
+                    items.push(Box::new(item));
+                }
+                None => items.push(Box::new(PredefinedMenuItem::separator())),
             }
-            let item = MenuItem::with_id(entry.id(), entry.label(), true, None);
-            items.push(Box::new(item));
         }
         let refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
             items.iter().map(|item| item.as_ref()).collect();
@@ -601,12 +643,40 @@ pub mod backend {
 mod tests {
     use super::*;
 
+    /// The tray now carries **everything** the window's right-click menu used to
+    /// carry (that menu is gone — user request).  The order is: the window
+    /// toggle alone, then the window menu's content, then `Quit` apart.
     #[test]
-    fn the_tray_menu_matches_the_qt_one() {
+    fn the_tray_menu_carries_the_whole_window_menu() {
         assert_eq!(
-            entries().map(TrayEntry::label),
-            ["Show/Hide", "Restart audio engine", "Quit"]
+            entries()
+                .iter()
+                .map(|entry| entry.label())
+                .collect::<Vec<_>>(),
+            [
+                "Show/Hide",
+                "MIDI port...",
+                "Restart audio engine",
+                "Debug window",
+                "Open project page",
+                "Quit",
+            ]
         );
+        // The separators are at both ends of the block that moved here: one
+        // under `Show/Hide`, one above `Quit`.
+        let layout = menu_layout();
+        assert_eq!(layout[1], None);
+        assert_eq!(layout[layout.len() - 2], None);
+        // Nothing from the window menu was lost in the move.
+        for label in crate::menus::labels(&crate::menus::ContextMenuKind::Window)
+            .into_iter()
+            .filter(|label| *label != "---")
+        {
+            assert!(
+                entries().iter().any(|entry| entry.label() == label),
+                "{label} is in no menu at all"
+            );
+        }
     }
 
     #[test]
@@ -646,9 +716,27 @@ mod tests {
             assert_eq!(entry_for_id(entry.id()), Some(entry));
             assert_eq!(menu_action(entry.id()), Some(entry.event()));
         }
-        assert_eq!(menu_action(entries()[0].id()), Some(TrayEvent::ToggleWindow));
-        assert_eq!(menu_action(entries()[1].id()), Some(TrayEvent::RestartEngine));
-        assert_eq!(menu_action(entries()[2].id()), Some(TrayEvent::Quit));
+        assert_eq!(
+            menu_action(entries()[0].id()),
+            Some(TrayEvent::ToggleWindow)
+        );
+        assert_eq!(
+            menu_action(entries()[1].id()),
+            Some(TrayEvent::MidiPortPicker)
+        );
+        assert_eq!(
+            menu_action(entries()[2].id()),
+            Some(TrayEvent::RestartEngine)
+        );
+        assert_eq!(
+            menu_action(entries()[3].id()),
+            Some(TrayEvent::OpenDiagnostics)
+        );
+        assert_eq!(
+            menu_action(entries()[4].id()),
+            Some(TrayEvent::OpenProjectPage)
+        );
+        assert_eq!(menu_action(entries()[5].id()), Some(TrayEvent::Quit));
     }
 
     #[test]

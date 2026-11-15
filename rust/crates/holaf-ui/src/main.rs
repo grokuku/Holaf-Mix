@@ -207,7 +207,7 @@ impl HolafApp {
             holaf_ui::tray::CloseAction::Hide => {
                 log::info!("ui: close requested - hiding to the tray");
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                send_visible(ctx, false);
                 self.window_visible = false;
             }
             holaf_ui::tray::CloseAction::Quit => {
@@ -238,11 +238,31 @@ impl HolafApp {
                         "tray: {}",
                         if self.window_visible { "show window" } else { "hide window" }
                     );
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
+                    send_visible(ctx, self.window_visible);
                 }
                 holaf_ui::tray::TrayEvent::RestartEngine => {
                     log::info!("tray: restart audio engine");
                     self.state.restart_engine(std::time::Instant::now());
+                }
+                // The three entries below opened the window's right-click menu
+                // until it was removed (user request): they are application
+                // *actions*, so they reach the very same `UiAction`s and their
+                // dialogs.  The window is un-hidden first — a dialog opening
+                // behind a hidden window would look like nothing happened.
+                holaf_ui::tray::TrayEvent::OpenDiagnostics => {
+                    log::info!("tray: debug window");
+                    self.show_window(ctx);
+                    self.state.apply(holaf_ui::app::UiAction::OpenDiagnostics);
+                }
+                holaf_ui::tray::TrayEvent::OpenProjectPage => {
+                    log::info!("tray: open project page");
+                    self.state.apply(holaf_ui::app::UiAction::OpenProjectPage);
+                }
+                holaf_ui::tray::TrayEvent::MidiPortPicker => {
+                    log::info!("tray: MIDI port picker");
+                    self.show_window(ctx);
+                    self.state
+                        .apply(holaf_ui::app::UiAction::OpenMidiPortPicker);
                 }
                 holaf_ui::tray::TrayEvent::Quit => {
                     log::info!("tray: quit");
@@ -257,6 +277,17 @@ impl HolafApp {
                 }
             }
         }
+    }
+
+    /// Bring the window back before an action that needs it (a dialog, a
+    /// picker).  No-op when it is already up.
+    fn show_window(&mut self, ctx: &egui::Context) {
+        if self.window_visible {
+            return;
+        }
+        self.window_visible = true;
+        send_visible(ctx, true);
+        ctx.request_repaint();
     }
 
     /// Move messages between the controller and the model (`--features midi`).
@@ -298,6 +329,23 @@ impl HolafApp {
                 );
             }
         }
+    }
+}
+
+/// Show or hide the window, on every backend.
+///
+/// `ViewportCommand::Visible(false)` alone is **not** enough on Wayland: a client
+/// cannot unmap its own toplevel there (winit has no protocol for it), so the
+/// command is a silent no-op.  A close request that was cancelled in order to
+/// "hide to the tray" then leaves the window exactly where it was — the user
+/// report “la croix ne ferme plus la fenêtre”.  `Minimized` **is** supported by
+/// both backends, so the window really leaves the screen; restoring sends the
+/// mirror pair and focuses the window.
+fn send_visible(ctx: &egui::Context, visible: bool) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(!visible));
+    if visible {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 }
 
@@ -653,12 +701,16 @@ fn main() -> ExitCode {
             "unavailable"
         }
     );
-    // The invariant `close_action` encodes: hide only when a tray exists.  A
-    // build/time without a tray must quit, never hide an unreachable window.
-    if holaf_ui::tray::available() {
-        log::info!("ui: closing the window hides it (the tray keeps the app alive)");
-    } else {
+    // The invariant `close_action` encodes: hide only when a tray exists **and**
+    // the user asked for it (`ui_rust.tray_hide_on_close`, default off since the
+    // close button must close).  A build/time without a tray must quit, never
+    // hide an unreachable window.
+    if !holaf_ui::tray::available() {
         log::info!("ui: closing the window quits (no tray icon compiled/available)");
+    } else if state.tray_hide_on_close {
+        log::info!("ui: closing the window hides it (ui_rust.tray_hide_on_close is on)");
+    } else {
+        log::info!("ui: closing the window quits (the tray icon keeps Show/Hide)");
     }
 
     let options = eframe::NativeOptions {

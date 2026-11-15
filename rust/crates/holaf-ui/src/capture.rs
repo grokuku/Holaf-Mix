@@ -321,6 +321,11 @@ fn spawn_stream(
         .name(format!("holaf-meter-{uid}"))
         .spawn(move || {
             let mut buffer = vec![0_u8; BLOCK_BYTES];
+            // One-shot reporters: a stream that is misread must say so once, and
+            // the first block's numbers are what a bug report needs (they are the
+            // only place where the *real* RMS of a strip is visible).
+            let mut announced = false;
+            let mut warned = false;
             loop {
                 match stdout.read_exact(&mut buffer) {
                     Ok(()) => {
@@ -330,9 +335,40 @@ fn spawn_stream(
                             .iter()
                             .map(|chunk| f32::from_le_bytes(*chunk))
                             .collect();
-                        // RMS × 5 clipped to 1.0 — the Qt rule; `analyse_block`
-                        // also yields the peak (used by tests/diagnostics).
-                        board.publish(slot, analyse_block(&samples, METER_CHANNELS).level());
+                        let sample = analyse_block(&samples, METER_CHANNELS);
+                        // A stream read with the wrong sample format yields huge
+                        // “samples”: drawing them pins the bar at 1.0 for ever
+                        // (the “VU toujours à fond” report).  Drop the block and
+                        // say it once — a dark bar plus a loud log line is the
+                        // honest picture.
+                        if sample.is_implausible() {
+                            if !warned {
+                                warned = true;
+                                log::warn!(
+                                    "metering: {label}: impossible block (peak {:?}, rms {:?}) — \
+                                     the recorder is not writing f32le to stdout. The VU stays \
+                                     dark instead of pinning at full scale.",
+                                    sample.peak,
+                                    sample.rms
+                                );
+                            }
+                            board.publish(slot, [0.0, 0.0]);
+                            continue;
+                        }
+                        if !announced {
+                            announced = true;
+                            log::info!(
+                                "metering: {label}: first block rms {:.4}/{:.4} peak {:.4}/{:.4} \
+                                 → level {:.2}/{:.2}",
+                                sample.rms[0],
+                                sample.rms[1],
+                                sample.peak[0],
+                                sample.peak[1],
+                                sample.level()[0],
+                                sample.level()[1]
+                            );
+                        }
+                        board.publish(slot, sample.level());
                     }
                     Err(err) => {
                         if err.kind() != std::io::ErrorKind::UnexpectedEof {
@@ -597,5 +633,125 @@ mod tests {
         wanted.insert("ghost".to_string(), "whatever.monitor".to_string());
         capture.sync(&wanted, &HashMap::new(), &board);
         assert!(capture.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // The reader, against a stand-in recorder (no PipeWire needed)
+    // -----------------------------------------------------------------
+
+    /// An executable script that replays `payload` on stdout for ever — a
+    /// `pw-cat --record` stand-in, so the *whole* reader path (child process →
+    /// `read_exact` → f32 decode → block maths → board) is exercised without an
+    /// audio server.
+    fn fake_recorder(payload: &[u8]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "holaf-capture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("block.bin");
+        std::fs::write(&data, payload).unwrap();
+        let script = dir.join("recorder.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nwhile :; do cat '{}'; done\n", data.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Read the board for up to 2 s, returning the last level seen.
+    fn wait_for_level(board: &MeterBoard, uid: &str) -> [f32; 2] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut last = [0.0, 0.0];
+        while std::time::Instant::now() < deadline {
+            last = board.read(uid).unwrap_or([0.0, 0.0]);
+            if last != [0.0, 0.0] {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        last
+    }
+
+    /// A real f32le block (what `pw-cat --format f32` writes) reaches the board as
+    /// the level the dBFS scale says — measured, not assumed: a −20 dBFS sine has
+    /// RMS 0.0707 → −23 dBFS → level ≈ 0.56.
+    #[test]
+    fn a_valid_f32_block_reaches_the_board_with_the_expected_level() {
+        let mut payload = Vec::with_capacity(BLOCK_BYTES);
+        for n in 0..BLOCK_FRAMES {
+            let sample = 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+            payload.extend_from_slice(&sample.to_le_bytes());
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        assert_eq!(payload.len(), BLOCK_BYTES);
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
+        let uid = "tone".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Tone.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        let level = wait_for_level(&board, &uid);
+        assert!(
+            (level[0] - 0.56).abs() < 0.02,
+            "a −20 dBFS sine must read 0.56 on the bar, got {level:?}"
+        );
+        capture.stop_all();
+    }
+
+    /// **The “VU à fond” regression.**  The reader assumes `f32le` because it asks
+    /// for `--format f32`; a stream handed over in another sample format decodes
+    /// to huge “samples”, and drawing them pins the bar at 1.0 for ever (the user
+    /// report: “toujours à fond, avec une baisse de 10 % de temps en temps”).
+    /// Such a block is dropped: the bar stays **dark** and the log says why,
+    /// which is a diagnosable failure instead of a plausible lie.
+    #[test]
+    fn a_stream_in_the_wrong_sample_format_never_pins_the_bar() {
+        // 0xCC0C34F3 little-endian = -1.6e31 as f32: what s16 audio looks like
+        // when it is read as f32.
+        let mut payload = Vec::with_capacity(BLOCK_BYTES);
+        for _ in 0..BLOCK_FRAMES * 2 {
+            payload.extend_from_slice(&[0xF3, 0x34, 0x0C, 0xCC]);
+        }
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
+        let uid = "misread".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Misread.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        // Give the reader plenty of blocks: it must publish zeros every time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                board.read(&uid),
+                Some([0.0, 0.0]),
+                "a misread stream must never publish a level"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        capture.stop_all();
+    }
+
+    /// Silence stays silence (a real zero-filled f32 stream, not a misread one).
+    #[test]
+    fn a_zero_filled_stream_is_dark() {
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&[0_u8; BLOCK_BYTES]));
+        let uid = "silent".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Silent.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(board.read(&uid), Some([0.0, 0.0]));
+        capture.stop_all();
     }
 }

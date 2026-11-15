@@ -342,10 +342,12 @@ Tests : `rust/crates/holaf-pw/tests/bus_naming.rs` (live) — noms dérivés du
 libellé + collisions, idempotence d'un apply répété, renommage (bus et chaîne FX),
 suppression d'un strip renommé, remplacement d'un nœud `Holaf_Strip_*`.
 
-## 2.5 Fenêtre de diagnostic (clic droit → « Debug window »)
+## 2.5 Fenêtre de diagnostic (menu du tray → « Debug window »)
 
-Un outil de debug, ouvert depuis le menu contextuel de l'application (clic droit
-n'importe où → **Debug window** ; il n'y a aucun bouton dédié) : il remplace la
+Un outil de debug, ouvert depuis le menu de l'icône de notification
+(**Debug window** ; il n'y a aucun bouton dédié).  En Python c'était le menu
+contextuel de la fenêtre (clic droit n'importe où) ; l'UI Rust a supprimé ce
+geste le 2026-11-15 et déplacé ses entrées dans le menu du tray.  Il remplace la
 collection manuelle de `pactl` / `pw-cli` / `pw-link` / `pw-top` /
 `holafctl status` par une fenêtre unique + un rapport texte copiable en un clic
 (voir la section « Dépannage » du README).  Le même menu porte *Restart audio

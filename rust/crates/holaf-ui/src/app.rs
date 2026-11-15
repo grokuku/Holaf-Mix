@@ -410,8 +410,16 @@ pub struct AppState {
     pub always_on_top: bool,
     /// `ui_rust.tray_hide_on_close` — the Qt `closeEvent` preference: **hide** the
     /// window instead of quitting, *when a tray icon is actually there* (see
-    /// [`crate::tray::close_action`]).  Defaults to `true` (Qt parity); ignored
-    /// when no tray is available, so it can never strand the app.
+    /// [`crate::tray::close_action`]).
+    ///
+    /// Defaults to **`false`** — the close button quits.  Qt defaulted to "hide",
+    /// but on Wayland a client cannot hide its own toplevel (`ViewportCommand::
+    /// Visible(false)` is a no-op there, winit has no protocol for it): the close
+    /// request was cancelled and the window stayed on screen, which is exactly
+    /// the user report “la croix ne ferme plus la fenêtre”.  Hiding is now opt-in
+    /// (`"ui_rust": {"tray_hide_on_close": true}`) and is carried out with
+    /// `Minimized` as well, so it works on Wayland too.  Ignored when no tray is
+    /// available, so it can never strand the app.
     pub tray_hide_on_close: bool,
     /// The open context menu, if any ([`crate::menus`]).
     pub context_menu: Option<crate::menus::ContextMenu>,
@@ -620,7 +628,7 @@ impl AppState {
             restarting: false,
             diagnostics: None,
             always_on_top: true,
-            tray_hide_on_close: true,
+            tray_hide_on_close: false,
             context_menu: None,
             applied_window_level: None,
             midi_bindings: HashMap::new(),
@@ -688,7 +696,7 @@ impl AppState {
                 state.midi_map = MidiMap::from_strips(&state.strips, &state.midi_bindings);
                 state.always_on_top = config.ui_rust_bool("always_on_top").unwrap_or(true);
                 state.tray_hide_on_close =
-                    config.ui_rust_bool("tray_hide_on_close").unwrap_or(true);
+                    config.ui_rust_bool("tray_hide_on_close").unwrap_or(false);
                 // The controller the user picked last time (`ui_rust.midi_port`).
                 // Python has no such key — it auto-opened the first port whose
                 // name contained "mix" at every start — so this is a Rust-only
@@ -2055,6 +2063,19 @@ impl AppState {
         let missing_devices = self.missing_device_list();
         let mut meter_missing: Vec<String> = self.meter_missing.iter().cloned().collect();
         meter_missing.sort();
+        // What the bars are drawing, strip by strip.  The user asked for this
+        // section (the Python report carried “L=0.030 R=0.029” per strip): without
+        // it, “les VU sont à fond” and “the levels never arrive” read the same.
+        let meter_levels: Vec<(String, String, [f32; 2])> = (0..self.strips.len())
+            .map(|index| {
+                let strip = &self.strips[index];
+                (
+                    strip.uid.clone(),
+                    strip.label.clone(),
+                    self.levels_for(index),
+                )
+            })
+            .collect();
         let sources: HashMap<String, String> = HashMap::new();
         let config_path = self
             .config
@@ -2069,6 +2090,7 @@ impl AppState {
             strips: &self.strips,
             missing_devices: &missing_devices,
             meter_missing: &meter_missing,
+            meter_levels: &meter_levels,
             config_path: config_path.as_deref(),
             now_unix: crate::diagnostics::now_unix(),
             daemon_pids: None,
@@ -2766,6 +2788,30 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    /// **The close button closes.**  Qt hid the window when a tray was there,
+    /// and that rule was kept as the default — but on Wayland a client cannot
+    /// hide its own toplevel (`ViewportCommand::Visible(false)` is a no-op), so
+    /// the close request was cancelled and the window stayed: “la croix ne ferme
+    /// plus la fenêtre”.  The default is now `false` (quit); hiding is opt-in via
+    /// `ui_rust.tray_hide_on_close`.
+    #[test]
+    fn the_close_button_quits_by_default_even_with_a_tray() {
+        let s = AppState::from_config(scratch_config("close"));
+        assert!(
+            !s.tray_hide_on_close,
+            "hide-on-close must be opt-in (a Wayland window cannot be hidden)"
+        );
+        // Whatever `tray::available()` says on this machine, closing quits.
+        assert_eq!(s.close_action(false), crate::tray::CloseAction::Quit);
+        // An explicit quit also quits.
+        assert_eq!(s.close_action(true), crate::tray::CloseAction::Quit);
+        // The opt-in path still works for whoever wants it (X11 sessions).
+        let mut opt_in = AppState::from_config(scratch_config("close-opt-in"));
+        opt_in.tray_hide_on_close = true;
+        let expected = crate::tray::close_action_with(false, crate::tray::available(), true);
+        assert_eq!(opt_in.close_action(false), expected);
     }
 
     #[test]

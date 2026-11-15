@@ -529,7 +529,10 @@ fn open_dialog(state: &mut AppState, kind: &str, tab: Option<&str>) -> Result<()
             });
         }
         "menu" => {
-            // The context menu floats over the window: render it open.
+            // The **application** menu, rendered open.  Since 2026-11-15 the
+            // window no longer opens it (its entries live in the tray menu);
+            // this still draws exactly the same list, which is what the labels
+            // are asserted against.
             state.apply(holaf_ui::app::UiAction::OpenContextMenu {
                 kind: holaf_ui::menus::ContextMenuKind::Window,
                 pos: egui::pos2(120.0, 120.0),

@@ -1,25 +1,30 @@
 //! Context menus — the Rust twin of `MainWindow.build_app_context_menu` and of
 //! the per-widget menus of the Qt build.
 //!
-//! The Qt UI had three kinds of menu, and they are reproduced with the same
-//! entries in the same order (the Python `*_MENU_*` constants and the tests in
-//! `tests/ui/test_context_menu.py` lock that order):
-//!
 //! | place | entries |
 //! |---|---|
-//! | the window (background, VU meters, empty areas) | `Restart audio engine`, `Debug window`, — , `Open project page` |
+//! | the **tray icon** (was: the window) | `MIDI port...`, — , `Restart audio engine`, `Debug window`, `Open project page`, — , `Quit` |
 //! | a strip (label click) | `Rename`, `Delete`, — , then the three application entries |
 //! | an FX button | `Effect settings`, — , then the three application entries |
 //!
-//! # Why the window menu is not a widget
+//! # The window's right-click menu is gone
+//!
+//! Qt opened the application menu on `contextMenuEvent` (a right click anywhere
+//! in the window).  Since 2026-11-15 that gesture does **nothing**: “je ne veux
+//! plus d'action au click droit sur la fenêtre, je veux que le contenu du menu
+//! soit déplacé au click sur le tray icon”.  The entries moved to
+//! [`crate::tray::menu_layout`] and [`ContextMenuKind::Window`] is kept as the
+//! single description of that menu (the tray builds its labels from it, and the
+//! headless snapshot can still render it), but no window widget opens it.
+//!
+//! # Why the strip / FX menus are still widgets
 //!
 //! egui's hit test gives a click to the **last** widget registered under the
-//! pointer, so `main_window::render` registers one "background" interaction for
-//! the whole window *before* anything else is drawn: a click on a strip button is
-//! taken by that button, and a click on a strip body, a VU meter or the empty
-//! space falls through to the window menu.  That is exactly the Qt rule
-//! (`contextMenuEvent` + an event filter for widgets whose policy is
-//! `Qt.DefaultContextMenu`), without an event filter per widget.
+//! pointer, so a menu opened by a widget button is unambiguous and it is the only
+//! way to reach a *per-strip* action (`Rename`, `Delete`, `Effect settings`,
+//! MIDI learn).  Each of them appends the application entries, exactly like the
+//! Qt `build_app_context_menu(menu)` did when a child widget passed its own
+//! `QMenu`.
 //!
 //! The menu itself is drawn by [`draw`] as a floating `egui::Area`; every entry
 //! is a plain button, so the drawing is deterministic and a headless test can
@@ -62,8 +67,10 @@ pub const MENU_MIDI_PORT: &str = "MIDI port...";
 /// Which menu is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
-    /// Right click on the window background (and on every widget without its
-    /// own menu).
+    /// The **application** menu (the one the tray now shows).  The window no
+    /// longer opens it — see the module docs; it is kept as the description of
+    /// the entries that moved to [`crate::tray::menu_layout`], and the headless
+    /// snapshot renders it.
     Window,
     /// Right click on a strip.
     Strip { uid: String, label: String },
@@ -350,9 +357,13 @@ pub fn draw(state: &mut AppState, ui: &mut Ui) {
 
     // Dismissal: a click anywhere else, or Escape (egui reports both).  The
     // frame that *opened* the menu is skipped: the opening click is outside it,
-    // so a rule without that guard would close the menu before it is painted.
+    // so a rule without that guard would close the menu before it is painted
+    // (the user report “le menu click droit … disparait instantanément”).  An
+    // unknown (`NaN`) or future timestamp counts as "just opened" for the same
+    // reason: when the clock is not sure, showing the menu one frame too long is
+    // harmless, closing it instantly is not.
     let now = ui.ctx().input(|input| input.time);
-    let just_opened = !menu.opened_at.is_nan() && (now - menu.opened_at).abs() < 1e-6;
+    let just_opened = menu.opened_at.is_nan() || menu.opened_at >= now;
     let pointer_click = ui.ctx().input(|input| input.pointer.any_click());
     let dismissed_by_key = ui.ctx().input(|input| input.key_pressed(egui::Key::Escape));
     let dismissed_by_click =
@@ -743,6 +754,61 @@ mod tests {
             &ContextMenuKind::Window,
         );
         assert!(state.diagnostics.is_some());
+    }
+
+    /// **A menu stays open until it is clicked away.**  The user report “le menu
+    /// click droit … disparait instantanément” is exactly the failure mode of the
+    /// dismissal rule: if the frame that opened the menu is not recognised, its
+    /// own opening click counts as an *outside* click and the menu is gone before
+    /// it is ever seen.  This drives the real render loop (press frame, release
+    /// frame that opens it, then idle frames) on a menu that still exists — the
+    /// strip's — and asserts it is still there.
+    #[test]
+    fn a_menu_survives_the_idle_frames_after_it_opened() {
+        let ctx = crate::test_support::headless_context();
+        let mut state = AppState::demo();
+        let run = |state: &mut AppState, time: f64, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| crate::render(state, ui));
+            output.textures_delta.clear();
+        };
+        // Open a strip menu exactly like the strip view does (the frame time it
+        // records is the one the dismissal rule compares against).
+        run(&mut state, 0.0, Vec::new());
+        state.apply(UiAction::OpenContextMenu {
+            kind: strip_menu(),
+            pos: egui::pos2(40.0, 40.0),
+        });
+        assert!(state.context_menu.is_some(), "the menu opened");
+        for step in 0..5 {
+            run(&mut state, 0.1 + step as f64 * 0.1, Vec::new());
+            assert!(
+                state.context_menu.is_some(),
+                "the menu vanished on idle frame {step}"
+            );
+        }
+        // Escape still closes it (the dismissal is not disabled, only the
+        // opening frame is exempted).
+        run(
+            &mut state,
+            1.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(state.context_menu.is_none(), "Escape must close the menu");
     }
 
     /// The menu paints headless (an `egui::Area` needs two passes to be laid

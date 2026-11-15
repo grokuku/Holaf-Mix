@@ -11,7 +11,8 @@
 //! 3. then it serves a minimal fake watcher (what KDE's plasmashell / waybar /
 //!    `gnome-shell-extension-appindicator` provide), calls
 //!    [`holaf_ui::tray::install`] again and asserts the item **registered** and
-//!    exposes the Qt menu (Show/Hide, Restart audio engine, Quit) through
+//!    exposes the application menu (Show/Hide, MIDI port..., Restart audio
+//!    engine, Debug window, Open project page, Quit) through
 //!    `com.canonical.dbusmenu`.
 //!
 //! It is skipped (not failed) where `dbus-daemon` is not installed.  Nothing
@@ -22,7 +23,6 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
 
 /// A private session bus, killed when the guard drops.
 struct SessionBus {
@@ -230,8 +230,10 @@ fn the_ksni_backend_registers_on_a_real_session_bus() {
     };
     assert!(!destination.is_empty(), "a registration must name the item");
 
-    // And the menu it published is the Qt one, in the Qt order.  The snapshot is
-    // published by a tray-icon watcher thread, so poll instead of racing it.
+    // And the menu it published is ours, in order: the window menu's content
+    // moved here (the window's right-click menu is gone), between the window
+    // toggle and Quit.  The snapshot is published by a tray-icon watcher thread,
+    // so poll instead of racing it.
     let mut attempts = 0;
     let labels = loop {
         let labels = menu_labels(&destination);
@@ -248,7 +250,14 @@ fn the_ksni_backend_registers_on_a_real_session_bus() {
         .collect();
     assert_eq!(
         visible,
-        ["Show/Hide", "Restart audio engine", "Quit"],
-        "the tray menu must match the Qt one (labels: {labels:?})"
+        [
+            "Show/Hide",
+            "MIDI port...",
+            "Restart audio engine",
+            "Debug window",
+            "Open project page",
+            "Quit",
+        ],
+        "the tray menu must carry the whole application menu (labels: {labels:?})"
     );
 }

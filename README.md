@@ -153,29 +153,38 @@ ci-dessus — voir `BUILD.md` §4.
     *   Select "Learn Volume/Mute/Mono".
     *   Move a fader or press a button on your controller.
     *   The mapping is saved automatically.
-5.  **Right click anywhere** for the application menu (*Restart audio engine*,
-    *Debug window*, *Open project page*) — see below.
+5.  **Click the tray icon** (or its left click) for the application menu
+    (*MIDI port…*, *Restart audio engine*, *Debug window*, *Open project page*,
+    *Quit*) — see below.  A right click in the window no longer opens anything.
 
-## Menu contextuel (clic droit)
+## Menu de l'application (icône de notification)
 
-Un **clic droit n'importe où** dans Holaf-Mix ouvre le menu de l'application
-(fond de fenêtre, strips, vumètres, en-têtes de section).  Il contient :
+Le menu de l'application vit dans l'**icône du tray** : clic (ou clic droit) sur
+l'icône ouvre le menu ; le clic droit **dans la fenêtre** ne fait plus rien
+(demandé par l'utilisateur le 2026-11-15).  Il contient :
 
 | Entrée | Effet |
 | --- | --- |
+| **Show/Hide** | Affiche ou cache la fenêtre (minimisée sur Wayland, où un client ne peut pas cacher sa fenêtre). |
+| **MIDI port…** | Choisit le contrôleur MIDI (ou « No controller »). |
 | **Restart audio engine** | Réinitialise complètement le moteur audio (arrêt du graphe puis reconstruction) **sans quitter l'application**. La barre de statut affiche « Audio engine restarting… » puis « Audio engine restarted » ; un second clic pendant l'opération est ignoré (un seul redémarrage à la fois). En cas d'échec, un message explicite s'affiche et l'app continue de tourner. |
 | **Debug window** | Ouvre la fenêtre de diagnostic (voir ci-dessous). Remplace l'ancien raccourci `Ctrl+Shift+D`, qui n'existe plus. |
 | **Open project page** | Ouvre <https://github.com/grokuku/Holaf-Mix> dans le navigateur par défaut. |
 
-Deux zones gardent en plus leur menu local, enrichi des entrées ci-dessus :
+Deux zones gardent en plus leur menu **local**, enrichi des entrées ci-dessus :
 le **nom d'un strip** (clic droit → *Rename…* puis le menu de l'application) et
-les boutons **FX** (clic droit → réglages de l'effet quand il en a).
+les boutons **FX** (clic droit → réglages de l'effet quand il en a).  Le bouton
+**MIDI** d'un strip ouvre, lui, son menu d'apprentissage (`Learn Volume` …).
 
-## Dépannage (`clic droit → Debug window`)
+La **croix de la fenêtre quitte** l'application.  Pour la cacher à la place
+(comportement Qt), mettez `"ui_rust": {"tray_hide_on_close": true}` dans
+`config.json` : la fenêtre est alors minimisée et le tray la ramène.
+
+## Dépannage (icône du tray → Debug window)
 
 Quand le son craque, qu'un strip ne route pas ou qu'une appli est muette,
-il n'y a pas de menu « aide » : lancez Holaf-Mix puis faites un **clic droit
-n'importe où → Debug window**.  Une fenêtre de diagnostic s'ouvre.
+il n'y a pas de menu « aide » : lancez Holaf-Mix puis cliquez l'**icône du
+tray → Debug window**.  Une fenêtre de diagnostic s'ouvre.
 
 Elle rassemble, en un seul endroit, ce qu'il fallait sinon demander en
 commandes shell (`pactl`, `pw-cli`, `pw-link`, `pw-top`, `holafctl status`) :
@@ -183,8 +192,9 @@ commandes shell (`pactl`, `pw-cli`, `pw-link`, `pw-top`, `holafctl status`) :
 | Onglet | Contenu |
 | --- | --- |
 | **Summary** | Les constats automatiques, colorés par sévérité (erreur / avertissement / info), avec l'action suggérée sous chacun |
-| **Engine** | État du moteur (`running`, `degraded`, `pending`, `fx_host`, strips avec leur bus et leurs effets actifs, routes) + métrage (niveaux, sources écoutées) |
-| **Graph** | Nœuds `Holaf_*` et devices physiques (id, classe, état, quantum, rate, ports) et liens qui touchent le mix |
+| **Engine** | État du moteur (`running`, `degraded`, `pending`, `fx_host`, strips avec leur bus et leurs effets actifs, routes) |
+| **Graph** | Nœuds `Holaf_*` et devices physiques (id, classe, état, quantum, rate, ports), liens qui touchent le mix, et **`L=`/`R=` de chaque vumètre** avec la source captée (ou « no capture source ») |
+| **Metering** (rapport texte) | La même chose dans le rapport copiable, plus l'échelle : `−60 dBFS → 0.00`, `0 dBFS → 0.91`, `+6 dBFS → 1.00` |
 | **System** | Versions (app, `holafd`, PipeWire, kernel), `config.json`, PID, CPU/mémoire, et **tous** les processus `holafd` vivants |
 | **Journal** | Les 200 dernières lignes de log de l'app (buffer mémoire) |
 
