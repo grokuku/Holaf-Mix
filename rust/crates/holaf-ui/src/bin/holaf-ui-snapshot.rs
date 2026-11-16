@@ -397,7 +397,7 @@ fn simulated_devices(count: usize) -> Vec<holaf_ui::engine_json::DeviceInfo> {
 /// healthy chain (so the section is also shown when nothing is wrong).
 fn simulated_captures(case: &str) -> Result<holaf_ui::diagnostics::CaptureSummary, String> {
     use holaf_ui::diagnostics::{
-        CaptureFacts, CaptureState, CaptureSummary, RejectReason, STDERR_TAIL,
+        CaptureFacts, CaptureState, CaptureSummary, STDERR_TAIL,
     };
     let facts = |uid: &str, source: &str, state: CaptureState, blocks: u64| CaptureFacts {
         uid: uid.to_string(),
@@ -421,6 +421,7 @@ fn simulated_captures(case: &str) -> Result<holaf_ui::diagnostics::CaptureSummar
         since_last_block: (blocks > 0).then(|| std::time::Duration::from_millis(20)),
         stderr_tail: Vec::new(),
         format_guess: None,
+        detected_format: None,
     };
     let mut summary = CaptureSummary {
         recorder: holaf_ui::diagnostics::default_recorder(),
@@ -451,21 +452,14 @@ fn simulated_captures(case: &str) -> Result<holaf_ui::diagnostics::CaptureSummar
             summary.sources = vec![mic, casque];
         }
         "misread" => {
-            // Blocks arrive but every one is refused (peak ≈ −1.6e31 as f32):
-            // the recorder writes s16le, not f32le.
-            let mut mic = facts(
-                "in-mic",
-                "Holaf_Bus_Mic.monitor",
-                CaptureState::Waiting,
-                0,
-            );
-            mic.rejected = 1240;
+            // The PipeWire 1.6 case, **with the fix**: the recorder writes s16le
+            // despite `--format f32`, the reader detected it and converts every
+            // block, so the VU works and the report names the format.
+            let mut mic = facts("in-mic", "Holaf_Bus_Mic.monitor", CaptureState::Streaming, 4210);
+            mic.detected_format = Some("s16le".to_string());
             mic.format_guess = Some("s16le (peak 0.750)".to_string());
             summary.sources = vec![mic];
-            summary.rejected = 1240;
-            summary
-                .rejects
-                .insert(RejectReason::Implausible.name().to_string(), 1240);
+            summary.blocks = 4210;
         }
         "live" => {
             // The nominal chain: blocks decoded, levels drawn, nothing wrong.

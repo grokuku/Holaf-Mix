@@ -173,7 +173,10 @@ fn the_python_config_is_loaded_with_its_mappings() {
 
 #[test]
 fn the_mapped_controls_move_the_right_strip() {
-    let state = AppState::from_config(repo_config());
+    // A **copy**: a MIDI message marks the config dirty, and the debounced save
+    // would otherwise rewrite the shipped `config.json` of the repository (it is
+    // how a test run muted a strip for real, measured: `mute: true` → `false`).
+    let state = AppState::from_config(copy_of_repo_config("controls"));
     let mut state = state;
     let now = std::time::Instant::now();
     state.set_clock(now);

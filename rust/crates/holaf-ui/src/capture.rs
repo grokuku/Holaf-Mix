@@ -15,7 +15,7 @@
 //! # a bus / output strip: record the MONITOR of a sink
 //! pw-cat --record --target Holaf_Bus_Mic \
 //!        -P {"stream.capture.sink":true} \
-//!        --format f32 --rate 48000 --channels 2 -     → raw f32le on stdout
+//!        --format f32 --raw --rate 48000 --channels 2 -   → raw f32le on stdout
 //! ```
 //!
 //! # The two traps this module exists to get right
@@ -37,6 +37,42 @@
 //!    headless sandbox: same command, RMS 0.0000 → 0.3497 once the property is
 //!    there).  Device sources (`alsa_input…`) must **not** get it: they are real
 //!    capture nodes and are linked directly.
+//!
+//! # The sample format is *detected*, never assumed (the “VU à zéro” report)
+//!
+//! `--format f32` does **not** mean “f32le on stdout”.  Since PipeWire 1.4 a
+//! capture to `-` without `--raw` is written through **libsndfile**, which wraps
+//! the samples in a `.au` **container** (a header, then big-endian data), and
+//! `--format` only picks the sample format *inside* that container.  A user
+//! report on PipeWire 1.6.11 showed the result: the reader decoded the header and
+//! the endian-swapped data as `f32`, every block was “impossible”, and every VU
+//! bar read 0.000 — on a machine where the same command wrote plain `f32le`
+//! under PipeWire 0.3.65 (which has no `--raw` and writes the raw samples).
+//!
+//! So the format is handled in two independent layers, and neither depends on
+//! the other being right:
+//!
+//! 1. **Force it** — `--raw` (`-a`) is added when the recorder supports it
+//!    (`pw-cat --help` is probed once, see [`recorder_supports_raw`]); it makes
+//!    `pw-cat` `fwrite` the samples with no container.  On a `pw-cat` that
+//!    predates 1.4 the flag does not exist and is simply not passed (that
+//!    version already writes raw samples to `-`).
+//! 2. **Never trust it** — the first block is checked, and the bytes are
+//!    measured against the formats `pw-cat` can really write
+//!    ([`detect_sample_format`]) whenever the `f32` reading of the block cannot
+//!    be audio.  Two measurements say that, and **both** are needed:
+//!    * **too loud** — a peak above +40 dBFS ([`MeterSample::is_implausible`]);
+//!      a misread `s32` block reaches 1e38.
+//!    * **too quiet for these bytes** — an RMS below −180 dBFS while the bytes
+//!      are *not* all zero ([`f32_reading_is_a_misread`]): reinterpreting `s16`
+//!      four bytes at a time produces **denormals** (measured: peak 4.9e-30,
+//!      RMS 1.4e-30 for a −20 dBFS-RMS tone), which pass a “too loud” guard and
+//!      left every bar at exactly 0.000 — the residual “VU à zéro”.
+//!
+//!    The block is then **converted** (`s16le/32768`, `s32le/2³¹`, `f64`, `u8`,
+//!    `s8`) instead of being thrown away.  The detected [`SampleFormat`] is
+//!    **frozen** for that capture (one conversion per block, no guess per
+//!    sample) and re-detected if the stream changes format mid-way.
 //!
 //! Measured on the headless sandbox (PipeWire 0.3.65): 10 ms of stereo audio
 //! costs one 3840-byte read, a `pw-cat` process idles at ~0.2 % CPU, and a
@@ -74,7 +110,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread::{self, JoinHandle};
 
 use crate::diagnostics::{CaptureRegistry, RejectReason};
-use crate::meters::{analyse_block, MeterBoard, BLOCK_FRAMES, METER_CHANNELS, METER_RATE};
+use crate::meters::{
+    analyse_block, MeterBoard, MeterSample, BLOCK_FRAMES, METER_CHANNELS, METER_RATE,
+};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Bytes of one published block (`480 frames × 2 ch × 4 B`).
 const BLOCK_BYTES: usize = BLOCK_FRAMES * METER_CHANNELS * 4;
@@ -101,6 +141,378 @@ pub const MONITOR_SUFFIX: &str = ".monitor";
 /// the **default source** and records something else entirely (silence, in a
 /// mixer whose default source is nobody).  Passed as `pw-cat -P '<json>'`.
 pub const MONITOR_PROPERTIES: &str = "{\"stream.capture.sink\":true}";
+
+/// Does this recorder accept `--raw` / `-a`?
+///
+/// **Why probe instead of always passing it:** `pw-cat` gained `--raw` in
+/// PipeWire 1.4.  Before that, `--raw` is an *unknown option* and `pw-cat`
+/// exits with `unrecognized option '--raw'` — passing it unconditionally would
+/// turn a working capture into a dead one on every older server (0.3.x is still
+/// common).  On those versions the raw stream is already what `-` gives, so the
+/// flag is not needed; on 1.4+ it is what stops libsndfile from wrapping the
+/// samples in an `.au` container.
+///
+/// The answer is cached: it costs one `<recorder> --help` spawn for the whole
+/// process (the capture is started once per strip, the probe not per strip).
+pub fn recorder_supports_raw(recorder: &str) -> bool {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(answer) = guard.get(recorder) {
+            return *answer;
+        }
+    }
+    let answer = probe_raw_flag(recorder);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(recorder.to_string(), answer);
+    }
+    answer
+}
+
+/// How long the recorder is given to answer `--help` (see [`probe_raw_flag`]).
+const RAW_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// What a **bounded** `<recorder> <arg>` probe produced.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeOutput {
+    /// Did the child exit with status 0?
+    pub success: bool,
+    /// Everything it printed on stdout.
+    pub stdout: String,
+    /// Everything it printed on stderr.
+    pub stderr: String,
+}
+
+impl ProbeOutput {
+    /// stdout and stderr as one text (what “does it mention this option?”
+    /// checks want: `pw-cat` writes its help on either).
+    pub fn text(&self) -> String {
+        let mut text = self.stdout.clone();
+        text.push_str(&self.stderr);
+        text
+    }
+}
+
+/// Run `<recorder> <arg>` and collect what it printed, **giving up after
+/// `timeout`**.
+///
+/// Why not `Command::output()`: it waits for the child to exit *and* for
+/// end-of-file on both pipes.  A recorder that is a **shell wrapper** — the
+/// documented workaround for a `pw-cat` that writes the wrong sample format, and
+/// every test stand-in — ignores the options it does not know and starts
+/// recording for ever, so `output()` never returns.  Measured: the diagnostic
+/// report froze for minutes because a wrapper was asked `--version`.
+///
+/// `None` means “could not spawn it, or it did not answer in time”: the caller
+/// treats both the same way (the probe is a convenience, never the diagnosis).
+pub fn recorder_probe_output(recorder: &str, arg: &str, timeout: Duration) -> Option<ProbeOutput> {
+    let mut child = Command::new(recorder)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    // Poll for the exit: `output()` would block on a recorder that streams for
+    // ever (a wrapper that ignores the argument).
+    let deadline = Instant::now() + timeout;
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    // The pipes close with the child, so these reads cannot block.
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    Some(ProbeOutput {
+        success,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run `<recorder> --help` and look for the `--raw` option.
+///
+/// A binary that cannot even be spawned (missing `pw-cat`) answers `false`: the
+/// spawn failure is reported by [`spawn_stream`] with the OS reason, which is
+/// far more useful than “no --raw”.
+///
+/// The probe is **bounded** ([`recorder_probe_output`]): a recorder that does not
+/// answer `--help` and exit (a wrapper script that ignores its arguments and
+/// records for ever) is killed after [`RAW_PROBE_TIMEOUT`] and treated as “no
+/// `--raw`”.  Without that bound the whole spawn would wait for ever on a
+/// recorder that never returns.
+fn probe_raw_flag(recorder: &str) -> bool {
+    let Some(output) = recorder_probe_output(recorder, "--help", RAW_PROBE_TIMEOUT) else {
+        return false;
+    };
+    // Match the option, not the word in prose: `pw-cat` prints
+    // `  -a, --raw                             RAW mode`.
+    output.text().lines().any(|line| {
+        line.split_whitespace()
+            .any(|token| token.trim_end_matches(',') == "--raw")
+    })
+}
+
+/// The sample format a capture stream really carries, as detected from the
+/// **bytes** (never from the `--format` we asked for).
+///
+/// Only the formats `pw-cat` can write to a raw stream are covered.  Each one
+/// knows how to turn one block of bytes into the `f32` samples the meter maths
+/// expect, scaling integer formats by their full-scale value so a −20 dBFS sine
+/// reads −20 dBFS whatever the transport format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFormat {
+    /// 32-bit little-endian float — what `--format f32 --raw` writes, the
+    /// nominal case (and the only one that needs no conversion).
+    F32Le,
+    /// 16-bit little-endian signed PCM (the `pw-cat` default, and what a
+    /// libsndfile `.au` container holds once the header is stripped).
+    S16Le,
+    /// 32-bit little-endian signed PCM.
+    S32Le,
+    /// 64-bit little-endian float.
+    F64Le,
+    /// 8-bit unsigned PCM (silence is 128, full scale ±127).
+    U8,
+    /// 8-bit signed PCM.
+    S8,
+}
+
+impl SampleFormat {
+    /// Bytes per sample on the wire.
+    pub fn width(self) -> usize {
+        match self {
+            SampleFormat::F32Le | SampleFormat::S32Le => 4,
+            SampleFormat::S16Le => 2,
+            SampleFormat::F64Le => 8,
+            SampleFormat::U8 | SampleFormat::S8 => 1,
+        }
+    }
+
+    /// The name the report prints (`s16le`, `f32le`, …).
+    pub fn name(self) -> &'static str {
+        match self {
+            SampleFormat::F32Le => "f32le",
+            SampleFormat::S16Le => "s16le",
+            SampleFormat::S32Le => "s32le",
+            SampleFormat::F64Le => "f64le",
+            SampleFormat::U8 => "u8",
+            SampleFormat::S8 => "s8",
+        }
+    }
+
+    /// Decode `bytes` into interleaved `f32` samples, appending to `out`.
+    ///
+    /// A trailing partial sample (a block that is not a multiple of the format
+    /// width) is dropped rather than read out of bounds — the block boundary is
+    /// what the caller already validated, this only guards a mid-stream change.
+    /// No allocation per sample: `out` is reserved once by the caller.
+    pub fn decode_into(self, bytes: &[u8], out: &mut Vec<f32>) {
+        let width = self.width();
+        let count = bytes.len() / width;
+        out.reserve(count);
+        match self {
+            SampleFormat::F32Le => {
+                for chunk in bytes[..count * 4].as_chunks::<4>().0 {
+                    out.push(f32::from_le_bytes(*chunk));
+                }
+            }
+            SampleFormat::S16Le => {
+                const SCALE: f32 = 1.0 / 32_768.0;
+                for chunk in bytes[..count * 2].as_chunks::<2>().0 {
+                    out.push(f32::from(i16::from_le_bytes(*chunk)) * SCALE);
+                }
+            }
+            SampleFormat::S32Le => {
+                const SCALE: f32 = 1.0 / 2_147_483_648.0;
+                for chunk in bytes[..count * 4].as_chunks::<4>().0 {
+                    out.push(i32::from_le_bytes(*chunk) as f32 * SCALE);
+                }
+            }
+            SampleFormat::F64Le => {
+                for chunk in bytes[..count * 8].as_chunks::<8>().0 {
+                    out.push(f64::from_le_bytes(*chunk) as f32);
+                }
+            }
+            SampleFormat::U8 => {
+                // u8 PCM is biased: 128 is silence.
+                const SCALE: f32 = 1.0 / 128.0;
+                for byte in &bytes[..count] {
+                    out.push((f32::from(*byte) - 128.0) * SCALE);
+                }
+            }
+            SampleFormat::S8 => {
+                const SCALE: f32 = 1.0 / 128.0;
+                for byte in &bytes[..count] {
+                    out.push(f32::from(*byte as i8) * SCALE);
+                }
+            }
+        }
+    }
+
+    /// Decode a whole block into a fresh `f32` buffer (the reader's hot path,
+    /// used when the block's format is not the nominal `f32le`).
+    pub fn decode(self, bytes: &[u8]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(bytes.len() / self.width());
+        self.decode_into(bytes, &mut out);
+        out
+    }
+}
+
+/// Does this block start with a **container magic** (`RIFF`, `.snd`)?
+///
+/// A container is the one thing that must be *refused*, not converted: the
+/// header appears once at the start of the stream, so converting its payload as
+/// raw samples would mis-align every following block by the header length.  This
+/// is exactly what PipeWire 1.4+ writes to `-` without `--raw` (an `.au`
+/// container), and why [`recorder_supports_raw`] exists.
+pub fn starts_with_container(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"RIFF") || bytes.starts_with(b".snd") || bytes.starts_with(b"FORM")
+}
+
+/// RMS below which an `f32le` reading of a block is **not believed** when the
+/// bytes are not all zero.
+///
+/// [`MeterSample::is_implausible`] only catches the *loud* half of a misread — a
+/// block whose `f32` peak is over +40 dBFS.  Reading a **narrower** format four
+/// bytes at a time just as often produces the opposite: almost nothing.
+///
+/// Measured on the headless sandbox, `s16le` tone (peak −20 dBFS, every sample in
+/// `0..=3783`, so the high byte never sets a large exponent) read as `f32le`:
+/// peak 4.9e-30, RMS 1.4e-30.  That is far below the +40 dBFS guard, so `f32le`
+/// was frozen on it, 249 blocks were *accepted*, and the level of every one of
+/// them was exactly 0.000 (the residual “VU à zéro”: `detected_format: None`,
+/// `last_rms: 1.4e-30`).  Values that small are denormals (or dropped
+/// NaN/infinities) — the signature of bytes read at the wrong width.
+///
+/// **−180 dBFS** is chosen so no real capture can be mistaken for it: a genuine
+/// `f32` path bottoms out around 1e-7 (−140 dBFS) with real material, and honest
+/// digital silence is *all zero bytes*, which [`f32_reading_is_a_misread`]
+/// excludes explicitly.
+pub const SUSPICIOUS_LOW_RMS: f32 = 1e-9;
+
+/// Is this block's `f32le` reading a **misread** rather than a genuinely quiet
+/// stream?
+///
+/// The positive half of the format detection: `is_implausible` says “too loud to
+/// be audio”, this says “too quiet to be *these* bytes”.  Both are needed — see
+/// [`SUSPICIOUS_LOW_RMS`] for the measurement that made the second one necessary.
+///
+/// Two conditions, cheapest first:
+/// 1. the loudest channel's RMS is under [`SUSPICIOUS_LOW_RMS`];
+/// 2. the block is **not** all zero bytes — an honest silent stream stays
+///    silent, so it must never trigger a conversion (and a `u8` stream's silence
+///    is `0x80`, which is not zero either, so it is still detected).
+///
+/// Denormals are not hunted sample by sample: an RMS under −180 dBFS already
+/// means every sample is a denormal or a NaN/infinity that [`analyse_block`]
+/// dropped, which is exactly what a misread block looks like.
+fn f32_reading_is_a_misread(bytes: &[u8], as_f32: &MeterSample) -> bool {
+    let rms = as_f32.rms[0].max(as_f32.rms[1]);
+    // Short-circuit on the RMS: the byte scan only runs for a suspicious block.
+    rms < SUSPICIOUS_LOW_RMS && bytes.iter().any(|byte| *byte != 0)
+}
+
+/// Which format a block of bytes really is, judged from the bytes alone.
+///
+/// The candidate formats are decoded and scored; the winner is the one whose
+/// samples look most like **audio**: plausible peak (finite, non-zero, within a
+/// couple of dB of full scale) *and* **smooth in time**.  Smoothness is what
+/// separates the right width from a wrong one: a block decoded at the wrong
+/// width builds its “samples” from pieces of neighbouring real samples, so it
+/// jumps from full scale to zero and back (a huge frame-to-frame change), while
+/// real PCM — at any width — only moves a little between consecutive samples of
+/// a 48 kHz stream.
+///
+/// `f32le` is never returned: if it were plausible the block would not have
+/// reached here, and reporting “the recorder wrote f32le” would be a lie.
+fn guess_format(bytes: &[u8]) -> Option<(SampleFormat, f32)> {
+    const CANDIDATES: [SampleFormat; 5] = [
+        SampleFormat::S16Le,
+        SampleFormat::S32Le,
+        SampleFormat::F64Le,
+        SampleFormat::U8,
+        SampleFormat::S8,
+    ];
+    let mut best: Option<(SampleFormat, f32, f32)> = None; // (format, peak, roughness)
+    for format in CANDIDATES {
+        let Some((peak, roughness)) = score_audio(bytes, format) else {
+            continue;
+        };
+        best = match best {
+            // Lower roughness = more audio-like.  On a tie the **wider** format
+            // wins (8-bit audio is ambiguous with a single silent sample).
+            Some((chosen, _, chosen_rough))
+                if roughness < chosen_rough
+                    || (roughness == chosen_rough && format.width() > chosen.width()) =>
+            {
+                Some((format, peak, roughness))
+            }
+            Some(found) => Some(found),
+            None => Some((format, peak, roughness)),
+        };
+    }
+    best.map(|(format, peak, _)| (format, peak))
+}
+
+/// Decode `bytes` as `format` and return `(peak, roughness)` when the result
+/// looks like audio, `None` otherwise.
+///
+/// `roughness` is the mean absolute step between consecutive samples divided by
+/// the RMS: ~0 for a smooth sine, ≫ 1 for the alternating full-scale junk a
+/// wrong-width decode produces.
+fn score_audio(bytes: &[u8], format: SampleFormat) -> Option<(f32, f32)> {
+    let samples = format.decode(bytes);
+    if samples.len() < 2 {
+        return None;
+    }
+    // NaN/inf samples are dropped by `analyse_block` too; a format that is mostly
+    // non-finite is not this stream's format.
+    let finite: Vec<f32> = samples.iter().copied().filter(|s| s.is_finite()).collect();
+    if finite.len() < samples.len() / 2 {
+        return None;
+    }
+    let peak = finite.iter().fold(0.0_f32, |peak, s| peak.max(s.abs()));
+    // Plausible audio: within a couple of dB of full scale, and not silence.
+    if !(peak > 1e-4 && peak <= 1.5) {
+        return None;
+    }
+    let rms = (finite.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+        / finite.len() as f64)
+        .sqrt() as f32;
+    if rms <= 1e-6 {
+        return None;
+    }
+    let mean_step = finite
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .sum::<f32>()
+        / (finite.len() - 1) as f32;
+    let roughness = mean_step / rms;
+    // Real audio is band-limited at 48 kHz: consecutive samples differ by a
+    // fraction of the RMS.  A wrong width scrambles them into a near-white
+    // signal (roughness ≳ 1.5, often ~2 for full-scale alternation).  A signal
+    // with **no** variation at all is DC (a constant byte pattern), which is not
+    // audio either — real silence never reaches here (its f32 reading is
+    // plausible and it is never re-detected).
+    if !(1e-4..=1.5).contains(&roughness) {
+        return None;
+    }
+    Some((peak, roughness))
+}
 
 /// What `--target` must be given for a `meter_sources()` entry, and whether the
 /// capture is a **sink monitor**.
@@ -365,16 +777,26 @@ fn spawn_stream(
         args.push("-P".to_string());
         args.push(MONITOR_PROPERTIES.to_string());
     }
+    // `--raw` forces the samples themselves on stdout instead of a libsndfile
+    // container (see the module docs).  Only passed when the recorder knows it:
+    // `pw-cat` before 1.4 exits on an unknown option, and those versions already
+    // write raw samples to `-`.
+    let raw = recorder_supports_raw(recorder);
     args.extend([
         "--target".to_string(),
         node.to_string(),
         "--format".to_string(),
         "f32".to_string(),
+    ]);
+    if raw {
+        args.push("--raw".to_string());
+    }
+    args.extend([
         "--rate".to_string(),
         METER_RATE.to_string(),
         "--channels".to_string(),
         METER_CHANNELS.to_string(),
-        // `-` = raw stream on stdout (verified on pw-cat 0.3.65 and 1.x).
+        // `-` = stream on stdout (verified on pw-cat 0.3.65 and 1.x).
         "-".to_string(),
     ]);
     let command_line = render_command(recorder, &args);
@@ -419,73 +841,266 @@ fn spawn_stream(
     let reader = thread::Builder::new()
         .name(format!("holaf-meter-{uid}"))
         .spawn(move || {
+            // The format this capture is really carrying, as detected from a
+            // **probe window** (below).  `f32le` is the nominal case (what
+            // `--format f32 --raw` writes); anything else is detected once and
+            // *converted* for every block, instead of each block being decoded as
+            // f32 and refused (the “VU à zéro” report — see the module docs).
+            //
+            // The format decides the **block size** too: 10 ms of stereo is
+            // 3840 B as f32le but only 1920 B as s16le, so the reader cannot use
+            // one fixed size for every format (that would cut a block in two and
+            // count the halves as “partial”).
+            let mut format: Option<SampleFormat> = None;
+            // Bytes of one block in the current format (`BLOCK_FRAMES × 2 ch ×
+            // width`); `None` until the format is known.
+            let mut block_bytes = BLOCK_BYTES;
+            // A block buffer big enough for any format (f32le is the widest at
+            // 4 B/sample times 2 channels; f64 is 8 B but half the frames per
+            // block would still fit, so size for the f32le case and grow once if
+            // f64 is detected).
             let mut buffer = vec![0_u8; BLOCK_BYTES];
-            // One-shot reporters: a stream that is misread must say so once, and
-            // the first block's numbers are what a bug report needs (they are the
-            // only place where the *real* RMS of a strip is visible).
+            // The `f32` sample buffer, reused across blocks: detection and
+            // conversion happen once per block, with no per-sample allocation.
+            let mut samples: Vec<f32> = Vec::with_capacity(BLOCK_BYTES / 4);
+            // Bytes read past the current block (the probe window usually holds
+            // more than one block): the tail belongs to the next block.
+            let mut carry: Vec<u8> = Vec::new();
+            // One-shot reporters: a stream that needed a conversion (or could not
+            // be read at all) must say so once.
             let mut announced = false;
             let mut warned = false;
+            // Has a **suspiciously quiet** block already been proved to be a
+            // genuinely quiet `f32le` stream (no other format explains its
+            // bytes)?  Set once, so the quiet test cannot bounce the reader
+            // between “unfreeze” and “freeze `f32le`” on every block.  Cleared
+            // whenever a format is detected or a loud misread unfreezes it.
+            let mut quiet_f32_settled = false;
+            // Is this still the first block of the stream?  Only the first block
+            // can legitimately carry a container header (see the detection step).
+            let mut first_block = true;
             loop {
-                let filled = match read_block(&mut stdout, &mut buffer) {
-                    Ok(filled) => filled,
-                    Err(err) => {
-                        log::warn!("metering: {label}: stream ended: {err}");
-                        stats_for_reader.ended(&label, format!("read error: {err}"));
-                        // The source disappeared (unplugged device, killed
-                        // engine): a dark VU is the honest picture.
-                        board.publish(slot, [0.0, 0.0]);
-                        return;
-                    }
-                };
-                if filled == 0 {
-                    // A clean end of stream (a strip was removed, the recorder
-                    // was stopped): not a failure, but the report shows it.
-                    stats_for_reader.ended(&label, "the recorder closed its stdout");
-                    board.publish(slot, [0.0, 0.0]);
-                    return;
+                // 1. Fill one block: first from the carry, then from stdout.
+                buffer.resize(block_bytes, 0);
+                let mut filled = 0_usize;
+                if !carry.is_empty() {
+                    let take = carry.len().min(block_bytes);
+                    buffer[..take].copy_from_slice(&carry[..take]);
+                    carry.drain(..take);
+                    filled = take;
                 }
-                if filled < BLOCK_BYTES {
+                if filled < block_bytes {
+                    match read_block(&mut stdout, &mut buffer[filled..block_bytes]) {
+                        Ok(0) if filled == 0 => {
+                            // Clean end of stream.
+                            stats_for_reader.ended(&label, "the recorder closed its stdout");
+                            board.publish(slot, [0.0, 0.0]);
+                            return;
+                        }
+                        Ok(0) => {
+                            // The stream ended mid-block.
+                            stats_for_reader.reject(&label, RejectReason::Partial, None);
+                            stats_for_reader.ended(
+                                &label,
+                                format!("stdout closed after {filled} of {block_bytes} bytes"),
+                            );
+                            board.publish(slot, [0.0, 0.0]);
+                            return;
+                        }
+                        Ok(count) => filled += count,
+                        Err(err) => {
+                            log::warn!("metering: {label}: stream ended: {err}");
+                            stats_for_reader.ended(&label, format!("read error: {err}"));
+                            board.publish(slot, [0.0, 0.0]);
+                            return;
+                        }
+                    }
+                }
+                if filled < block_bytes {
                     // A short read can only be the tail of a stream: the rest is
                     // not a frame-aligned block, so it is **counted** as a
-                    // partial block instead of silently treated as silence (a
-                    // WAV header would land here too).
+                    // partial block instead of silently treated as silence.
                     stats_for_reader.reject(&label, RejectReason::Partial, None);
                     stats_for_reader.ended(
                         &label,
-                        format!("stdout closed after {filled} of {BLOCK_BYTES} bytes"),
+                        format!("stdout closed after {filled} of {block_bytes} bytes"),
                     );
                     board.publish(slot, [0.0, 0.0]);
                     return;
                 }
-                let samples: Vec<f32> = buffer
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect();
-                let sample = analyse_block(&samples, METER_CHANNELS);
-                // A stream read with the wrong sample format yields huge
-                // “samples”: drawing them pins the bar at 1.0 for ever
-                // (the “VU toujours à fond” report).  Drop the block and
-                // say it once — a dark bar plus a loud log line is the
-                // honest picture.
-                if sample.is_implausible() {
-                    // Guess the real format once, from the raw bytes, so the
-                    // report says *what* the recorder writes instead of only
-                    // that something is wrong.
-                    let guess = (!warned).then(|| detect_sample_format(&buffer));
-                    if !warned {
-                        warned = true;
+
+                // 2. Decide the format on the first block, if not already known.
+                //
+                //    The first block arrives *as f32le* sized, so it may be a
+                //    fraction of a real block in another format — but it is
+                //    always ≥ 1 whole frame, which is all the detection needs (it
+                //    looks at the bytes, not at frame alignment).
+                if format.is_none() {
+                    let as_f32 = analyse_block(&SampleFormat::F32Le.decode(&buffer), METER_CHANNELS);
+                    // A container magic (`.au`/RIFF) is *definitive* — but only at
+                    // the **very start** of the stream: a container header appears
+                    // once, at offset 0, never later.  Checking it on every
+                    // unformatted block would refuse a legitimate s16 block whose
+                    // first two samples happen to spell `.snd` (measured: a tone at
+                    // 0.9 amplitude gives exactly those bytes).  So the magic only
+                    // vetoes detection on the first block of the capture.
+                    let looks_like_container = first_block && starts_with_container(&buffer);
+                    first_block = false;
+                    if looks_like_container {
+                        // The recorder is writing a libsndfile container, not raw
+                        // samples (PipeWire 1.4+ without `--raw`).  Converting its
+                        // payload would mis-align every block by the header, so
+                        // this is **terminal** for the capture: report it once and
+                        // keep the bar dark (the fix is the `--raw` flag, not a
+                        // guess).  No retry: the header only appears once, so
+                        // every later block would look “convertible” while being
+                        // shifted by the header length.
+                        let guess = detect_sample_format(&buffer);
                         log::warn!(
-                            "metering: {label}: impossible block (peak {:?}, rms {:?}) — the \
-                             recorder is not writing f32le to stdout (the bytes look like {}). \
-                             The VU stays dark instead of pinning at full scale.",
-                            sample.peak,
-                            sample.rms,
-                            guess.as_deref().unwrap_or("unknown")
+                            "metering: {label}: the recorder writes {} instead of raw samples — \
+                             it needs `--raw` (pw-cat 1.4+) to stream f32le. The VU stays dark \
+                             instead of drawing the container bytes.",
+                            guess
+                        );
+                        stats_for_reader.reject(&label, RejectReason::Implausible, Some(guess));
+                        stats_for_reader.ended(
+                            &label,
+                            "the recorder writes a container, not raw samples (add `--raw`)",
+                        );
+                        board.publish(slot, [0.0, 0.0]);
+                        return;
+                    }
+                    // Two independent reasons to distrust the `f32le` reading of
+                    // this block, because a misread takes two shapes:
+                    //
+                    //   * `as_f32.is_implausible()` — **too loud** (peak above
+                    //     +40 dBFS).  Reading `s32` as f32 does that.
+                    //   * `f32_reading_is_a_misread` — **too quiet for these
+                    //     bytes**: an RMS under −180 dBFS while the bytes are not
+                    //     all zero, i.e. denormals.  Reading `s16` as f32 does
+                    //     that (measured peak 4.9e-30 for a −20 dBFS-RMS tone),
+                    //     and it used to be *accepted*, freezing `f32le` and
+                    //     leaving the bar at 0.000 for ever.
+                    let impossible = as_f32.is_implausible();
+                    let too_quiet = f32_reading_is_a_misread(&buffer, &as_f32);
+                    let chosen = if impossible {
+                        guess_format(&buffer)
+                    } else if too_quiet {
+                        // Positive detection: the reading is not believable, so
+                        // ask the bytes.  If nothing explains them the block is a
+                        // genuinely (absurdly) quiet f32 stream — accepted as is,
+                        // not refused, and not re-examined for ever.
+                        match guess_format(&buffer) {
+                            Some(found) => Some(found),
+                            None => {
+                                quiet_f32_settled = true;
+                                Some((SampleFormat::F32Le, 0.0))
+                            }
+                        }
+                    } else {
+                        Some((SampleFormat::F32Le, 0.0))
+                    };
+                    match chosen {
+                        Some((detected, peak)) => {
+                            format = Some(detected);
+                            if detected != SampleFormat::F32Le {
+                                // The bytes are not the `f32le` the recorder was
+                                // asked for: the quiet test has nothing left to
+                                // prove.
+                                quiet_f32_settled = false;
+                            }
+                            let new_bytes = BLOCK_FRAMES * METER_CHANNELS * detected.width();
+                            if detected != SampleFormat::F32Le {
+                                log::info!(
+                                    "metering: {label}: the recorder writes {} (peak {peak:.3}), \
+                                     not f32le — converting every block instead of dropping it",
+                                    detected.name()
+                                );
+                                stats_for_reader.format_detected(&label, detected.name(), peak);
+                            }
+                            if new_bytes != block_bytes {
+                                // Re-frame: the first block was read at the f32le
+                                // size; its tail beyond the real block size is
+                                // carried into the next block.
+                                block_bytes = new_bytes;
+                                if buffer.len() > block_bytes {
+                                    carry.splice(0..0, buffer[block_bytes..].iter().copied());
+                                    buffer.truncate(block_bytes);
+                                }
+                            }
+                        }
+                        None => {
+                            // Nothing explains these bytes: keep the bar dark and
+                            // say it once, as before.
+                            let guess = (!warned).then(|| detect_sample_format(&buffer));
+                            if !warned {
+                                warned = true;
+                                log::warn!(
+                                    "metering: {label}: impossible block (peak {:?}, rms {:?}) — \
+                                     the bytes look like {} and no known sample format explains \
+                                     them. The VU stays dark instead of pinning at full scale.",
+                                    as_f32.peak,
+                                    as_f32.rms,
+                                    guess.as_deref().unwrap_or("unknown")
+                                );
+                            }
+                            stats_for_reader.reject(&label, RejectReason::Implausible, guess);
+                            board.publish(slot, [0.0, 0.0]);
+                            // Do not freeze a format: try again on the next block.
+                            continue;
+                        }
+                    }
+                }
+
+                // 3. Decode the block in the frozen format and measure it.
+                let current = format.unwrap_or(SampleFormat::F32Le);
+                samples.clear();
+                current.decode_into(&buffer, &mut samples);
+                let sample = analyse_block(&samples, METER_CHANNELS);
+                // A frozen format that stops explaining the stream means the
+                // recorder changed format mid-way — **or** that the stream began
+                // with digital silence (whose f32 reading is a plausible 0.0 and
+                // froze `f32le` before any real sample arrived) and the first real
+                // block is in another format.  The two are told apart: only a
+                // *real* format change (a non-f32 format that stops fitting) is
+                // reported; the silence-then-s16 startup is a `f32le` that never
+                // carried data, so it is silently unfrozen.
+                //
+                // The **quiet** half of the same coin: `f32le` frozen on a silent
+                // first block, then real `s16` bytes whose f32 reading is a
+                // denormal (measured: RMS 1.4e-30) — not “implausible”, so the
+                // guard above never fired and the bar stayed at 0.000.  Such a
+                // block is unfrozen the same silent way (it is not a format
+                // change: `f32le` never carried audio).
+                let suspicious_quiet = current == SampleFormat::F32Le
+                    && !quiet_f32_settled
+                    && f32_reading_is_a_misread(&buffer, &sample);
+                if sample.is_implausible() || suspicious_quiet {
+                    let started_silent = current == SampleFormat::F32Le;
+                    format = None;
+                    block_bytes = BLOCK_BYTES;
+                    if sample.is_implausible() {
+                        // A loud misread may be followed by anything: let the
+                        // quiet test have its say again.
+                        quiet_f32_settled = false;
+                    }
+                    if sample.is_implausible() && !started_silent {
+                        log::warn!(
+                            "metering: {label}: block implausible as {} — redetecting (format \
+                             changed mid-stream?)",
+                            current.name()
+                        );
+                        stats_for_reader.format_changed(&label);
+                        stats_for_reader.reject(&label, RejectReason::Implausible, None);
+                    }
+                    if suspicious_quiet {
+                        log::info!(
+                            "metering: {label}: f32le reading of this block is {:.3e} rms (all \
+                             denormals) while its bytes are not zero — redetecting the sample \
+                             format",
+                            sample.rms[0].max(sample.rms[1])
                         );
                     }
-                    stats_for_reader.reject(&label, RejectReason::Implausible, guess);
                     board.publish(slot, [0.0, 0.0]);
                     continue;
                 }
@@ -493,13 +1108,14 @@ fn spawn_stream(
                     announced = true;
                     log::info!(
                         "metering: {label}: first block rms {:.4}/{:.4} peak {:.4}/{:.4} \
-                         → level {:.2}/{:.2}",
+                         → level {:.2}/{:.2} ({})",
                         sample.rms[0],
                         sample.rms[1],
                         sample.peak[0],
                         sample.peak[1],
                         sample.level()[0],
-                        sample.level()[1]
+                        sample.level()[1],
+                        current.name()
                     );
                 }
                 stats_for_reader.block(&label, &sample);
@@ -603,48 +1219,25 @@ fn read_block(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usiz
 /// impossible** — so the report can name it instead of leaving “impossible
 /// block” to the reader's imagination.
 ///
-/// The three formats `pw-cat` could plausibly write when `--format f32` is not
-/// honoured are tried on the very same bytes, and the first one that looks like
-/// audio (peak within a sane range, non-zero) wins.  A real `f32` stream that is
-/// merely **over** full scale (a huge but genuine level) matches none of them,
-/// which is why this returns “unknown” rather than always naming a format.
+/// The formats `pw-cat` can plausibly write when `--format f32 --raw` is not
+/// honoured are tried on the very same bytes (see [`guess_format`]); a real `f32`
+/// stream that is merely **over** full scale (a huge but genuine level) matches
+/// none of them, which is why this returns “unknown” rather than always naming a
+/// format.
 pub fn detect_sample_format(bytes: &[u8]) -> String {
     // A container header is unambiguous: `pw-cat` would only write one if it were
-    // asked for a file (`.wav`) instead of the raw `-` stream.
+    // asked for a file instead of the raw `-` stream (which is exactly what
+    // PipeWire 1.4+ does without `--raw`).
     if bytes.len() >= 4 && &bytes[..4] == b"RIFF" {
         return "a WAV/RIFF header".to_string();
     }
-    // A plausible audio peak: within a couple of dB of full scale, and not
-    // digital silence (an all-zero reinterpretation says nothing).
-    let plausible = |peak: f32| peak.is_finite() && peak > 1e-4 && peak <= 1.5;
-
-    let s16 = peak_of(bytes.as_chunks::<2>().0.iter().map(|chunk| {
-        f32::from(i16::from_le_bytes(*chunk)) / 32_768.0
-    }));
-    if plausible(s16) {
-        return format!("s16le (peak {s16:.3})");
+    if bytes.len() >= 4 && &bytes[..4] == b".snd" {
+        return "a libsndfile .au header (pw-cat without --raw)".to_string();
     }
-    let s32 = peak_of(bytes.as_chunks::<4>().0.iter().map(|chunk| {
-        (f64::from(i32::from_le_bytes(*chunk)) / 2_147_483_648.0) as f32
-    }));
-    if plausible(s32) {
-        return format!("s32le (peak {s32:.3})");
+    match guess_format(bytes) {
+        Some((format, peak)) => format!("{} (peak {peak:.3})", format.name()),
+        None => "unknown — not s16le/s32le/f64le audio either".to_string(),
     }
-    let f64 = peak_of(
-        bytes
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|chunk| f64::from_le_bytes(*chunk).abs() as f32),
-    );
-    if plausible(f64) {
-        return format!("f64le (peak {f64:.3})");
-    }
-    "unknown — not s16le/s32le/f64le audio either".to_string()
-}
-
-fn peak_of(values: impl Iterator<Item = f32>) -> f32 {
-    values.fold(0.0_f32, |peak, value| peak.max(value.abs()))
 }
 
 /// Kill a capture's child and join its reader.
@@ -860,6 +1453,91 @@ mod tests {
         );
     }
 
+    /// **Live, through a real child (opt-in).**  A recorder that writes `s16le`
+    /// despite `--format f32` (the PipeWire 1.6 report) must reach the board with
+    /// the right level **and** be reported as detected+converted — never dropped.
+    ///
+    /// Two shapes of “s16 bytes read as f32” reach this same assertion, and both
+    /// are worth running:
+    ///
+    /// * **loud s16** (a symmetric −20 dBFS tone): the f32 reading is *huge*
+    ///   (1e37), caught by the +40 dBFS guard;
+    /// * **quiet/all-positive s16** (measured on the sandbox: every sample in
+    ///   `0..=3783` gives peak 4.9e-30, RMS 1.4e-30): the f32 reading is a
+    ///   **denormal**, which used to be accepted silently — 249 blocks, level
+    ///   0.000, `detected_format: None`.  This is the case the positive RMS test
+    ///   ([`f32_reading_is_a_misread`]) exists for.
+    ///
+    /// A tone that exercises the second shape while still carrying −20 dBFS RMS
+    /// (so the bar must read 0.56) is a **DC-offset** sine:
+    /// `sample = a·(1 + sin(2π1000t))` with `a = 0.0707/√1.5` (all samples stay
+    /// positive, RMS = 0.0707).  Either WAV works for this test.
+    ///
+    /// ```bash
+    /// eval "$(./scripts/start-pipewire-headless.sh --export)"
+    /// pw-cli create-node adapter '{ factory.name=support.null-audio-sink \
+    ///   node.name=Test_Sink media.class=Audio/Sink object.linger=true \
+    ///   audio.position=[ FL FR ] }'
+    /// pw-cat --playback --target Test_Sink /tmp/tone.wav &   # or the DC-offset tone
+    /// HOLAF_METER_LIVE_SINK=Test_Sink HOLAF_METER_LIVE_S16=1 \
+    ///   HOLAF_PW_CAT=/tmp/rig/pwcat_s16_wrapper.sh \
+    ///   cargo test -p holaf-ui --lib a_live_s16_recorder_is_converted
+    /// ```
+    #[test]
+    fn a_live_s16_recorder_is_converted() {
+        let (Ok(sink), Ok(_wav)) = (
+            std::env::var("HOLAF_METER_LIVE_SINK"),
+            std::env::var("HOLAF_METER_LIVE_S16"),
+        ) else {
+            eprintln!(
+                "SKIP a_live_s16_recorder_is_converted: set HOLAF_METER_LIVE_SINK and \
+                 HOLAF_METER_LIVE_S16 and HOLAF_PW_CAT=<a recorder that writes s16le>"
+            );
+            return;
+        };
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::new();
+        let uid = "s16-live".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), format!("{sink}.monitor"));
+        capture.sync(&wanted, &slots, &board);
+        // Sample a little past the first audible block: the very first converted
+        // block can still contain the stream's leading digital silence (the
+        // recorder starts before the sink has audio), which would read low.
+        let mut level = wait_for_level(&board, &uid);
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < settle {
+            let read = board.read(&uid).unwrap_or([0.0, 0.0]);
+            level = [level[0].max(read[0]), level[1].max(read[1])];
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let summary = capture.stats().summary();
+        capture.stop_all();
+        assert!(
+            (level[0] - 0.56).abs() < 0.05,
+            "the s16le stream must move the bar to 0.56 (a −20 dBFS sine), got {level:?} \
+             ({summary:?})"
+        );
+        assert_eq!(
+            summary.sources.first().and_then(|facts| facts.detected_format.clone()),
+            Some("s16le".to_string()),
+            "the report must name the detected format: {summary:?}"
+        );
+        // The level that moved the bar is the **converted** one: proof that the
+        // block was decoded as s16 (−20 dBFS ≈ 0.0707) and not as the denormal
+        // f32 reading it has when taken 4 bytes at a time.
+        assert!(
+            summary
+                .sources
+                .first()
+                .and_then(|facts| facts.last_rms)
+                .is_some_and(|rms| (rms[0] - 0.0707).abs() < 0.005),
+            "the recorded RMS must be the converted one: {summary:?}"
+        );
+        assert_eq!(summary.rejected, 0, "nothing is refused: {summary:?}");
+    }
+
     #[test]
     fn a_uid_without_a_board_slot_is_not_captured() {
         let board = MeterBoard::new();
@@ -891,7 +1569,10 @@ mod tests {
         let script = dir.join("recorder.sh");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\nwhile :; do cat '{}'; done\n", data.display()),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && {{ echo '  -a, --raw   RAW mode'; exit 0; }}; done\nwhile :; do cat '{}'; done\n",
+                data.display()
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -957,6 +1638,11 @@ mod tests {
         assert!(facts.monitor);
         assert!(facts.blocks > 0 && facts.pid.is_some());
         assert!(facts.last_rms.is_some_and(|rms| (rms[0] - 0.0707).abs() < 1e-3));
+        // …and no conversion is claimed: a real f32le block is read as it is.
+        assert!(
+            facts.detected_format.is_none(),
+            "a native f32 block must not be “detected”: {facts:?}"
+        );
         assert!(facts.since_last_block.is_some());
         capture.stop_all();
         // Stopping clears the entries: a stale status must not describe the
@@ -964,26 +1650,440 @@ mod tests {
         assert!(capture.stats().summary().is_empty());
     }
 
-    /// **The “VU à fond” regression.**  The reader assumes `f32le` because it asks
-    /// for `--format f32`; a stream handed over in another sample format decodes
-    /// to huge “samples”, and drawing them pins the bar at 1.0 for ever (the user
-    /// report: “toujours à fond, avec une baisse de 10 % de temps en temps”).
-    /// Such a block is dropped: the bar stays **dark** and the log says why,
-    /// which is a diagnosable failure instead of a plausible lie.
+    /// The `--raw` capability is **probed**, not assumed: `pw-cat` before 1.4
+    /// exits on an unknown option, so the flag may only be added when the binary
+    /// offers it.
     #[test]
-    fn a_stream_in_the_wrong_sample_format_never_pins_the_bar() {
-        // 0xCC0C34F3 little-endian = -1.6e31 as f32: what s16 audio looks like
-        // when it is read as f32.
-        let mut payload = Vec::with_capacity(BLOCK_BYTES);
-        for _ in 0..BLOCK_FRAMES * 2 {
-            payload.extend_from_slice(&[0xF3, 0x34, 0x0C, 0xCC]);
+    fn the_raw_flag_is_probed_from_the_recorder_help() {
+        use std::os::unix::fs::PermissionsExt;
+        let write = |name: &str, body: &str| -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "holaf-capture-raw-{name}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("recorder.sh");
+            std::fs::write(&script, body).unwrap();
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+            script.to_string_lossy().into_owned()
+        };
+        // A pw-cat that lists the option (1.4+).
+        let modern = write(
+            "modern",
+            "#!/bin/sh\n[ \"$1\" = --help ] && { echo '  -a, --raw   RAW mode'; exit 0; }\n",
+        );
+        assert!(recorder_supports_raw(&modern), "the help lists --raw");
+        // A pw-cat that does not (0.3.x: the flag would be refused).
+        let old = write(
+            "old",
+            "#!/bin/sh\n[ \"$1\" = --help ] && { echo '  -r, --record   Recording mode'; exit 0; }\n",
+        );
+        assert!(!recorder_supports_raw(&old), "no --raw in the help");
+        // A recorder that never answers `--help` is not given the flag (and is
+        // not waited on for ever — `probe_raw_flag` is bounded).
+        let stuck = write("stuck", "#!/bin/sh\nwhile :; do sleep 1; done\n");
+        assert!(!recorder_supports_raw(&stuck));
+        // A binary that does not exist at all.
+        assert!(!recorder_supports_raw("/nonexistent/holaf-pw-cat"));
+        // The probe is cached: a second call does not respawn.  (The script is
+        // still there, so a non-cached probe would answer the same — the point
+        // is that the answer is stable, which the cache guarantees.)
+        assert!(recorder_supports_raw(&modern));
+    }
+
+    /// **The “VU à zéro” fix (PipeWire 1.4+ without `--raw`).**  The recorder
+    /// writes `s16le` even though we ask for `--format f32` (on 1.6 the samples
+    /// go through libsndfile in an `.au` container).  The reader must **detect**
+    /// the format from the bytes and **convert** it — the VU then shows the real
+    /// level instead of staying dark.
+    ///
+    /// Measured, not assumed: a −20 dBFS sine encoded as `s16le` and converted
+    /// (`i16 / 32768`) must read the same 0.56 a native `f32le` block reads.
+    #[test]
+    fn an_s16le_stream_is_detected_and_converted_instead_of_dropped() {
+        // A −20 dBFS sine, encoded as interleaved s16le (what a `pw-cat` that
+        // ignores `--format f32` writes).  10 ms of stereo at 2 B/sample is
+        // 1920 B, not the 3840 B of an f32 block — the reader must re-frame.
+        let mut payload = Vec::with_capacity(BLOCK_FRAMES * METER_CHANNELS * 2);
+        for n in 0..BLOCK_FRAMES {
+            let sample =
+                0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+            let value = (sample * 32_767.0) as i16;
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(payload.len(), BLOCK_FRAMES * METER_CHANNELS * 2);
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
+        let uid = "s16".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Sixteen.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        let level = wait_for_level(&board, &uid);
+        assert!(
+            (level[0] - 0.56).abs() < 0.02,
+            "a −20 dBFS sine carried as s16le must read 0.56 after conversion, got {level:?}"
+        );
+        // The report says the format was **detected and converted** — not that
+        // blocks were dropped (nothing is dropped any more).
+        let summary = capture.stats().summary();
+        assert!(summary.blocks > 0, "{summary:?}");
+        assert_eq!(summary.rejected, 0, "nothing is refused: {summary:?}");
+        assert_eq!(summary.rejects_of(crate::diagnostics::RejectReason::Implausible), 0);
+        let facts = &summary.sources[0];
+        assert_eq!(facts.detected_format.as_deref(), Some("s16le"), "{facts:?}");
+        assert!(
+            facts.describe().contains("detected s16le and converted"),
+            "{}",
+            facts.describe()
+        );
+        // The recorded RMS is the converted one (−20 dBFS sine → 0.0707).
+        assert!(
+            facts.last_rms.is_some_and(|rms| (rms[0] - 0.0707).abs() < 1e-3),
+            "{facts:?}"
+        );
+        capture.stop_all();
+    }
+
+    /// **The startup case measured live:** the stream begins with digital
+    /// silence (pw-cat starts before the tone reaches the sink), then the tone
+    /// arrives in s16le.  The silent block freezes `f32le`; the first real block
+    /// is implausible as f32 — it must be **redetected and converted, not counted
+    /// as a rejected block** (a rejection there is pure noise: the VU works).
+    #[test]
+    fn silence_then_s16le_is_converted_without_a_spurious_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        // A recorder that emits one block of zeros, then repeats an s16 tone.
+        let dir = std::env::temp_dir().join(format!(
+            "holaf-capture-silence-then-s16-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zeros = dir.join("zeros.bin");
+        let tone = dir.join("tone.bin");
+        std::fs::write(&zeros, vec![0_u8; BLOCK_BYTES]).unwrap();
+        let mut s16 = Vec::with_capacity(BLOCK_FRAMES * METER_CHANNELS * 2);
+        for n in 0..BLOCK_FRAMES {
+            let sample =
+                0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+            let value = (sample * 32_767.0) as i16;
+            s16.extend_from_slice(&value.to_le_bytes());
+            s16.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&tone, &s16).unwrap();
+        let script = dir.join("recorder.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && {{ echo '  -a, --raw   RAW mode'; exit 0; }}; done\ncat '{zeros}'\nwhile :; do cat '{tone}'; done\n",
+                zeros = zeros.display(),
+                tone = tone.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(script.to_string_lossy().into_owned());
+        let uid = "silence-then-s16".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Silence.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        let level = wait_for_level(&board, &uid);
+        assert!(
+            (level[0] - 0.56).abs() < 0.03,
+            "after the silent first block the s16le tone must read 0.56, got {level:?} ({:?})",
+            capture.stats().summary()
+        );
+        let summary = capture.stats().summary();
+        assert_eq!(summary.rejected, 0, "no spurious rejection: {summary:?}");
+        assert_eq!(
+            summary.sources[0].detected_format.as_deref(),
+            Some("s16le"),
+            "{summary:?}"
+        );
+        capture.stop_all();
+    }
+
+    /// **The residual “VU à zéro” (measured live).**  A recorder that writes
+    /// `s16le` does **not** always produce an “impossible” f32 block: when every
+    /// sample stays small and positive, reading four bytes at a time gives
+    /// **denormals** (measured peak 4.9e-30, RMS 1.4e-30), which sail under the
+    /// +40 dBFS guard.  `f32le` was then frozen on that reading, 249 blocks were
+    /// accepted, and the level of every one of them was exactly 0.000.
+    ///
+    /// The fix is a **positive** test: an RMS under [`SUSPICIOUS_LOW_RMS`] while
+    /// the bytes are not all zero means the bytes are being read at the wrong
+    /// width, whatever the peak says.  Here the s16 payload carries a −20 dBFS-RMS
+    /// tone (so the converted block must read 0.56), yet its f32 reading is
+    /// 1e-30-ish: exactly the stream that used to be silently dropped.
+    #[test]
+    fn a_denormal_f32_reading_of_s16_bytes_is_detected_and_converted() {
+        // All samples positive (a DC-offset tone): the high byte of every sample
+        // stays under 0x0F, so the f32 reading has a tiny exponent.  A tone with
+        // both signs would give huge negatives instead — the *other* guard.
+        let offset = 0.0707_f32 / 1.5_f32.sqrt(); // RMS = offset·√1.5 = 0.0707
+        let mut payload = Vec::with_capacity(BLOCK_FRAMES * METER_CHANNELS * 2);
+        for n in 0..BLOCK_FRAMES {
+            let sample = offset
+                * (1.0 + (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin());
+            let value = (sample * 32_767.0) as i16;
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        // The premise of this test, measured on the bytes themselves: the f32
+        // reading of that block is denormal-quiet, i.e. it passes the loudness
+        // guard — so nothing but the positive test can catch it.
+        let as_f32 = analyse_block(&SampleFormat::F32Le.decode(&payload), METER_CHANNELS);
+        assert!(
+            !as_f32.is_implausible(),
+            "the whole point: a denormal reading is not “implausible” ({as_f32:?})"
+        );
+        assert!(
+            as_f32.rms[0].max(as_f32.rms[1]) < SUSPICIOUS_LOW_RMS,
+            "…and it is suspiciously quiet instead ({as_f32:?})"
+        );
+        assert!(f32_reading_is_a_misread(&payload, &as_f32));
+
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
+        let uid = "denormal-s16".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Denormal.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        let level = wait_for_level(&board, &uid);
+        assert!(
+            (level[0] - 0.56).abs() < 0.03,
+            "a −20 dBFS-RMS s16 tone must read 0.56 once converted, got {level:?} ({:?})",
+            capture.stats().summary()
+        );
+        let summary = capture.stats().summary();
+        assert_eq!(summary.rejected, 0, "nothing is refused: {summary:?}");
+        let facts = &summary.sources[0];
+        assert_eq!(facts.detected_format.as_deref(), Some("s16le"), "{facts:?}");
+        assert!(
+            facts.last_rms.is_some_and(|rms| (rms[0] - 0.0707).abs() < 1e-3),
+            "the recorded RMS must be the converted one: {facts:?}"
+        );
+        capture.stop_all();
+    }
+
+    /// An `s16le` stream *below* the meter's floor is still detected: −60 dBFS
+    /// reads as NaN/denormals in f32 (230 of 480 groups were non-finite), so the
+    /// block arrives “plausible” and silent.  After detection the level is
+    /// legitimately 0 (the scale starts at −60 dBFS), but the **format** and the
+    /// **RMS** prove the conversion happened instead of the bytes being ignored.
+    #[test]
+    fn a_very_quiet_s16_stream_is_detected_from_its_denormals() {
+        let mut payload = Vec::with_capacity(BLOCK_FRAMES * METER_CHANNELS * 2);
+        for n in 0..BLOCK_FRAMES {
+            // ±32 counts: the high byte is 0x00 (positive) or 0xFF (negative).
+            let sample =
+                0.001 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+            let value = (sample * 32_767.0) as i16;
+            payload.extend_from_slice(&value.to_le_bytes());
+            payload.extend_from_slice(&value.to_le_bytes());
         }
         let board = MeterBoard::new();
         let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
-        let uid = "misread".to_string();
+        let uid = "quiet-s16".to_string();
         let slots = board.assign(std::slice::from_ref(&uid));
         let mut wanted = HashMap::new();
-        wanted.insert(uid.clone(), "Holaf_Bus_Misread.monitor".to_string());
+        wanted.insert(uid.clone(), "Holaf_Bus_QuietSixteen.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        assert!(
+            wait_until(|| capture
+                .stats()
+                .summary()
+                .sources
+                .first()
+                .is_some_and(|facts| facts.blocks > 0 && facts.detected_format.is_some())),
+            "the format must be detected: {:?}",
+            capture.stats().summary()
+        );
+        let summary = capture.stats().summary();
+        assert_eq!(summary.rejected, 0, "{summary:?}");
+        let facts = &summary.sources[0];
+        assert_eq!(facts.detected_format.as_deref(), Some("s16le"), "{facts:?}");
+        // 0.001/√2 = 7.07e-4 — the real amplitude, not the 1e-39 of the misread.
+        assert!(
+            facts
+                .last_rms
+                .is_some_and(|rms| (rms[0] - 0.000_707).abs() < 1e-4),
+            "the converted RMS must be the real one, not a denormal: {facts:?}"
+        );
+        capture.stop_all();
+    }
+
+    /// The nominal cases must **not** trigger a detection, however quiet they
+    /// are: a real `f32` stream is a real `f32` stream, and reporting “detected
+    /// s16le” for it would be a lie (and would draw a wrong level).
+    #[test]
+    fn a_real_f32_stream_is_never_redetected() {
+        // −63 dBFS, i.e. under the meter's floor but perfectly ordinary f32 data
+        // — a hundred thousand times louder than the suspicious threshold.
+        let quiet = sine_block(0.0007);
+        let as_f32 = analyse_block(&SampleFormat::F32Le.decode(&quiet), METER_CHANNELS);
+        assert!(!as_f32.is_implausible());
+        assert!(
+            !f32_reading_is_a_misread(&quiet, &as_f32),
+            "a quiet f32 block is not a misread ({as_f32:?})"
+        );
+        // Digital silence (all zero bytes) is not a misread either — nor is a
+        // block of denormal *f32* values, the only case left that could confuse
+        // the test, since no capture path produces one.
+        assert!(!f32_reading_is_a_misread(&[0_u8; BLOCK_BYTES], &MeterSample::default()));
+
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&quiet));
+        let uid = "quiet-f32".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_QuietF32.monitor".to_string());
+        capture.sync(&wanted, &slots, &board);
+        assert!(
+            wait_until(|| capture
+                .stats()
+                .summary()
+                .sources
+                .first()
+                .is_some_and(|facts| facts.blocks > 0)),
+            "the stream must be read: {:?}",
+            capture.stats().summary()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let summary = capture.stats().summary();
+        let facts = &summary.sources[0];
+        assert!(
+            facts.detected_format.is_none(),
+            "a real f32 stream is not “detected as” anything: {facts:?}"
+        );
+        assert_eq!(summary.rejected, 0, "{summary:?}");
+        assert!(
+            facts
+                .last_rms
+                .is_some_and(|rms| (rms[0] - 0.000_495).abs() < 1e-4),
+            "the RMS must be read as is (0.0007/√2): {facts:?}"
+        );
+        capture.stop_all();
+    }
+
+    /// `s32le` and `f64le` are converted too (a recorder that honours `--format`
+    /// with a different width, or an `.au` container's payload).
+    #[test]
+    fn s32le_and_f64le_streams_are_converted_to_the_same_level() {
+        let sine: Vec<f32> = (0..BLOCK_FRAMES)
+            .map(|n| 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin())
+            .collect();
+        // Build the two payloads.
+        let mut s32 = Vec::with_capacity(BLOCK_BYTES);
+        let mut f64 = Vec::with_capacity(BLOCK_FRAMES * 2 * 8);
+        for sample in &sine {
+            let wide = (f64::from(*sample) * 2_147_483_648.0) as i32;
+            s32.extend_from_slice(&wide.to_le_bytes());
+            s32.extend_from_slice(&wide.to_le_bytes());
+            f64.extend_from_slice(&f64::from(*sample).to_le_bytes());
+            f64.extend_from_slice(&f64::from(*sample).to_le_bytes());
+        }
+        for (name, payload, expected) in [("s32le", s32, "s32le"), ("f64le", f64, "f64le")] {
+            let board = MeterBoard::new();
+            let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
+            let uid = name.to_string();
+            let slots = board.assign(std::slice::from_ref(&uid));
+            let mut wanted = HashMap::new();
+            wanted.insert(uid.clone(), format!("Holaf_Bus_{name}.monitor"));
+            capture.sync(&wanted, &slots, &board);
+            let level = wait_for_level(&board, &uid);
+            assert!(
+                (level[0] - 0.56).abs() < 0.03,
+                "{name}: expected ≈0.56 after conversion, got {level:?} ({:?})",
+                capture.stats().summary()
+            );
+            let summary = capture.stats().summary();
+            assert_eq!(
+                summary.sources[0].detected_format.as_deref(),
+                Some(expected),
+                "{summary:?}"
+            );
+            capture.stop_all();
+        }
+    }
+
+    /// The pure conversion functions, without a child process: each format's
+    /// full-scale and a −20 dBFS sine land on the same amplitude.
+    #[test]
+    fn every_sample_format_converts_to_the_same_amplitude() {
+        // A ±0.5 (≈ −6 dBFS peak) frame, per format.
+        let frame = 0.5_f32;
+        let cases: Vec<(SampleFormat, Vec<u8>)> = vec![
+            (SampleFormat::F32Le, frame.to_le_bytes().to_vec()),
+            (
+                SampleFormat::S16Le,
+                ((frame * 32_767.0) as i16).to_le_bytes().to_vec(),
+            ),
+            (
+                SampleFormat::S32Le,
+                ((f64::from(frame) * 2_147_483_648.0) as i32)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (
+                SampleFormat::F64Le,
+                f64::from(frame).to_le_bytes().to_vec(),
+            ),
+            (SampleFormat::U8, vec![(128.0 + frame * 127.0) as u8]),
+            (SampleFormat::S8, vec![(frame * 127.0) as i8 as u8]),
+        ];
+        for (format, bytes) in cases {
+            let decoded = format.decode(&bytes);
+            assert_eq!(decoded.len(), 1, "{format:?}: one sample");
+            assert!(
+                (decoded[0] - frame).abs() < 0.01,
+                "{:?}: expected {frame}, got {}",
+                format,
+                decoded[0]
+            );
+        }
+        // Silence stays silence in every format (u8's zero point is 128).
+        assert_eq!(SampleFormat::S16Le.decode(&[0, 0]), vec![0.0]);
+        assert_eq!(SampleFormat::U8.decode(&[128]), vec![0.0]);
+        assert_eq!(SampleFormat::F64Le.decode(&0.0_f64.to_le_bytes()), vec![0.0]);
+    }
+
+    /// **The residual case: a libsndfile container.**  PipeWire 1.4+ without
+    /// `--raw` wraps the samples in a `.au` header; if that header ever reaches
+    /// the reader as *data* (a `--raw`-less recorder that does not honour our
+    /// probe), no sample format explains it, and the bar must stay dark with the
+    /// cause named — never pin at full scale.
+    ///
+    /// This is the *only* path left that refuses blocks: with `--raw` and the
+    /// s16le/s32le/f64le conversion, a real stream is never dropped.
+    #[test]
+    fn a_container_header_is_reported_and_never_drawn() {
+        // A whole big-endian `.au` f32 block: magic `.snd`, header, then data.
+        // Reading this as f32le gives huge/NaN garbage in any of the 6 formats.
+        let mut payload = vec![
+            0x2e, 0x73, 0x6e, 0x64, // .snd
+            0, 0, 0, 24, // header size
+            0, 0, 0, 0, // data size (unknown)
+            0, 0, 0, 6, // encoding 6 = float32
+            0, 0, 0xbb, 0x80, // 48000
+            0, 0, 0, 2, // 2 channels
+        ];
+        payload.resize(BLOCK_BYTES, 0x7f); // 0x7f bytes: implausible in every format
+        let board = MeterBoard::new();
+        let mut capture = MeterCapture::with_recorder(fake_recorder(&payload));
+        let uid = "container".to_string();
+        let slots = board.assign(std::slice::from_ref(&uid));
+        let mut wanted = HashMap::new();
+        wanted.insert(uid.clone(), "Holaf_Bus_Container.monitor".to_string());
         capture.sync(&wanted, &slots, &board);
         // Give the reader plenty of blocks: it must publish zeros every time.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
@@ -991,24 +2091,18 @@ mod tests {
             assert_eq!(
                 board.read(&uid),
                 Some([0.0, 0.0]),
-                "a misread stream must never publish a level"
+                "an unexplainable stream must never publish a level"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // **And it is counted**, with the format guessed from the same bytes: a
-        // dark bar used to be the only trace of this failure (the user's report
-        // was “all the levels are 0.000”, with no cause anywhere).
+        // **And it is counted**, so a dark bar is never the only trace.
         let summary = capture.stats().summary();
-        assert!(summary.blocks == 0, "nothing is drawn: {summary:?}");
+        assert_eq!(summary.blocks, 0, "nothing is drawn: {summary:?}");
         assert!(
             summary.rejects_of(crate::diagnostics::RejectReason::Implausible) > 0,
             "{summary:?}"
         );
-        let facts = &summary.sources[0];
-        assert_eq!(facts.blocks, 0);
-        assert!(facts.rejected > 0);
-        let guess = facts.format_guess.clone().unwrap_or_default();
-        assert!(guess.contains("s16le"), "{guess}");
+        assert!(summary.sources[0].detected_format.is_none());
         // A refused block is *not* a dead chain: the bytes prove it runs.
         assert!(!summary.never_streamed());
         capture.stop_all();
@@ -1027,7 +2121,14 @@ mod tests {
         let data = dir.join("payload.bin");
         std::fs::write(&data, payload).unwrap();
         let script = dir.join("recorder.sh");
-        std::fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", data.display())).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && {{ echo '  -a, --raw   RAW mode'; exit 0; }}; done\ncat '{}'\n",
+                data.display()
+            ),
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
@@ -1120,27 +2221,43 @@ mod tests {
     /// “your recorder writes s16le”: it reinterprets the very same bytes.
     #[test]
     fn the_byte_format_of_a_misread_block_is_guessed() {
-        // s16 audio read as f32 (the payload of the regression test above).
-        let mut s16_as_f32 = Vec::new();
-        for _ in 0..BLOCK_FRAMES * 2 {
-            s16_as_f32.extend_from_slice(&[0xF3, 0x34, 0x0C, 0xCC]);
-        }
-        let guess = detect_sample_format(&s16_as_f32);
-        assert!(guess.starts_with("s16le"), "{guess}");
-        // The *same* sine, encoded as s16le: the guess holds because it only
-        // looks at the bytes.
+        // A real −20 dBFS sine, encoded as s16le: `detect_sample_format` looks
+        // only at the bytes, so it names the format the recorder really wrote.
         let mut s16 = Vec::new();
         for n in 0..BLOCK_FRAMES * 2 {
             let sample = 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
-            s16.extend_from_slice(&((sample * 32767.0) as i16).to_le_bytes());
+            s16.extend_from_slice(&((sample * 32_767.0) as i16).to_le_bytes());
         }
-        assert!(detect_sample_format(&s16).starts_with("s16le"));
-        // A container header is unambiguous.
+        let guess = detect_sample_format(&s16);
+        assert!(guess.starts_with("s16le"), "{guess}");
+        // The same sine at 32-bit and 64-bit float widths.
+        let mut s32 = Vec::new();
+        let mut f64_le = Vec::new();
+        for n in 0..BLOCK_FRAMES * 2 {
+            let sample = 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+            s32.extend_from_slice(&((f64::from(sample) * 2_147_483_648.0) as i32).to_le_bytes());
+            f64_le.extend_from_slice(&f64::from(sample).to_le_bytes());
+        }
+        assert!(detect_sample_format(&s32).starts_with("s32le"));
+        assert!(detect_sample_format(&f64_le).starts_with("f64le"));
+        // A container header is unambiguous, and names *which* container.
         let mut wav = b"RIFF".to_vec();
         wav.extend_from_slice(&[0_u8; 44]);
         assert!(detect_sample_format(&wav).contains("WAV/RIFF"));
+        let mut au = b".snd".to_vec();
+        au.extend_from_slice(&[0_u8; 44]);
+        assert!(detect_sample_format(&au).contains(".au"));
         // Digital silence says nothing at all (no format claim out of zeros).
         assert!(detect_sample_format(&[0_u8; BLOCK_BYTES]).starts_with("unknown"));
+        // A smoothly varying s16 signal is not mistaken for a wider format: the
+        // decoder that reads it as s32 would see the same RMS but the wrong
+        // sample count, and roughness scoring picks s16 (the narrower truth).
+        assert_eq!(guess_format(&s16).map(|(f, _)| f), Some(SampleFormat::S16Le));
+        assert_eq!(guess_format(&s32).map(|(f, _)| f), Some(SampleFormat::S32Le));
+        assert_eq!(
+            guess_format(&f64_le).map(|(f, _)| f),
+            Some(SampleFormat::F64Le)
+        );
     }
 
     /// A recorder that picks its payload from the `--target` it was given, so one
@@ -1161,7 +2278,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\npayload='{quiet}'\ncase \"$*\" in\n  *Holaf_Bus_Loud*) payload='{loud}' ;;\nesac\nwhile :; do cat \"$payload\"; done\n",
+                "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && {{ echo '  -a, --raw   RAW mode'; exit 0; }}; done\npayload='{quiet}'\ncase \"$*\" in\n  *Holaf_Bus_Loud*) payload='{loud}' ;;\nesac\nwhile :; do cat \"$payload\"; done\n",
                 loud = loud_path.display(),
                 quiet = quiet_path.display()
             ),
@@ -1263,6 +2380,15 @@ mod tests {
         capture.sync(&wanted, &slots, &board);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(board.read(&uid), Some([0.0, 0.0]));
+        // Nothing is detected, nothing is refused: all-zero bytes are honest
+        // f32 silence, not a misread (the positive quiet test must not fire —
+        // a `u8` stream's silence is `0x80`, a *f32* stream's is `0x00`).
+        let summary = capture.stats().summary();
+        assert_eq!(summary.rejected, 0, "{summary:?}");
+        let facts = &summary.sources[0];
+        assert!(facts.detected_format.is_none(), "{facts:?}");
+        assert!(facts.last_rms.is_some_and(|rms| rms == [0.0, 0.0]), "{facts:?}");
         capture.stop_all();
     }
 }
+

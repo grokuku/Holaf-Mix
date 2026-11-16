@@ -336,6 +336,15 @@ pub struct RecorderProbe {
     /// `XDG_RUNTIME_DIR` (where the default socket lives), then
     /// `PIPEWIRE_RUNTIME_DIR` when it is set.
     pub runtime_dir: Option<String>,
+    /// Does the recorder accept `--raw` (the flag that stops PipeWire 1.4+ from
+    /// wrapping samples in a libsndfile `.au` container)?
+    ///
+    /// `None` when it could not be probed (no binary to ask).  `Some(false)` on
+    /// a `pw-cat` older than 1.4 is *fine*: those versions already write raw
+    /// samples to `-`.  The point of printing it is that the fix for “the
+    /// recorder writes s16le” is exactly this flag, so a report must show whether
+    /// it was used.
+    pub raw: Option<bool>,
 }
 
 impl RecorderProbe {
@@ -364,6 +373,15 @@ impl RecorderProbe {
                 None => "unset".to_string(),
             }
         ));
+        // Whether `--raw` is driven: the one flag that stops PipeWire 1.4+ from
+        // wrapping the samples in a libsndfile container (the “VU à zéro” cause
+        // on 1.6).  Printed even when `false` (a pre-1.4 `pw-cat` already writes
+        // raw samples, so `false` there is not a problem — only a fact).
+        match self.raw {
+            Some(true) => line.push_str(" — raw mode: yes"),
+            Some(false) => line.push_str(" — raw mode: no (--raw not offered)"),
+            None => line.push_str(" — raw mode: not probed"),
+        }
         line
     }
 
@@ -510,6 +528,13 @@ pub struct CaptureFacts {
     pub stderr_tail: Vec<String>,
     /// Best-effort guess at the real byte format, when its blocks were refused.
     pub format_guess: Option<String>,
+    /// The sample format the capture **detected and converted** from.
+    ///
+    /// `None` while the stream is the nominal `f32le` (nothing to say).
+    /// `Some("s16le")` means the recorder wrote s16le despite `--format f32` and
+    /// every block is being converted — the VU works, and the report says why the
+    /// bytes are not f32le (the “VU à zéro” report on PipeWire 1.6).
+    pub detected_format: Option<String>,
 }
 
 impl CaptureFacts {
@@ -548,6 +573,9 @@ impl CaptureFacts {
         }
         if let Some(guess) = &self.format_guess {
             line.push_str(&format!(" — the bytes look like {guess}"));
+        }
+        if let Some(detected) = &self.detected_format {
+            line.push_str(&format!(" · detected {detected} and converted"));
         }
         line
     }
@@ -712,6 +740,7 @@ impl CaptureRegistry {
                     since_last_block: None,
                     stderr_tail: Vec::new(),
                     format_guess: None,
+                    detected_format: None,
                 },
                 last_block_at: None,
             },
@@ -754,6 +783,7 @@ impl CaptureRegistry {
                     since_last_block: None,
                     stderr_tail: Vec::new(),
                     format_guess: None,
+                    detected_format: None,
                 },
                 last_block_at: None,
             },
@@ -789,6 +819,35 @@ impl CaptureRegistry {
             entry.facts.rejected += 1;
             if format_guess.is_some() {
                 entry.facts.format_guess = format_guess;
+            }
+        }
+    }
+
+    /// The first block showed the recorder writes another sample format than
+    /// `f32le`, and every block is being **converted** from it: the VU works.
+    ///
+    /// This is the opposite of [`Self::reject`]: nothing is dropped, so it is
+    /// recorded *without* counting a rejection (the bar is fed).  `peak` is the
+    /// converted peak, kept so a bug report shows the detection was sound.
+    pub fn format_detected(&self, uid: &str, format: &str, peak: f32) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            entry.facts.detected_format = Some(format.to_string());
+            entry.facts.format_guess = Some(format!("{format} (peak {peak:.3})"));
+        }
+    }
+
+    /// The detected format stopped explaining the stream (a format change
+    /// mid-way): the reader will redetect on the next block.
+    pub fn format_changed(&self, uid: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = inner.sources.get_mut(uid) {
+            if let Some(detected) = entry.facts.detected_format.take() {
+                entry.facts.format_guess = Some(format!("{detected} (changed mid-stream)"));
             }
         }
     }
@@ -1512,6 +1571,11 @@ impl Report {
 
         // A block whose f32 reading is impossible is a **format** mismatch, not
         // silence: name the format the bytes really look like.
+        //
+        // Note: a detected-and-converted stream does NOT land here (nothing is
+        // dropped) — it shows as `detected <fmt> and converted` in the CAPTURES
+        // section (`CaptureFacts::detected_format`).  This finding is now only
+        // the *residual* case: bytes no known sample format explains.
         let implausible = captures.rejects_of(RejectReason::Implausible);
         if implausible > 0 {
             let guess = captures
@@ -1520,7 +1584,7 @@ impl Report {
                 .find_map(|facts| facts.format_guess.clone());
             let mut message = format!(
                 "{implausible} metering block(s) were dropped as impossible (peak above +{:.0} \
-                 dBFS): `{}` is not writing f32le to stdout",
+                 dBFS): no known sample format explains what `{}` wrote to stdout",
                 crate::meters::amplitude_to_db(crate::meters::IMPLAUSIBLE_PEAK),
                 self.recorder.command
             );
@@ -1529,9 +1593,11 @@ impl Report {
             }
             findings.push(
                 Finding::new("metering_implausible", Severity::Error, message).with_hint(
-                    "the bars stay dark instead of pinning at full scale (that was the honest \
-                     choice); run the recorder by hand and check the sample format it really \
-                     writes — or set the recorder to a wrapper that emits f32le",
+                    "a plausible sample format (s16le/s32le/f64le) is converted automatically, so \
+                     this is bytes that are neither audio nor a format pw-cat writes — a container \
+                     header (a WAV/.au header is counted as “partial” blocks, not here); run the \
+                     recorder by hand and check what it really writes, or set the recorder to a \
+                     wrapper that emits f32le",
                 ),
             );
         }
@@ -2328,6 +2394,11 @@ pub fn recorder_probe() -> RecorderProbe {
         .unwrap_or_else(|| DEFAULT_RECORDER.to_string());
     let path = resolve_in_path(&command);
     let version = path.as_ref().and_then(|_| recorder_version(&command));
+    // Only ask a binary that exists: probing a missing `pw-cat` would just print
+    // the same ENOENT the spawn already reports.
+    let raw = path
+        .is_some()
+        .then(|| crate::capture::recorder_supports_raw(&command));
     RecorderProbe {
         env_override,
         command,
@@ -2347,6 +2418,7 @@ pub fn recorder_probe() -> RecorderProbe {
                     .ok()
                     .filter(|value| !value.trim().is_empty())
             }),
+        raw,
     }
 }
 
@@ -2356,15 +2428,37 @@ pub fn recorder_probe() -> RecorderProbe {
 /// (“pw-cat”, “Compiled with libpipewire 0.3.65”, “Linked with libpipewire
 /// 0.3.65”), so the *last line carrying a number* is the informative one — the
 /// first line alone would only repeat the command name.
+///
+/// The probe is **bounded and cached**: a recorder that is a shell wrapper (the
+/// documented workaround for a `pw-cat` writing the wrong sample format) ignores
+/// `--version` and starts recording, so an unbounded wait froze the report for
+/// minutes (measured).  Once a command has answered, the answer is reused — the
+/// report is rebuilt often, a child spawn per rebuild would not do.
 fn recorder_version(command: &str) -> Option<String> {
-    let output = std::process::Command::new(command)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(answer) = guard.get(command) {
+            return answer.clone();
+        }
+    }
+    let answer = probe_version(command);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(command.to_string(), answer.clone());
+    }
+    answer
+}
+
+/// How long `<recorder> --version` is given to answer ([`recorder_version`]).
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn probe_version(command: &str) -> Option<String> {
+    let output = crate::capture::recorder_probe_output(command, "--version", VERSION_PROBE_TIMEOUT)?;
+    if !output.success {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout;
     let lines: Vec<&str> = stdout
         .lines()
         .map(str::trim)
@@ -2616,6 +2710,7 @@ mod tests {
             since_last_block: (blocks > 0).then(|| std::time::Duration::from_millis(20)),
             stderr_tail: Vec::new(),
             format_guess: None,
+            detected_format: None,
         }
     }
 
@@ -2759,10 +2854,23 @@ mod tests {
         assert!(finding.message.contains("210 metering block(s)"), "{}", finding.message);
         assert!(finding.message.contains("+40 dBFS"), "{}", finding.message);
         assert!(finding.message.contains("s16le"), "{}", finding.message);
+        // The message says the bytes are *unexplainable*, not “not f32le”: a
+        // plausible format (s16le/s32le/f64le) is now detected and converted, so
+        // this finding is the residual case (a container header, no format at
+        // all) — and the hint explains that a real sample format would have been
+        // handled automatically.
         assert!(
-            finding.message.contains("not writing f32le"),
+            finding.message.contains("no known sample format explains"),
             "{}",
             finding.message
+        );
+        assert!(
+            finding
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("converted automatically")),
+            "{:?}",
+            finding.hint
         );
         // It does not claim the chain is dead: blocks *are* arriving.
         assert!(
@@ -3112,6 +3220,54 @@ mod tests {
             .stderr_tail;
         assert_eq!(tail.len(), STDERR_TAIL);
         assert_eq!(tail.last().map(String::as_str), Some("line 8"));
+    }
+
+    /// **The report must never wait on the recorder.**  A recorder that is a
+    /// shell wrapper (the documented workaround for a `pw-cat` writing the wrong
+    /// sample format — and every test stand-in) ignores the options it does not
+    /// know and starts recording: `Command::output()` then never returns, and
+    /// the diagnostic report froze for minutes (measured while capturing with
+    /// such a wrapper).  Both probes are bounded.
+    #[test]
+    fn a_recorder_that_never_answers_a_probe_cannot_hang_the_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "holaf-recorder-hang-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("recorder.sh");
+        // A wrapper that only knows `--help` and records for ever otherwise —
+        // exactly what a `pw-cat` stand-in looks like.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = --help ] && { echo '  -a, --raw   RAW mode'; exit 0; }; done\nsleep 60\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let command = script.to_string_lossy().into_owned();
+
+        let started = std::time::Instant::now();
+        // `--version` is not answered: the probe gives up (None) instead of
+        // waiting for the `sleep 60`.
+        assert_eq!(recorder_version(&command), None);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < VERSION_PROBE_TIMEOUT * 3,
+            "the version probe must be bounded, took {elapsed:?}"
+        );
+        // The bounded helper also reports a *successful* answer, so a healthy
+        // recorder keeps naming its version.
+        let answered = crate::capture::recorder_probe_output(
+            &command,
+            "--help",
+            VERSION_PROBE_TIMEOUT,
+        )
+        .expect("an answer within the bound");
+        assert!(answered.success, "{answered:?}");
+        assert!(answered.text().contains("--raw"), "{answered:?}");
     }
 
     /// The recorder probe must never panic and must answer the two questions a

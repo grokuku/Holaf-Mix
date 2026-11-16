@@ -107,6 +107,37 @@ fn report_for(capture: &MeterCapture, uid: &str, source: &str) -> Report {
     })
 }
 
+/// Like [`report_for`], but with the **live** level the board is drawing (so the
+/// report's METERING section and the `metering_silent` finding reflect the real
+/// bars, not a hard-coded zero).  Used by the conversion case, whose whole point
+/// is that the bar moves.
+fn report_for_live_level(capture: &MeterCapture, uid: &str, source: &str, level: [f32; 2]) -> Report {
+    let strips = strips();
+    let levels = vec![
+        ("in-mic".to_string(), "Mic".to_string(), level),
+        ("out-casque".to_string(), "Casque".to_string(), [0.0, 0.0]),
+    ];
+    let status = status();
+    let captures = capture.stats().summary();
+    let sources: HashMap<String, String> = [(uid.to_string(), source.to_string())]
+        .into_iter()
+        .collect();
+    Report::collect(&Inputs {
+        status: Some(&status),
+        status_error: None,
+        devices: &[],
+        meter_sources: &sources,
+        strips: &strips,
+        missing_devices: &[],
+        meter_missing: &[],
+        meter_levels: &levels,
+        captures: Some(&captures),
+        config_path: None,
+        now_unix: 1_700_000_000,
+        daemon_pids: Some(Vec::new()),
+    })
+}
+
 /// Start one capture and wait until `ready` holds (bounded: a hung child must
 /// fail the test, not hang it).
 fn capture_until(
@@ -180,20 +211,89 @@ fn a_missing_recorder_is_described_by_the_report() {
     );
 }
 
-/// **Case B — the recorder writes something that is not f32le.**  Every block is
-/// refused (it would pin the bar at 1.0), so the report must say *which* format
-/// the bytes look like — the difference between “your VUs are broken” and “your
-/// pw-cat writes s16le”.
+/// **Case B — the recorder writes s16le (PipeWire 1.6, no `--raw`).**  The
+/// reader detects the format from the bytes and **converts** every block, so the
+/// VU works — and the report must say *which* format it detected and converted,
+/// not that blocks were dropped (the user's report: “all levels 0.000” on a
+/// machine whose pw-cat wrote s16le despite `--format f32`).
 #[test]
-fn a_stream_in_the_wrong_format_is_described_by_the_report() {
-    // s16le stereo audio read as f32: 0xCC0C34F3 is −1.6e31 as a float, i.e.
-    // the peak of the “impossible” block.
+fn an_s16le_stream_is_detected_converted_and_described_by_the_report() {
+    // A −20 dBFS sine, encoded as interleaved s16le (what a pw-cat that ignores
+    // `--format f32` writes).  10 ms of stereo at 2 B/sample = 1920 bytes.
     let mut payload = Vec::new();
-    for _ in 0..480 * 2 {
-        payload.extend_from_slice(&[0xF3, 0x34, 0x0C, 0xCC]);
+    for n in 0..480 {
+        let sample = 0.1 * (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin();
+        let value = (sample * 32_767.0) as i16;
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
     }
     let board = MeterBoard::new();
-    let mut capture = MeterCapture::with_recorder(recorder_repeating("misread", &payload));
+    let mut capture = MeterCapture::with_recorder(recorder_repeating("s16", &payload));
+    let uid = "in-mic";
+    let source = "Holaf_Bus_Mic.monitor";
+    // Wait until the format is detected and blocks are drawn.
+    capture_until(&mut capture, &board, uid, source, |capture| {
+        capture
+            .stats()
+            .summary()
+            .sources
+            .first()
+            .is_some_and(|facts| facts.blocks > 0 && facts.detected_format.is_some())
+    });
+    let level = board.read(uid).unwrap_or([0.0, 0.0]);
+    let report = report_for_live_level(&capture, uid, source, level);
+    let text = report.text();
+    capture.stop_all();
+
+    // The report names the detected format and says it was converted.
+    assert!(
+        text.contains("detected s16le and converted"),
+        "the CAPTURES section must say what it detected:\n{text}"
+    );
+    assert!(text.contains("s16le"), "{text}");
+    // Nothing was refused: a convertible stream is not a failure any more.
+    assert!(
+        !text.contains("implausible"),
+        "a converted stream has no rejected blocks:\n{text}"
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|finding| finding.id == "metering_implausible"),
+        "no metering_implausible for a converted stream:\n{text}"
+    );
+    // …and the VU actually moves (the whole point): a −20 dBFS sine ≈ 0.56.
+    assert!(
+        (level[0] - 0.56).abs() < 0.05,
+        "the converted stream must feed the bar (level {level:?}):\n{text}"
+    );
+    // The report's METERING section shows the converted level on Mic (the only
+    // captured strip; Casque has no capture, so it legitimately reads 0.000).
+    assert!(text.contains("L=0.560 R=0.560"), "{text}");
+}
+
+/// **Case B′ — the same s16le stream, but read as *denormals*.**  This is the
+/// shape the “VU à zéro” report really had: an s16 block whose `f32` reading is
+/// **not** implausible (measured peak 4.9e-30, RMS 1.4e-30 — the loudness guard
+/// never fires), so it used to be accepted as `f32le` and drawn at exactly
+/// 0.000.  The report must show the detected format *and* a non-zero level.
+#[test]
+fn a_denormal_s16le_stream_is_detected_converted_and_described_by_the_report() {
+    // A −20 dBFS-RMS tone as interleaved s16le whose samples all stay **positive**
+    // (a DC-offset sine): every high byte is ≤ 0x0F, so reading 4 bytes at a time
+    // yields denormals instead of huge values.
+    let offset = 0.0707_f32 / 1.5_f32.sqrt();
+    let mut payload = Vec::new();
+    for n in 0..480 {
+        let sample = offset
+            * (1.0 + (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin());
+        let value = (sample * 32_767.0) as i16;
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    let board = MeterBoard::new();
+    let mut capture = MeterCapture::with_recorder(recorder_repeating("s16-denormal", &payload));
     let uid = "in-mic";
     let source = "Holaf_Bus_Mic.monitor";
     capture_until(&mut capture, &board, uid, source, |capture| {
@@ -202,29 +302,38 @@ fn a_stream_in_the_wrong_format_is_described_by_the_report() {
             .summary()
             .sources
             .first()
-            .is_some_and(|facts| facts.rejected > 0)
+            .is_some_and(|facts| facts.blocks > 0 && facts.detected_format.is_some())
     });
-    let report = report_for(&capture, uid, source);
+    let level = board.read(uid).unwrap_or([0.0, 0.0]);
+    let summary = capture.stats().summary();
+    let report = report_for_live_level(&capture, uid, source, level);
     let text = report.text();
+    if std::env::var_os("HOLAF_REPORT_DUMP").is_some() {
+        eprintln!("{text}");
+    }
     capture.stop_all();
 
-    assert!(text.contains("rejected (1 implausible)") || text.contains("implausible"), "{text}");
-    let finding = report
-        .findings
-        .iter()
-        .find(|finding| finding.id == "metering_implausible")
-        .unwrap_or_else(|| panic!("no metering_implausible:\n{text}"));
-    assert_eq!(finding.severity, Severity::Error);
-    assert!(finding.message.contains("not writing f32le"), "{finding:?}");
-    assert!(finding.message.contains("s16le"), "{finding:?}");
-    // The bars stay dark *and* the chain is not called dead: data does arrive.
-    assert!(text.contains("L=0.000 R=0.000"), "{text}");
     assert!(
-        !report
-            .findings
-            .iter()
-            .any(|finding| finding.id == "metering_dead"),
-        "a refused block is not a dead chain:\n{text}"
+        text.contains("detected s16le and converted"),
+        "the CAPTURES section must say what it detected:\n{text}"
+    );
+    // The RMS is the converted one (−20 dBFS ≈ 0.0707), not the 1e-30 of the
+    // misread — this is what tells “converted” from “read as silence”.
+    let rms = summary.sources[0].last_rms.unwrap_or_default();
+    assert!(
+        (rms[0] - 0.0707).abs() < 5e-3,
+        "the report must carry the converted RMS, got {rms:?}\n{text}"
+    );
+    assert_eq!(summary.rejected, 0, "nothing is refused: {summary:?}");
+    // …and the VU moves: the very symptom was “L=0.000 R=0.000”.
+    assert!(
+        text.contains("L=0.560 R=0.560"),
+        "the METERING section must show the converted level:\n{text}"
+    );
+    assert!(
+        !report.findings.iter().any(|finding| finding.id == "metering_implausible"
+            || finding.id == "metering_silent"),
+        "no failure finding for a working stream:\n{text}"
     );
 }
 
