@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
-use holaf_core::model::{EffectKey, Strip, StripType};
+use holaf_core::model::{pulse_linear_gain, EffectKey, Strip, StripType};
 
 use crate::apps::{self, AppList, AppSelection};
 use crate::bridge::{EngineBridge, EngineCommand, EngineEvent};
@@ -51,7 +51,7 @@ use crate::devices::{self, DevicePresence};
 use crate::diagnostics::{DiagnosticsState, Inputs, Report};
 use crate::dialogs::{AddStripDialog, DeleteConfirm, DevicePicker, FxSettings};
 use crate::engine_json::DeviceInfo;
-use crate::meters::{Envelope, MeterBoard, METER_INTERVAL};
+use crate::meters::{attenuate_level, Envelope, MeterBoard, METER_INTERVAL};
 use crate::midi::{Binding, MidiMap, MidiMessage, MidiOutcome, MidiTarget};
 use crate::theme::images::ImageCache;
 use crate::theme::resolve::{resolve, ResolvedStripStyle, StripDescriptor};
@@ -784,6 +784,16 @@ impl AppState {
 
     /// Current `[left, right]` levels of the strip at `index`, mono-collapsed
     /// like `StripWidget.update_vumeter`.
+    ///
+    /// The captured level is already **post-fader for a virtual strip**: the
+    /// engine writes `Props.monitorVolumes` on the strip's bus, so a tone into a
+    /// bus reads `pulse_linear_gain(volume)` of what it read at unity (measured:
+    /// 0.3535 → 0.0096 at volume 0.3).  A **physical** strip is the exception: it
+    /// records the *device* source or monitor, which is tapped before the strip's
+    /// fader, so the fader is applied here
+    /// ([`AppState::fader_compensation`]) — otherwise the bar ignores the fader
+    /// altogether, which is exactly the reported “quel que soit le volume de la
+    /// sortie, le vu-mètre est toujours à la même hauteur”.
     pub fn levels_for(&self, index: usize) -> [f32; 2] {
         let Some(strip) = self.strips.get(index) else {
             return [0.0, 0.0];
@@ -799,6 +809,37 @@ impl AppState {
         } else {
             levels
         }
+    }
+
+    /// The linear gain the capture of `strip` is missing, i.e. the strip fader
+    /// that sits **after** the tap.
+    ///
+    /// * virtual strip (no device): the capture is its own bus monitor, which the
+    ///   engine already scales through `Props.monitorVolumes` → unity here;
+    /// * physical strip: the capture is the device's source/monitor, tapped
+    ///   before the fader → `pulse_linear_gain(volume)`, the same cubic curve the
+    ///   engine pushes to the node (so the bar follows the fader exactly like the
+    ///   sound does).
+    ///
+    /// Applying it twice is the only risk, and it is measurable: if a future
+    /// engine ever makes a *device* monitor honour `monitorVolumes`, the bar would
+    /// read `gain²` — the diagnostic report prints the factor it applied
+    /// (`VU gain`), so that shows up as a single wrong number instead of a
+    /// mystery.
+    pub fn fader_compensation(&self, strip: &Strip) -> f32 {
+        match strip.device_name.as_deref().filter(|name| !name.is_empty()) {
+            Some(_) => pulse_linear_gain(strip.volume),
+            None => 1.0,
+        }
+    }
+
+    /// Apply [`Self::fader_compensation`] to a `[left, right]` level.
+    fn post_fader(&self, strip: &Strip, levels: [f32; 2]) -> [f32; 2] {
+        let gain = self.fader_compensation(strip);
+        [
+            attenuate_level(levels[0], gain),
+            attenuate_level(levels[1], gain),
+        ]
     }
 
     /// Feed real meter values (from the engine bridge or the Python side).
@@ -1651,10 +1692,15 @@ impl AppState {
                     // The envelope takes `dt` into account, so a 60 fps repaint
                     // decays exactly like a 25 Hz one.
                     //
-                    // The level is used **as captured**: the capture is already
-                    // post-fader (the engine writes `Props.monitorVolumes` with
-                    // the strip volume — measured, see `crate::meters`), so
-                    // multiplying by the volume here would attenuate twice.
+                    // The level itself is used **as captured** for a virtual
+                    // strip (the capture is already post-fader: the engine writes
+                    // `Props.monitorVolumes` with the strip volume — measured, see
+                    // `crate::meters`), so multiplying it by the volume again
+                    // would attenuate twice.  A **physical** strip's capture is
+                    // the device tap, which sits *before* the fader, so its fader
+                    // is applied here (`post_fader`) — that is what makes the bar
+                    // move when the fader does.
+                    let levels = self.post_fader(&self.strips[index], levels);
                     self.feed_levels(&uid, levels, dt);
                 }
                 None => {
@@ -2095,6 +2141,15 @@ impl AppState {
                 )
             })
             .collect();
+        // Which strips' captures are tapped before their fader (see
+        // `fader_compensation`): the report prints the factor, so a VU that
+        // ignores the fader and a VU attenuated twice can be told apart.
+        let vu_gains: Vec<(String, f32)> = self
+            .strips
+            .iter()
+            .map(|strip| (strip.uid.clone(), self.fader_compensation(strip)))
+            .filter(|(_, gain)| (gain - 1.0).abs() > f32::EPSILON)
+            .collect();
         let sources: HashMap<String, String> = HashMap::new();
         let config_path = self
             .config
@@ -2119,6 +2174,7 @@ impl AppState {
             missing_devices: &missing_devices,
             meter_missing: &meter_missing,
             meter_levels: &meter_levels,
+            vu_gains: &vu_gains,
             captures: captures.as_ref(),
             config_path: config_path.as_deref(),
             now_unix: crate::diagnostics::now_unix(),
@@ -3575,12 +3631,21 @@ mod tests {
         });
         // The mock reports levels through `Levels` events.
         assert!(wait_for_engine(&mut s, |state| state.levels_for(0)[0] > 0.5));
-        // Then silence: the envelope pulls the bar down by 15 % per tick.
+        // Then silence: the envelope releases with a 350 ms time constant, so one
+        // 40 ms tick keeps exp(-40/350) = 89 % of the level.
         let high = s.levels_for(0)[0];
         s.poll_engine_at(start + Duration::from_millis(40));
         let after = s.levels_for(0)[0];
         assert!(after < high, "{after} must decay from {high}");
-        assert!((after - high * 0.85).abs() < 0.1, "{after} vs {high}");
+        // A late `Levels` event from the mock can refresh the level between the
+        // two reads, so the check is a band rather than an equality: one tick must
+        // keep ~89 % of the value, never 85 % (the old per-frame rule) nor the
+        // full level.
+        let expected = high * (-40.0_f32 / 350.0).exp();
+        assert!(
+            after <= high && after > high * 0.85,
+            "{after} must be one 350 ms-release tick below {high} (~{expected})"
+        );
     }
 
     #[test]
@@ -3674,9 +3739,10 @@ mod tests {
             description: None,
         }];
         assert_eq!(s.device_presence(&hp_uid), DevicePresence::Missing);
-        // The capture of the default source publishes a hot level for it.
+        // The capture of the default source publishes a hot level for it
+        // (0 dBFS — the top of the *usable* scale, since 1.0 is +6 dBFS).
         let slots = board.assign(std::slice::from_ref(&hp_uid));
-        board.publish(slots[&hp_uid], [1.0, 1.0]);
+        board.publish(slots[&hp_uid], [crate::meters::level_from_amplitude(1.0); 2]);
         let now = Instant::now();
         for tick in 0..200 {
             s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
@@ -3697,8 +3763,86 @@ mod tests {
         }];
         assert_eq!(s.device_presence(&hp_uid), DevicePresence::Found);
         s.feed_from_board(&board, now + METER_INTERVAL * 41, METER_INTERVAL);
-        assert!(s.levels_for(hp)[0] > 0.9, "{:?}", s.levels_for(hp));
+        // Post-fader: the device tap is **pre**-fader, so the strip's fader is
+        // applied to the captured level (HP is at 0.55 → gain 0.166 → 0 dBFS
+        // reads −15.6 dBFS = 0.673 on the bar).  A bar that ignored the fader
+        // was the second half of the report: “quel que soit le volume de la
+        // sortie, le vu-mètre est toujours à la même hauteur”.
+        let expected = crate::meters::attenuate_level(
+            crate::meters::level_from_amplitude(1.0),
+            pulse_linear_gain(s.strips[hp].volume),
+        );
+        assert!(
+            (s.levels_for(hp)[0] - expected).abs() < 1e-5,
+            "{:?} vs {expected}",
+            s.levels_for(hp)
+        );
         assert!(!s.meter_missing.contains(&hp_uid));
+    }
+
+    /// **The VU follows the fader.**  A physical strip's capture is the *device*
+    /// tap, which sits before the strip fader (measured on real hardware: fader at
+    /// 30 %, monitor RMS 0.51 — the VU never moved).  The fader is therefore
+    /// applied to the captured level, on the amplitude scale with PulseAudio's
+    /// cubic curve, so fader 1.0 → 0.3 attenuates by −31 dB (a ratio of 0.027),
+    /// never “30 % of the bar”.  A **virtual** strip needs nothing: its own bus
+    /// monitor is already post-fader (the engine writes `Props.monitorVolumes`),
+    /// and applying the fader again would attenuate twice.
+    #[test]
+    fn the_vu_of_a_physical_strip_follows_the_fader_and_a_virtual_one_does_not() {
+        let mut s = state();
+        let board = MeterBoard::new();
+        let casque = s.strip_index("out-casque").expect("physical output");
+        let mix = s.strip_index("out-mix").expect("virtual output");
+        assert!(s.strips[casque].device_name.is_some());
+        assert!(s.strips[mix].device_name.is_none());
+        let casque_uid = s.strips[casque].uid.clone();
+        let mix_uid = s.strips[mix].uid.clone();
+        let slots = board.assign(&[casque_uid.clone(), mix_uid.clone()]);
+        // The same captured level (−6 dBFS) on both strips' captures.
+        let captured = [crate::meters::level_from_amplitude(0.5); 2];
+        board.publish(slots[&casque_uid], captured);
+        board.publish(slots[&mix_uid], captured);
+        let now = Instant::now();
+        // Fader at 1.0: the bar shows the captured level as is.
+        s.strips[casque].volume = 1.0;
+        s.feed_from_board(&board, now, METER_INTERVAL);
+        assert!((s.levels_for(casque)[0] - captured[0]).abs() < 1e-5);
+        assert!((s.levels_for(mix)[0] - captured[0]).abs() < 1e-5);
+        // Fader at 0.3: the physical bar drops by 31.4 dB, the virtual one does
+        // not move (its capture is already scaled by the engine).
+        s.strips[casque].volume = 0.3;
+        let gain = pulse_linear_gain(0.3);
+        assert!((gain - 0.027).abs() < 1e-3, "{gain}");
+        // The release envelope takes ~1 s to follow the drop (350 ms constant),
+        // so the bar is read after it has settled.
+        for tick in 1..60 {
+            s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
+        }
+        let expected = crate::meters::attenuate_level(captured[0], gain);
+        assert!(
+            (s.levels_for(casque)[0] - expected).abs() < 1e-4,
+            "fader 0.3 must scale the physical VU: {:?} vs {expected}",
+            s.levels_for(casque)
+        );
+        assert!(
+            expected < captured[0] - 0.3,
+            "a −31 dB move has to be visible: {expected} vs {}",
+            captured[0]
+        );
+        assert!((s.levels_for(mix)[0] - captured[0]).abs() < 1e-5);
+        // Fader at 0 is silence, whatever the device monitor still carries.
+        s.strips[casque].volume = 0.0;
+        for tick in 200..300 {
+            s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
+        }
+        // The release is exponential, so the bar approaches zero rather than
+        // snapping: 100 ticks (4 s) leaves it visually dark.
+        assert!(
+            s.levels_for(casque)[0] < 1e-5,
+            "a fader at zero is a dark bar: {:?}",
+            s.levels_for(casque)
+        );
     }
 
     #[test]

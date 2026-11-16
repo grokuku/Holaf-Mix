@@ -440,6 +440,10 @@ Debian 12 notes (checked with `apt-cache policy` / `dpkg -S`):
   `swh-plugins` for gate/mbeq/sc4 and build the rnnoise LADSPA plugin yourself.
 * The `rustc` in bookworm (1.63) is far below the workspace MSRV (1.98): use
   `rustup`.
+* bookworm's own `pipewire` is **0.3.65**, while the supported targets run 1.x
+  (`pw-cat --raw`, the PulseAudio-compatible server, the `Props` rules…).  For a
+  *development* container, take PipeWire from `bookworm-backports` so the tests
+  exercise what users actually run — full recipe and rationale in §5.5.
 
 ### 5.2 Build the icons
 
@@ -485,6 +489,75 @@ ln -s "$PWD/dist/holaf-ui" ~/.local/bin/holaf-ui
 
 Same runtime dependencies as §1.4/§1.3 and the same config resolution as §2
 (from the repo root, the repo's own `config.json` is used).
+
+### 5.5 Dev container: align PipeWire with the target (bookworm-backports)
+
+A plain **Debian 12** container ships **PipeWire 0.3.65**, while the supported
+targets run **1.x** (Arch: 1.6.x; CI: the Arch `pipewire` package).  Testing
+against 0.3.65 validated code that then broke on the real machine — `pw-cat
+--raw` does not exist there, `pw-cat … -` behaves differently, and the `Props`
+read-back follows other rules.  Take PipeWire from **bookworm-backports**, which
+is the same 1.4.x built *for* bookworm (glibc 2.36, no `t64` rename, no
+`libc6`/`systemd` upgrade):
+
+```bash
+cat > /etc/apt/sources.list.d/bookworm-backports.sources <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: bookworm-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+apt-get update
+apt-get install -y -t bookworm-backports \
+    pipewire pipewire-bin pipewire-pulse \
+    libpipewire-0.3-0 libpipewire-0.3-dev libpipewire-0.3-modules \
+    libspa-0.2-modules libspa-0.2-dev wireplumber
+```
+
+The upgrade touches **15 packages** (10 of them from backports) and *no* core
+package — `libc6`, `systemd`, `util-linux` and `python3` are left alone.  Check
+it did not snowball with:
+
+```bash
+apt-get install -s -t bookworm-backports pipewire wireplumber | grep -c '^Inst'   # 15
+pkg-config --modversion libpipewire-0.3     # 1.4.2
+pw-cat --version                             # Compiled/Linked with libpipewire 1.4.2
+pw-cat --help | grep -- --raw                # -a, --raw   RAW mode
+```
+
+Do **not** add `trixie` (Debian 13) with a low pin: resolving `pipewire 1.4.2`
+from trixie drags in the `t64` transition and wants to upgrade **129** packages
+including `libc6`, `systemd` (252 → 257) and to *remove* `libssl3`.  Backports
+has the same PipeWire without any of that.  Compiling 1.6 from source
+(meson into `/opt`) also works but is a 30-minute build with a second
+`libpipewire` on `LD_LIBRARY_PATH` — only worth it if you need ≥ 1.5.
+
+#### The headless bench
+
+`scripts/start-pipewire-headless.sh` starts a throwaway `dbus-daemon` +
+`pipewire` + `wireplumber` (no `pipewire-pulse` — start it yourself when a test
+needs `pactl`) in `/tmp/pw-runtime-holaf`:
+
+```bash
+./scripts/start-pipewire-headless.sh restart
+eval "$(./scripts/start-pipewire-headless.sh --export)"
+cargo test --workspace                  # 669 passed, 0 failed (live tests included)
+./scripts/start-pipewire-headless.sh stop
+```
+
+It prints the PipeWire/wireplumber versions it is about to use, and warns when
+they are older than 1.0 (i.e. `pw-cat --raw` absent → the VU capture path is
+exercising a code path no user has).
+
+> **PipeWire ≥ 1.4 and `Props` read-back.**  A bus that never negotiated a
+> format (a virtual strip with nothing playing) does not publish `Props`
+> changes, so the daemon's per-node param cache keeps serving the
+> construction-time `channelVolumes 1.0` even though the engine wrote the real
+> gain — the audio is correct, only the *report* lies.  `Engine::create_null_sink`
+> therefore sets `node.cache-params=false` on our buses.  Keep it: every live
+> test that pins the volume/monitor contract reads those props with
+> `pw-cli enum-params`.
 
 ---
 

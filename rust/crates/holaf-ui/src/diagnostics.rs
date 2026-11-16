@@ -971,6 +971,16 @@ pub struct Report {
     /// cannot be told apart from “the levels never arrive”.  It is the *drawn*
     /// value — envelope included — so it is exactly what is on screen.
     pub meter_levels: Vec<(String, String, [f32; 2])>,
+    /// `(uid, linear gain)` applied to a capture that is tapped **before** the
+    /// strip's fader (a physical device's source/monitor), printed in the
+    /// METERING section.
+    ///
+    /// It exists so “my VU ignores the fader” and “my VU is far too quiet” can
+    /// both be diagnosed from a pasted report: a `×0.027` next to a strip at
+    /// volume 0.3 is the post-fader correction working, and a missing gain on a
+    /// strip that *should* have one names the strip the UI treated as a virtual
+    /// bus.
+    pub vu_gains: Vec<(String, f32)>,
     /// The capture children themselves: source, pid, state, blocks, rejects,
     /// last level and what `pw-cat` said on stderr (see [`CaptureSummary`]).
     pub captures: CaptureSummary,
@@ -1056,6 +1066,10 @@ pub struct Inputs<'a> {
     /// `(uid, label, [left, right])` the VU bars currently draw (see
     /// [`Report::meter_levels`]).
     pub meter_levels: &'a [(String, String, [f32; 2])],
+    /// `(uid, linear gain)` the UI multiplies a **pre-fader** capture by (see
+    /// [`Report::vu_gains`]).  Only strips whose fader sits after the capture
+    /// tap appear here.
+    pub vu_gains: &'a [(String, f32)],
     /// The capture children's own status (`None` = no capture instrumentation:
     /// a mock build, or no real engine attached).
     pub captures: Option<&'a CaptureSummary>,
@@ -1078,6 +1092,7 @@ impl<'a> Inputs<'a> {
             missing_devices: &[],
             meter_missing: &[],
             meter_levels: &[],
+            vu_gains: &[],
             captures: None,
             config_path: None,
             now_unix: 0,
@@ -1101,6 +1116,7 @@ impl Report {
             missing_devices: inputs.missing_devices.to_vec(),
             meter_missing: inputs.meter_missing.to_vec(),
             meter_levels: inputs.meter_levels.to_vec(),
+            vu_gains: inputs.vu_gains.to_vec(),
             captures: inputs.captures.cloned().unwrap_or_default(),
             captures_instrumented: inputs.captures.is_some(),
             recorder: recorder_probe(),
@@ -1921,8 +1937,22 @@ impl Report {
                 } else {
                     ""
                 };
+                // A pre-fader capture (a physical strip's device tap) is scaled
+                // by the strip's fader before it is drawn: say so, otherwise a
+                // bar that does not match the raw monitor looks like a bug.
+                let gain = self
+                    .vu_gains
+                    .iter()
+                    .find(|(gain_uid, _)| gain_uid == uid)
+                    .map(|(_, gain)| *gain)
+                    .unwrap_or(1.0);
+                let fader = if (gain - 1.0).abs() > f32::EPSILON {
+                    format!("  (post-fader x{gain:.3})")
+                } else {
+                    String::new()
+                };
                 lines.push(format!(
-                    "    - {:<24} L={left:.3} R={right:.3}{source}",
+                    "    - {:<24} L={left:.3} R={right:.3}{source}{fader}",
                     label
                 ));
             }
@@ -2674,6 +2704,30 @@ mod tests {
         );
         // The scale is spelled out, so a reader can tell 0.73 from “full”.
         assert!(text.contains("0 dBFS -> 0.91"), "{text}");
+        // A **pre-fader** capture (a physical strip's device tap) is scaled by
+        // the strip's fader before it is drawn; the report prints the factor so
+        // “my VU ignores the fader” and “my VU is far too quiet” are
+        // distinguishable — and a strip with no factor is visibly a virtual one.
+        let report = Report::collect(&Inputs {
+            status: Some(&status),
+            strips: &strips,
+            meter_levels: &levels,
+            vu_gains: &[("in-mic".to_string(), 0.614_125_f32)],
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        let text = report.text();
+        assert!(
+            text.contains("L=0.301 R=0.299") && text.contains("(post-fader x0.614)"),
+            "{text}"
+        );
+        // …and the strip without a gain shows none.
+        let casque_lines = text
+            .lines()
+            .filter(|line| line.contains("Casque"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!casque_lines.contains("post-fader"), "{casque_lines}");
 
         // A report with no strips drawing anything says so (never an empty
         // heading that reads like a truncated report).

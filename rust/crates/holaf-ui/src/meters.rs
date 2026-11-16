@@ -10,12 +10,24 @@
 //!        ▼ raw f32le, 2 ch, 48 kHz
 //! block maths: rms + peak per channel     ← this module (pure, unit-tested)
 //!        ▼
+//! RmsWindow: RMS over the last 300 ms     ← the value a VU shows
+//!        ▼
 //! MeterBoard: Arc<[AtomicU32]>            ← the UI reads f32 bits, no lock
 //!        ▼ polled at 25 Hz by AppState::poll_engine
-//! decay envelope (level = max(new, prev × 0.85 per 40 ms))
+//! decay envelope (level = max(new, prev × exp(-dt / 350 ms)))
 //!        ▼
 //! VU bars ([`crate::widgets::fader`])
 //! ```
+//!
+//! Two properties of that chain are deliberate and user-visible:
+//!
+//! * the **bar shows a short-term RMS** ([`RMS_WINDOW`]), never a peak: a peak
+//!   follower on music sits at the loudest sample and reads “constant and too
+//!   high”, vibrating on every transient;
+//! * the **release is a real time constant** ([`RELEASE_TAU`]) applied to the
+//!   elapsed `dt`, so the bar falls at the same speed whatever the frame rate,
+//!   and a 10 % drop of the signal is visible immediately instead of being
+//!   averaged into a per-frame factor.
 //!
 //! The **level scale** is the one thing the port deliberately changed.
 //!
@@ -45,11 +57,17 @@
 //! | 0.00316 | −50 | 0.15 |
 //! | 0 | −∞ | 0.00 |
 //!
-//! The **capture is post-fader**, and that was measured rather than assumed: the
-//! engine writes `Props.monitorVolumes` together with `channelVolumes` on a
-//! strip's master node, and a tone played into a bus reads 0.3535 at volume 1.0,
-//! 0.0096 at 0.3 and 0.0004 at 0.1 — exactly `pulse_linear_gain(volume)` (the
-//! PulseAudio cubic curve).  A bare `adapter`/`null-audio-sink` whose
+//! The **capture of a virtual strip's bus is post-fader**, and that was measured
+//! rather than assumed: the engine writes `Props.monitorVolumes` together with
+//! `channelVolumes` on a strip's master node, and a tone played into a bus reads
+//! 0.3535 at volume 1.0, 0.0096 at 0.3 and 0.0004 at 0.1 — exactly
+//! `pulse_linear_gain(volume)` (the PulseAudio cubic curve).  A **physical**
+//! strip is different: its capture is the *device* source/monitor, which sits
+//! before the strip's fader (measured on real hardware: fader at 30 %, monitor
+//! RMS 0.51, i.e. a VU that never moves with the fader).  `AppState` therefore
+//! applies `pulse_linear_gain(volume)` to physical strips only — see
+//! [`crate::app::AppState::levels_for`] and [`attenuate_level`].  A bare
+//! `adapter`/`null-audio-sink` whose
 //! `monitor.channel-volumes` is left at its default is **pre**-fader (measured:
 //! identical RMS at every gain), which is why the engine sets `monitorVolumes`
 //! explicitly.  Turning `monitor.channel-volumes` on **as well** doubles the
@@ -68,13 +86,36 @@ use std::time::Duration;
 /// Meter refresh cadence: 40 ms = 25 Hz (`METER_POLL_INTERVAL_MS` in Qt).
 pub const METER_INTERVAL: Duration = Duration::from_millis(40);
 
-/// How much a level keeps after one [`METER_INTERVAL`] of silence
-/// (`level = max(new, prev * DECAY)`), so the bars slide down instead of
-/// snapping to zero.
-pub const DECAY_PER_INTERVAL: f32 = 0.85;
+/// Release time constant of the bar: after the signal stops, the displayed
+/// level falls to `1/e` (37 %) in this long, `level = prev * exp(-dt / τ)`.
+///
+/// `dt` is the **real** elapsed time between two measurements, so a 60 fps
+/// repaint falls exactly as fast as a 25 Hz one.  The old rule was a fixed
+/// factor per UI tick (`prev * 0.85` every 40 ms, i.e. τ = 246 ms), which made
+/// the fall depend on the frame rate *and* left the bar hanging at its last
+/// value for over a second after the sound stopped (“il descend, mais avec du
+/// lag”).  350 ms is the classic VU return time: fast enough to follow the
+/// music, slow enough not to blink on every gap.
+pub const RELEASE_TAU: Duration = Duration::from_millis(350);
+
+/// Integration time of a VU meter: the displayed level is the RMS over this
+/// window, not over one block.
+///
+/// A 10 ms block is the *capture* granularity, not a meter time constant.  With
+/// the block RMS feeding the bar directly, the level jumps on every hi-hat and
+/// the max-hold below turns the bar into a peak follower: “le niveau est plus
+/// ou moins constant (et trop haut) mais ça vibre”.  Averaging over ~300 ms
+/// gives the reading a human eye integrates over, and makes loud music read
+/// its *short-term* RMS (−12…−9 dBFS) instead of its loudest 10 ms.
+pub const RMS_WINDOW: Duration = Duration::from_millis(300);
 
 /// Frames per published block in the capture path: 480 frames at 48 kHz = 10 ms.
 pub const BLOCK_FRAMES: usize = 480;
+
+/// Blocks in [`RMS_WINDOW`] (`300 ms / 10 ms`): the reader keeps this many
+/// per-channel mean squares, which makes the window exactly 300 ms of audio
+/// whatever the wall-clock jitter of the capture thread.
+pub const RMS_WINDOW_BLOCKS: usize = 30;
 
 /// Bottom of the level scale: this many dB below full scale maps to 0.
 ///
@@ -194,11 +235,31 @@ pub fn amplitude_to_db(amplitude: f32) -> f32 {
     20.0 * amplitude.log10()
 }
 
-/// RMS + peak of an interleaved stereo f32 block.
+/// RMS + peak of an interleaved stereo f32 block, **canal par canal**.
 ///
-/// A mono block (`frames.len()` not divisible by `METER_CHANNELS`) is treated as
-/// duplicated channels, exactly like `metering.py` does when PortAudio hands it
-/// one channel; an empty block is silence.
+/// Even indices are the left channel, odd ones the right: each channel gets its
+/// own RMS and its own peak, so `[rms[0], rms[1]]` is exactly what the two VU
+/// bars draw.  A signal present only on the left gives `rms = [x, 0.0]` — the
+/// measure is done per channel, never summed or maxed (a bar that rose on both
+/// sides for a one-eared source was one of the reported bugs; measured live
+/// through a real `pw-cat` capture, a left-only WAV reads `L = 0.354, R = 0.0`).
+///
+/// **Mono is duplicated on purpose, and only here.**  Two different situations
+/// collapse to one channel, and both must show the same level on both bars
+/// rather than a fake stereo image:
+///
+/// * the *capture* hands us one channel (`frames.len()` not divisible by
+///   `channels`) — exactly what `metering.py` did when PortAudio gave it mono;
+/// * the *source* is mono: the stream is opened with `--channels 2`, and
+///   PipeWire's channel mixer **duplicates** the single channel, so a mono device
+///   (`alsa_output….pro-output-0`, a mono microphone) arrives as two identical
+///   channels and there is nothing left to tell apart at this level.  Which case
+///   it is has to be read from the graph (`pw-dump`: `audio.channels` of the
+///   captured node), not guessed from the samples.
+///
+/// A strip with `is_mono` set collapses `max(L, R)` onto both bars in
+/// [`crate::app::AppState::levels_for`] (Qt parity: `StripWidget.update_vumeter`).
+/// An empty block is silence.
 pub fn analyse_block(frames: &[f32], channels: usize) -> MeterSample {
     let channels = channels.max(1);
     if frames.is_empty() {
@@ -235,7 +296,8 @@ pub fn analyse_block(frames: &[f32], channels: usize) -> MeterSample {
     MeterSample { rms, peak }
 }
 
-/// Per-strip decay envelope.  `level = max(new, prev * 0.85^(dt / 40 ms))`.
+/// Per-strip decay envelope.  `level = max(new, prev * exp(-dt / 350 ms))`:
+/// attack is instantaneous, release is a real time constant.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Envelope {
     level: [f32; 2],
@@ -275,15 +337,135 @@ impl Envelope {
     }
 }
 
-/// `0.85^(dt / 40 ms)`, i.e. exactly [`DECAY_PER_INTERVAL`] per meter tick but
-/// frame-rate independent (a 60 fps UI decays 1.5× less per frame than a 25 fps
-/// one, for the same wall-clock fall-off).
+/// `exp(-dt / τ)` with τ = [`RELEASE_TAU`].
+///
+/// Exponential, so it composes: two steps of `dt/2` decay exactly like one of
+/// `dt`.  That is what makes the bar frame-rate independent — the old
+/// per-tick factor did not, and a UI that repainted at 120 fps fell half as
+/// fast as one at 60 fps while claiming the same “15 % per tick”.
 pub fn decay_factor(dt: Duration) -> f32 {
-    let ticks = dt.as_secs_f32() / METER_INTERVAL.as_secs_f32();
-    if !ticks.is_finite() || ticks <= 0.0 {
+    let seconds = dt.as_secs_f32();
+    let tau = RELEASE_TAU.as_secs_f32();
+    if !seconds.is_finite() || seconds <= 0.0 || tau <= 0.0 {
         return 1.0;
     }
-    DECAY_PER_INTERVAL.powf(ticks).clamp(0.0, 1.0)
+    (-seconds / tau).exp().clamp(0.0, 1.0)
+}
+
+/// The RMS of the last [`RMS_WINDOW`] of audio, per channel — the value a VU bar
+/// shows.
+///
+/// Why not the block RMS: a 10 ms RMS is dominated by whatever the loudest
+/// handful of cycles in that block were, so the level of steady music jumps
+/// several dB from block to block (measured on the sandbox: 10 ms blocks of the
+/// same mix ranged over 0.075…0.117 RMS = −22…−19 dBFS, while the 300 ms RMS sat
+/// at 0.10 = −20 dBFS).  Feeding that into a max-hold envelope gives exactly the
+/// reported symptom: a bar that is **constant and too high** (it tracks the
+/// loudest recent block) while **vibrating** (every block is a new maximum).
+///
+/// The window is a ring of per-block *mean squares*, so it is exact (no IIR
+/// bias, no attack transient) and its length is a number of blocks — 300 ms of
+/// audio by construction, independent of the thread's scheduling.
+#[derive(Debug, Clone)]
+pub struct RmsWindow {
+    /// Per block: mean square of each channel.
+    means: Vec<[f64; 2]>,
+    next: usize,
+    filled: usize,
+}
+
+impl Default for RmsWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RmsWindow {
+    pub fn new() -> Self {
+        Self {
+            means: vec![[0.0; 2]; RMS_WINDOW_BLOCKS.max(1)],
+            next: 0,
+            filled: 0,
+        }
+    }
+
+    /// Add one block (its per-channel RMS as measured by [`analyse_block`]).
+    pub fn push(&mut self, sample: &MeterSample) {
+        let mean = [
+            f64::from(sample.rms[0]) * f64::from(sample.rms[0]),
+            f64::from(sample.rms[1]) * f64::from(sample.rms[1]),
+        ];
+        self.means[self.next] = mean;
+        self.next = (self.next + 1) % self.means.len();
+        self.filled = (self.filled + 1).min(self.means.len());
+    }
+
+    /// RMS over the window (whatever it is filled with: partial until warm).
+    pub fn rms(&self) -> [f32; 2] {
+        if self.filled == 0 {
+            return [0.0, 0.0];
+        }
+        let mut sum = [0.0_f64; 2];
+        for mean in &self.means[..self.filled] {
+            sum[0] += mean[0];
+            sum[1] += mean[1];
+        }
+        let count = self.filled as f64;
+        [(sum[0] / count).sqrt() as f32, (sum[1] / count).sqrt() as f32]
+    }
+
+    /// The window RMS on the bar scale — what [`MeterBoard::publish`] gets.
+    pub fn level(&self) -> [f32; 2] {
+        let rms = self.rms();
+        [level_from_amplitude(rms[0]), level_from_amplitude(rms[1])]
+    }
+
+    /// Forget the window (mute, stop): the next block starts a fresh average
+    /// instead of dragging 300 ms of the old signal along.
+    pub fn reset(&mut self) {
+        self.means.fill([0.0; 2]);
+        self.next = 0;
+        self.filled = 0;
+    }
+
+    /// How many blocks are in the window right now (tests: the warm-up).
+    pub fn len(&self) -> usize {
+        self.filled
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.filled == 0
+    }
+}
+
+/// The inverse of [`level_from_amplitude`]: a bar height back to a linear
+/// amplitude.
+///
+/// Used to apply a **linear gain** to a level that the board publishes already
+/// scaled (a fader move, a mono downmix trim): a level is a dB reading, so
+/// multiplying it by 0.03 would not be −30 dB.
+pub fn amplitude_from_level(level: f32) -> f32 {
+    if !level.is_finite() {
+        return 0.0;
+    }
+    let db = LEVEL_FLOOR_DB + level.clamp(0.0, 1.0) * (LEVEL_CEILING_DB - LEVEL_FLOOR_DB);
+    10.0_f32.powf(db / 20.0)
+}
+
+/// Apply a **linear amplitude gain** to a bar level (`gain` 0…1), in the
+/// amplitude domain: `level_from_amplitude(amplitude_from_level(level) * gain)`.
+///
+/// This is the post-fader correction: a capture tapped *before* the strip's
+/// fader has to be scaled by it, and the scale must happen on amplitudes or the
+/// dB mapping hides it (level 0.7 × 0.03 = 0.02 is −58 dB, not −30 dB).
+pub fn attenuate_level(level: f32, gain: f32) -> f32 {
+    if !gain.is_finite() || !level.is_finite() {
+        return 0.0;
+    }
+    if (gain - 1.0).abs() < f32::EPSILON {
+        return level.clamp(0.0, 1.0);
+    }
+    level_from_amplitude(amplitude_from_level(level) * gain.clamp(0.0, 1.0))
 }
 
 fn sanitize(value: f32) -> f32 {
@@ -650,22 +832,37 @@ mod tests {
     }
 
     #[test]
-    fn the_envelope_decays_by_fifteen_percent_per_meter_tick() {
+    fn the_envelope_attacks_instantly_and_releases_with_a_350_ms_constant() {
         let mut envelope = Envelope::new();
         assert_eq!(envelope.update([1.0, 0.5], Duration::ZERO), [1.0, 0.5]);
+        // One 40 ms UI tick: exp(-40/350) = 0.892.
         let after = envelope.update([0.0, 0.0], METER_INTERVAL);
-        assert!((after[0] - DECAY_PER_INTERVAL).abs() < 1e-6, "{after:?}");
-        assert!((after[1] - 0.5 * DECAY_PER_INTERVAL).abs() < 1e-6);
-        // Two ticks: 0.7225.
+        let expected = (-METER_INTERVAL.as_secs_f32() / RELEASE_TAU.as_secs_f32()).exp();
+        assert!((after[0] - expected).abs() < 1e-6, "{after:?}");
+        assert!((after[1] - 0.5 * expected).abs() < 1e-6);
+        // Two ticks compose: 0.892² = 0.795.
         let two = envelope.update([0.0, 0.0], METER_INTERVAL);
-        assert!((two[0] - 0.85 * 0.85).abs() < 1e-6, "{two:?}");
+        assert!((two[0] - expected * expected).abs() < 1e-6, "{two:?}");
         // A new peak wins immediately (attack is instantaneous).
         assert_eq!(envelope.update([0.9, 0.9], METER_INTERVAL), [0.9, 0.9]);
+        // …and the release really is ~350 ms: one second of silence leaves 5 %.
+        let mut falling = Envelope::new();
+        falling.update([1.0, 1.0], Duration::ZERO);
+        let after_one_second = falling.update([0.0, 0.0], Duration::from_secs(1));
+        assert!(
+            (after_one_second[0] - 0.057).abs() < 0.01,
+            "one second after the signal stops the bar must be near dark: {after_one_second:?}"
+        );
+        // Half a second gets it to 24 % — not “several seconds of lag”.
+        let mut half = Envelope::new();
+        half.update([1.0, 1.0], Duration::ZERO);
+        let after_half = half.update([0.0, 0.0], Duration::from_millis(500));
+        assert!(after_half[0] < 0.25, "{after_half:?}");
     }
 
     #[test]
     fn the_envelope_is_frame_rate_independent() {
-        // 2 × 20 ms must decay like 1 × 40 ms.
+        // 2 × 20 ms must decay like 1 × 40 ms — whatever the call pattern.
         let mut split = Envelope::new();
         split.update([1.0, 1.0], Duration::ZERO);
         split.update([0.0, 0.0], Duration::from_millis(20));
@@ -673,8 +870,19 @@ mod tests {
         let mut whole = Envelope::new();
         whole.update([1.0, 1.0], Duration::ZERO);
         let whole_level = whole.update([0.0, 0.0], Duration::from_millis(40));
-        assert!((split_level[0] - whole_level[0]).abs() < 1e-5);
-        assert!((split_level[0] - DECAY_PER_INTERVAL).abs() < 1e-5);
+        assert!((split_level[0] - whole_level[0]).abs() < 1e-6);
+        // And a 16 ms step then a 100 ms step follow exp(-dt/τ) exactly: the
+        // fall depends on the elapsed time, never on the number of calls.
+        let mut stepped = Envelope::new();
+        stepped.update([1.0, 1.0], Duration::ZERO);
+        let after_16 = stepped.update([0.0, 0.0], Duration::from_millis(16));
+        let after_116 = stepped.update([0.0, 0.0], Duration::from_millis(100));
+        let expected_116 = (-0.116_f32 / RELEASE_TAU.as_secs_f32()).exp();
+        assert!((after_16[0] - (-0.016_f32 / 0.35).exp()).abs() < 1e-6, "{after_16:?}");
+        assert!(
+            (after_116[0] - expected_116).abs() < 1e-5,
+            "{after_116:?} vs {expected_116}"
+        );
         // It keeps falling towards zero, never below.
         let mut envelope = Envelope::new();
         envelope.update([1.0, 1.0], Duration::ZERO);
@@ -683,6 +891,77 @@ mod tests {
         }
         assert!(envelope.level()[0] < 1e-6);
         assert!(envelope.level()[0] >= 0.0);
+    }
+
+    /// The bar reads the **RMS over 300 ms**, not the loudest 10 ms block: a
+    /// transient must be diluted, and a steady signal must give a steady bar
+    /// (no “ça vibre”).
+    #[test]
+    fn the_vu_window_averages_a_transient_instead_of_following_it() {
+        let steady = MeterSample {
+            rms: [0.1, 0.1],
+            peak: [0.3, 0.3],
+        };
+        let mut window = RmsWindow::new();
+        assert!(window.is_empty());
+        assert_eq!(window.level(), [0.0, 0.0]);
+        for _ in 0..RMS_WINDOW_BLOCKS {
+            window.push(&steady);
+        }
+        assert_eq!(window.len(), RMS_WINDOW_BLOCKS);
+        assert!((window.rms()[0] - 0.1).abs() < 1e-6, "{:?}", window.rms());
+        let steady_level = window.level()[0];
+        assert!((steady_level - 0.61).abs() < 0.01, "{steady_level}");
+        // One loud block (a snare) moves the window by ~1/30 of its energy:
+        // RMS = sqrt((29·0.01 + 0.64)/30) = 0.176, i.e. +4.9 dB — a visible
+        // kick, not the +10 dB a peak follower would show.
+        window.push(&MeterSample {
+            rms: [0.8, 0.8],
+            peak: [1.0, 1.0],
+        });
+        let kicked = window.rms()[0];
+        assert!(kicked > 0.17 && kicked < 0.19, "{kicked}");
+        assert!(window.level()[0] - steady_level < 0.1, "{steady_level}");
+        // Two different channels stay two different channels.
+        let mut stereo = RmsWindow::new();
+        for _ in 0..RMS_WINDOW_BLOCKS {
+            stereo.push(&MeterSample {
+                rms: [0.5, 0.0],
+                peak: [0.7, 0.0],
+            });
+        }
+        assert!(stereo.rms()[0] > 0.49 && stereo.rms()[1] == 0.0, "{:?}", stereo.rms());
+        // A window that is not full averages what it has (no fade-in).
+        let mut warm = RmsWindow::new();
+        warm.push(&steady);
+        assert!((warm.rms()[0] - 0.1).abs() < 1e-6);
+        warm.reset();
+        assert!(warm.is_empty());
+        assert_eq!(warm.level(), [0.0, 0.0]);
+    }
+
+    /// The post-fader correction works in the **amplitude** domain: a fader at
+    /// 0.3 is −30 dB (PulseAudio's cubic curve, 0.027), not “30 % of the bar”.
+    #[test]
+    fn a_linear_gain_attenuates_the_level_by_decibels_not_by_bars() {
+        // Round trip: amplitude → level → amplitude.
+        for amplitude in [1.0_f32, 0.5, 0.1, 0.01, 0.001] {
+            let level = level_from_amplitude(amplitude);
+            let back = amplitude_from_level(level);
+            assert!(
+                (back - amplitude).abs() / amplitude < 0.01,
+                "{amplitude} → {level} → {back}"
+            );
+        }
+        assert_eq!(amplitude_from_level(0.0), 10.0_f32.powf(LEVEL_FLOOR_DB / 20.0));
+        assert_eq!(amplitude_from_level(1.0), 10.0_f32.powf(LEVEL_CEILING_DB / 20.0));
+        // Unity gain is a no-op, zero gain is silence, NaN is silence.
+        assert!((attenuate_level(0.73, 1.0) - 0.73).abs() < 1e-6);
+        assert_eq!(attenuate_level(0.73, 0.0), 0.0);
+        assert_eq!(attenuate_level(0.73, f32::NAN), 0.0);
+        // 0 dBFS RMS at volume 0.3 (−31.4 dB) sits at −31.4 dBFS = 0.43.
+        let gained = attenuate_level(level_from_amplitude(1.0), 0.027);
+        assert!((gained - 0.43).abs() < 0.02, "{gained}");
     }
 
     #[test]

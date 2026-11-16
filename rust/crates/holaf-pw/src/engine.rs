@@ -277,6 +277,24 @@ impl PwSession {
     /// PipeWire exports only a fixed key subset in registry globals, so a custom
     /// key never reaches the client that would need it (see the `graph` module
     /// docs).
+    ///
+    /// # Why `node.cache-params = false`
+    ///
+    /// The daemon caches the `Props` param of a node (`PW_KEY_NODE_CACHE_PARAMS`,
+    /// default **true**) the first time a client enumerates it, and serves every
+    /// later read from that snapshot.  On PipeWire 0.3.65 the cache was
+    /// invalidated whenever the adapter's props changed, so `pw-cli
+    /// enum-params … Props` always reported the live `channelVolumes`.  From 1.4
+    /// on, a bus that has **never negotiated a format** (a virtual strip with
+    /// nothing playing, i.e. the normal state in the tests and in an idle mixer)
+    /// does *not* publish a `Props` change, so the cached snapshot stays at
+    /// construction-time unity: measured on 1.4.2, `pw-cli enum-params` kept
+    /// reporting `channelVolumes 1.0;1.0` after the engine had written 0.085 —
+    /// while the audio output was *correctly* attenuated (verified with an RMS
+    /// capture: 8269 → 3638 → 413 for 1.0 / 0.44 / 0.05).  A lying read-back is
+    /// poison for the diagnostics and for every live test that pins the volume
+    /// contract, so the caches of *our* buses are disabled: they are ours, they
+    /// are few, and a node round-trip is cheap next to a wrong report.
     fn create_null_sink(
         &self,
         name: &str,
@@ -296,6 +314,9 @@ impl PwSession {
                     "audio.channels" => "2",
                     "audio.position" => "[ FL, FR ]",
                     "object.linger" => "1",
+                    // Truthful `Props` read-back on PipeWire ≥ 1.4 (see the
+                    // doc comment above).
+                    "node.cache-params" => "false",
                     graph::UID_PROP => uid,
                     graph::KIND_PROP => graph::KIND_BUS,
                     graph::LABEL_PROP => label,

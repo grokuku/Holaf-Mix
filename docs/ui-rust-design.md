@@ -1304,6 +1304,68 @@ session).
 
 ---
 
+### 10sexies.4 VU-mètres, troisième tour : barre constante/haute et VU sourd au fader
+
+Deux défauts distincts, tous deux **mesurés** sur le bac à sable (PipeWire
+headless, `pw-cat` réel, WAV stéréo généré) avant/après correction.
+
+**1. La détection de format corrompait un flux f32 valide.**  Avec `--raw` (et
+l'option existe depuis PipeWire 1.4, donc chez l'utilisateur en 1.6.11), `pw-cat`
+écrit des échantillons `f32le` **par contrat** : il n'y a rien à deviner.  Or le
+lecteur re-détectait le format dès qu'**un** bloc paraissait suspect (un bloc de
+dénormaux suffit : RMS < 1e-9 avec des octets non nuls), figeait `s16le`/`s32le`
+— au hasard, et différemment selon la source — puis décodait *tous* les blocs
+suivants à cette largeur.  Mesuré en décodant un vrai flux f32 de musique comme
+du `s16le` (ce que faisait le bug) : RMS médian **0.574 à 0.595** au lieu de
+0.05, soit une barre **0.84-0.85 constante** — exactement le rapport utilisateur
+(`last rms 0.5858/0.5016 peak 0.9969`).  Corrections :
+
+* `--raw` actif ⇒ format **connu** (`f32le`), détection **désactivée** ; un bloc
+  impossible est refusé et signalé, jamais « réinterprété » ;
+* sans `--raw` (PipeWire < 1.4, largeur réellement inconnue), la détection reste
+  un filet mais doit être **confirmée sur 2 blocs consécutifs**
+  (`MISREAD_CONFIRM_BLOCKS`) avant de re-figer la largeur : un bloc bizarre isolé
+  ne peut plus condamner le flux.
+
+**2. La barre suivait le pic à court terme, pas le niveau.**  La valeur publiée
+était le RMS du bloc de 10 ms, et l'enveloppe faisait `max(nouveau, ancien × 0.85)`.
+Un `max` sur des RMS de 10 ms est un **peak-hold** : la barre reste au niveau des
+10 ms les plus forts, donc haute et quasi constante, en frémissant à chaque
+transitoire.  Mesuré sur une piste percussive (655 blocs, 6.6 s) : l'ancienne
+barre oscillait entre **0.40 et 0.76** d'un poll à l'autre, la nouvelle reste
+entre **0.55 et 0.61**.  Corrections :
+
+* `meters::RmsWindow` : la barre affiche le RMS des **300 ms** écoulées (30 blocs,
+  exact, indépendant de l'ordonnancement) — la constante de temps d'un vrai VU ;
+* `meters::RELEASE_TAU` = **350 ms** appliqué au `dt` **réel**
+  (`prev × exp(-dt/τ)`) : plus de facteur par frame, donc plus de dépendance au
+  framerate.  Mesure de descente : < 0.05 en ~1 s depuis −18 dBFS (dont 300 ms de
+  fenêtre qui se vide), jamais « plusieurs secondes ».
+
+**3. Séparation L/R.**  `analyse_block` mesurait déjà canal par canal (indices
+pairs = L, impairs = R) ; la mesure live le confirme : un WAV **gauche
+seulement** dans un sink stéréo donne **L = 0.354, R = 0.000** (test opt-in
+`a_live_left_only_source_keeps_the_right_bar_dark`).  Deux cas de duplication
+restent explicites et documentés : un strip **MONO** (`levels_for` replie
+`max(L,R)` sur les deux barres, parité Qt) et une **source mono** captée avec
+`--channels 2` (PipeWire duplique le canal ; à vérifier côté graphe avec
+`audio.channels`, pas ici).
+
+**4. VU sourd au fader sur un strip physique.**  Le monitor d'un bus est
+post-fader (le moteur y écrit `monitorVolumes` : mesuré 0.3535 / 0.0096 / 0.0004
+à volume 1.0 / 0.3 / 0.1), mais le tap d'un **device** (sortie physique :
+`<device>.monitor`, entrée physique : la source du device) est **pré-fader** :
+l'utilisateur a mesuré fader 30 %, monitor RMS 0.51.  `AppState` applique donc
+`pulse_linear_gain(volume)` au niveau **des strips physiques uniquement**, dans le
+domaine des amplitudes (`meters::attenuate_level`, jamais « × le volume de la
+barre » : 0.7 × 0.03 ≠ −30 dB).  Le rapport de diagnostic imprime le facteur
+(`(post-fader x0.027)`), ce qui rend les deux erreurs symétriques visibles :
+un facteur absent sur un strip qui devrait en avoir un (strip traité comme bus),
+ou un VU trop bas si un futur moteur rend un monitor de device post-fader
+(double atténuation).
+
+---
+
 ## 11. Raccourcis
 
 * Inventaire chiffré : [`docs/ui-inventory.md`](./ui-inventory.md)

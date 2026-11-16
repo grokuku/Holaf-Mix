@@ -74,6 +74,30 @@ require_tools() {
     fi
 }
 
+# Report the versions the bench is about to use, and refuse to stay silent when
+# they do not match the targets.
+#
+# Why this exists: a Debian 12 container ships PipeWire 0.3.65 while every
+# supported target runs 1.x (Arch 1.6.x).  Testing 0.3.65 validated code that
+# then broke on real machines (`pw-cat --raw` does not exist there, `pw-cat ... -`
+# behaves differently).  The versions are printed on every start so a green test
+# run can never be mistaken for "the users' PipeWire".  See BUILD.md §5.5.
+report_versions() {
+    local pw wpc lib wp
+    pw="$(pipewire --version 2>/dev/null | awk '/Linked with libpipewire/{print $NF}')"
+    pw="${pw:-unknown}"
+    wpc="$(pw-cat --version 2>/dev/null | awk '/Linked with libpipewire/{print $NF}')"
+    lib="$(pkg-config --modversion libpipewire-0.3 2>/dev/null || echo '?')"
+    wp="$(wireplumber --version 2>/dev/null | awk '/Linked with libwireplumber/{print $NF}')"
+    log "versions: pipewire $pw · pw-cat ${wpc:-?} · pkg-config libpipewire-0.3 $lib · wireplumber ${wp:-?}"
+    # 0.3.x is the pre-1.0 world: no `--raw`, other `-` semantics, another
+    # `Props` read-back.  Say so loudly instead of letting a green suite lie.
+    if [[ "$pw" == 0.* ]]; then
+        warn "PipeWire $pw is NOT what the supported targets run — take pipewire"
+        warn "from bookworm-backports (BUILD.md §5.5) before trusting these tests."
+    fi
+}
+
 # True if $1 is a live, non-zombie process.
 pid_alive() {
     local pid="${1:-}"
@@ -164,6 +188,7 @@ dump_log_tail() {
 
 cmd_start() {
     require_tools
+    report_versions
     mkdir -p "$RUNTIME_DIR"
     chmod 700 "$RUNTIME_DIR"
 
