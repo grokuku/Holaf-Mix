@@ -383,6 +383,26 @@ fn pulse_source_names() -> Option<Vec<String>> {
     }
 }
 
+/// Is there a PulseAudio-compatible **server** behind `pactl`?
+///
+/// The mono-route tests below *create* their fixture with `pactl load-module`,
+/// so they need three things at once: the `pactl` binary, a PipeWire daemon and
+/// a `pipewire-pulse` server.  `pactl` being installed says nothing about the
+/// last one — measured here: kill the sandbox's `pipewire-pulse` and `pactl`
+/// still exists but every call fails.  A service that is absent is a **SKIP**,
+/// never a panic: the test then says *why* it cannot run instead of reporting a
+/// code failure on a machine that simply has no pulse server.
+fn pulse_server_available(test: &str) -> bool {
+    if run("pactl", &["info"]).is_some() {
+        return true;
+    }
+    eprintln!(
+        "SKIP {test}: no PulseAudio/pipewire-pulse server behind pactl (`pactl info` \
+         failed) — this case creates its mono sink with `pactl load-module`"
+    );
+    false
+}
+
 /// `meter.sources` must hand the Python VU-meter engine names it can actually
 /// record from (`PULSE_SOURCE=<name>`): a `<node>.monitor` source for every
 /// virtual strip (chain or not), the device source for a physical input — and
@@ -744,6 +764,9 @@ fn a_route_into_a_mono_device_is_linked() {
         return;
     }
     fresh_sandbox_daemon();
+    if !pulse_server_available("a_route_into_a_mono_device_is_linked") {
+        return;
+    }
 
     // A mono sink: exactly the port shape of a Pro Audio `pro-output-0`.
     const MONO: &str = "alsa_output.holaf_test.pro-output-0";
@@ -756,10 +779,11 @@ fn a_route_into_a_mono_device_is_linked() {
             "channels=1",
         ],
     );
-    assert!(
-        created.is_some(),
-        "pactl must be able to create a mono null-sink ({MONO})"
-    );
+    if created.is_none() {
+        // The fixture cannot exist (no `module-null-sink`): nothing to assert.
+        eprintln!("SKIP a_route_into_a_mono_device_is_linked: pactl could not create a mono null-sink ({MONO})");
+        return;
+    }
 
     let mut backend = match PipeWireBackend::connect() {
         Ok(b) => b,
@@ -997,22 +1021,26 @@ fn the_mono_downmix_option_rewires_a_mono_route() {
         return;
     }
     fresh_sandbox_daemon();
+    if !pulse_server_available("the_mono_downmix_option_rewires_a_mono_route") {
+        return;
+    }
 
     // A mono sink: the port shape of a Pro Audio `pro-output-0`.
     const MONO: &str = "alsa_output.holaf_downmix.pro-output-0";
-    assert!(
-        run(
-            "pactl",
-            &[
-                "load-module",
-                "module-null-sink",
-                &format!("sink_name={MONO}"),
-                "channels=1",
-            ],
-        )
-        .is_some(),
-        "pactl must be able to create a mono null-sink ({MONO})"
-    );
+    if run(
+        "pactl",
+        &[
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={MONO}"),
+            "channels=1",
+        ],
+    )
+    .is_none()
+    {
+        eprintln!("SKIP the_mono_downmix_option_rewires_a_mono_route: pactl could not create a mono null-sink ({MONO})");
+        return;
+    }
 
     let mut backend = match PipeWireBackend::connect() {
         Ok(b) => b,

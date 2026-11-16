@@ -513,9 +513,25 @@ R  52    128  48000   1.1us   0.7us  0.00  0.00    3    F32LE 2 48000  Holaf_Bus
     /// none (the unit tests above cover the logic).
     #[test]
     fn collect_against_a_live_daemon_when_there_is_one() {
+        // Two independent conditions, and BOTH must hold:
+        //
+        // 1. the runtime dir looks like the throwaway sandbox — this test
+        //    *writes* `clock.force-quantum` on the daemon, so it must never
+        //    touch a real user session;
+        // 2. that daemon is actually **reachable**.  The path alone proves
+        //    nothing: `start-pipewire-headless.sh --export` only exports the
+        //    variables, so a shell that keeps them after a `stop` (the normal
+        //    way to switch the sandbox off) still has `XDG_RUNTIME_DIR` set with
+        //    no socket behind it.  Gating on the name alone made this test
+        //    *fail* (`pw-metadata … can't connect: Host is down`) instead of
+        //    skipping — the one thing a live test must never do.
         let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
         if !(dir.contains("pw-runtime") || dir.contains("holaf")) {
             eprintln!("SKIP: no headless PipeWire configured");
+            return;
+        }
+        if let Err(reason) = run("pw-metadata", &["-n", "settings"]) {
+            eprintln!("SKIP: the headless PipeWire daemon does not answer: {reason}");
             return;
         }
         let payload = collect();

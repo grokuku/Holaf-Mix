@@ -138,6 +138,25 @@ fn report_for_live_level(capture: &MeterCapture, uid: &str, source: &str, level:
     })
 }
 
+/// The `blocks : N accepted` figure the report prints (`0` when absent).
+///
+/// Parsing the number beats substring matching: `!text.contains("0 accepted")`
+/// also matches the perfectly normal “10 accepted” (and 20, 100, …), which made
+/// the tests below fail on ~10 % of the runs — a CI-only red that is
+/// unreproducible locally because the decoded-block count depends on scheduling.
+fn accepted_blocks_in(text: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let (_, rest) = line.split_once(": ")?;
+            let (count, tail) = rest.split_once(' ')?;
+            if !tail.starts_with("accepted") {
+                return None;
+            }
+            count.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
 /// Start one capture and wait until `ready` holds (bounded: a hung child must
 /// fail the test, not hang it).
 fn capture_until(
@@ -270,7 +289,17 @@ fn an_s16le_stream_is_detected_converted_and_described_by_the_report() {
     );
     // The report's METERING section shows the converted level on Mic (the only
     // captured strip; Casque has no capture, so it legitimately reads 0.000).
-    assert!(text.contains("L=0.560 R=0.560"), "{text}");
+    //
+    // The expected string is built from the level the board actually holds, not
+    // from a constant: the value is printed with 3 decimals, so pinning
+    // `"L=0.560"` would depend on the last digit of a float (0.5604 today) and
+    // fail on a machine that happens to read 0.5599 — while the assertion we
+    // *want* is “the METERING section shows the bar's level, not 0.000”.  The
+    // numeric guard above is what pins the value.
+    assert!(
+        text.contains(&format!("L={:.3} R={:.3}", level[0], level[1])),
+        "the METERING section must show the converted level {level:?}:\n{text}"
+    );
 }
 
 /// **Case B′ — the same s16le stream, but read as *denormals*.**  This is the
@@ -325,10 +354,11 @@ fn a_denormal_s16le_stream_is_detected_converted_and_described_by_the_report() {
         "the report must carry the converted RMS, got {rms:?}\n{text}"
     );
     assert_eq!(summary.rejected, 0, "nothing is refused: {summary:?}");
-    // …and the VU moves: the very symptom was “L=0.000 R=0.000”.
+    // …and the VU moves: the very symptom was “L=0.000 R=0.000”.  Same rule as
+    // above: the string is derived from the level the board holds.
     assert!(
-        text.contains("L=0.560 R=0.560"),
-        "the METERING section must show the converted level:\n{text}"
+        text.contains(&format!("L={:.3} R={:.3}", level[0], level[1])),
+        "the METERING section must show the converted level {level:?}:\n{text}"
     );
     assert!(
         !report.findings.iter().any(|finding| finding.id == "metering_implausible"
@@ -412,7 +442,20 @@ fn a_working_capture_is_counted_and_raises_nothing() {
     // The recorded RMS is −23 dBFS → 0.56 on the bar; the report prints the
     // level the capture would draw (`METERING` is the *drawn* envelope, which is
     // 0.000 here because nothing polls the board in this test).
-    assert!(!text.contains("0 accepted"), "{text}");
+    //
+    // The block count is read back **by value** (see [`accepted_blocks_in`]).
+    // The report is built from a snapshot taken after `summary`, so its count can
+    // only be equal or larger — and it must never be 0 on a working chain.
+    let accepted = accepted_blocks_in(&text);
+    assert!(
+        accepted > 0,
+        "the CAPTURES section must not report 0 accepted blocks:\n{text}"
+    );
+    assert!(
+        accepted >= summary.blocks,
+        "the report ({accepted}) must not under-count the decoded blocks ({}):\n{text}",
+        summary.blocks
+    );
     for id in ["metering_dead", "metering_implausible", "metering_pinned"] {
         assert!(
             !report
@@ -519,7 +562,17 @@ fn a_live_recorder_is_counted_with_a_real_level() {
     let rms = facts.last_rms.expect("a block was decoded")[0];
     assert!(rms > 0.01, "the monitor of {sink} recorded silence: {facts:?}");
     assert!(text.contains("· streaming ·"), "{text}");
-    assert!(!text.contains("0 accepted"), "{text}");
+    // By value, not by substring (see [`accepted_blocks_in`]).
+    let accepted = accepted_blocks_in(&text);
+    assert!(
+        accepted > 0,
+        "the CAPTURES section must not report 0 accepted blocks:\n{text}"
+    );
+    assert!(
+        accepted >= summary.blocks,
+        "the report ({accepted}) must not under-count the decoded blocks ({}):\n{text}",
+        summary.blocks
+    );
     for id in ["metering_dead", "metering_implausible"] {
         assert!(
             !report.findings.iter().any(|finding| finding.id == id),

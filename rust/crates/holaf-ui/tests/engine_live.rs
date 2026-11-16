@@ -147,6 +147,16 @@ fn fresh_sandbox_daemon() {
     if !live_allowed() {
         return;
     }
+    // No `pipewire` launcher on PATH (a container without the `pipewire`
+    // package): do not spend the 20 s watchdog below waiting for a daemon that
+    // cannot possibly start — `sandbox_daemon_answers` will skip at once.
+    let launcher = Command::new("sh")
+        .args(["-c", "command -v pipewire"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !launcher {
+        return;
+    }
     let script = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../scripts/start-pipewire-headless.sh"
@@ -159,6 +169,44 @@ fn fresh_sandbox_daemon() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The sandbox daemon really answers `pw-dump`?
+///
+/// A live test must **skip** when it does not: `start-pipewire-headless.sh
+/// --export` only exports the variables, so a shell that keeps them after a
+/// `stop` (the normal way to switch the sandbox off) still has
+/// `XDG_RUNTIME_DIR` set with no socket behind it.  The path alone therefore
+/// proves nothing, and asserting against an unreachable daemon would FAIL where
+/// the honest answer is “nothing to test here”.
+fn sandbox_daemon_answers(test: &str) -> bool {
+    if pw_dump().is_some() {
+        return true;
+    }
+    eprintln!(
+        "SKIP {test}: the headless PipeWire daemon does not answer (pw-dump failed) — \
+         start it with `./scripts/start-pipewire-headless.sh start`"
+    );
+    false
+}
+
+/// Is there a PulseAudio-compatible **server** behind `pactl`?
+///
+/// `app_list` / `app_move` (the “SELECT APPS” dialog and “assign an application
+/// to this strip”) are served by `pactl`, so a test that exercises them needs the
+/// pulse server **on top of** the PipeWire daemon.  This sandbox's
+/// `start-pipewire-headless.sh` does not launch `pipewire-pulse`: measured here,
+/// `pactl` exists but every call fails, and the app list then never answers —
+/// the test waited 20 s and panicked.  An absent service is a **SKIP**.
+fn pulse_server_available(test: &str) -> bool {
+    if run("pactl", &["info"]).is_some() {
+        return true;
+    }
+    eprintln!(
+        "SKIP {test}: no PulseAudio/pipewire-pulse server behind pactl (`pactl info` \
+         failed) — app_list/app_move are served by pactl"
+    );
+    false
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -277,6 +325,9 @@ fn the_ui_drives_a_real_pipewire_graph() {
         return;
     }
     fresh_sandbox_daemon();
+    if !sandbox_daemon_answers("the_ui_drives_a_real_pipewire_graph") {
+        return;
+    }
 
     // --- (a) load a realistic config --------------------------------
     let dir = scratch("graph");
@@ -517,6 +568,12 @@ fn the_app_routing_and_the_diagnostics_see_the_real_engine() {
         return;
     }
     fresh_sandbox_daemon();
+    if !sandbox_daemon_answers("the_app_routing_and_the_diagnostics_see_the_real_engine") {
+        return;
+    }
+    if !pulse_server_available("the_app_routing_and_the_diagnostics_see_the_real_engine") {
+        return;
+    }
 
     let dir = scratch("apps-diag");
     let config_path = dir.join("config.json");
@@ -734,6 +791,9 @@ fn the_vu_bar_is_post_fader_and_not_pinned_by_a_normal_level() {
         return;
     }
     fresh_sandbox_daemon();
+    if !sandbox_daemon_answers("the_vu_bar_is_post_fader_and_not_pinned_by_a_normal_level") {
+        return;
+    }
 
     let dir = scratch("vu");
     let config_path = dir.join("config.json");
