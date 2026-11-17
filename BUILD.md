@@ -584,6 +584,16 @@ Run any step in isolation:
 ```
 
 CI (`.github/workflows/build.yml`) runs `cargo test --workspace` as a gate, then
+`cargo test -p holaf-ui --features tray` (the **only** place the tray is
+executed: the workspace run compiles `tests/tray_live.rs` to *0 tests*, and this
+step fails the job if that test skips itself for a missing `dbus-daemon`), then
 `./build.sh --tarball`, then unpacks the tarball and smoke-tests it: no `.py`
 file inside, `holaf-ui --help` / `holaf-mix --help` run, `ldd` resolves, and a
 headless launch falls back to `$XDG_CONFIG_HOME/holaf-mix/config.json`.
+
+Build-configuration check (never needed in production — the product always
+ships with `engine-pw`):
+
+```bash
+cargo check -p holaf-ui --no-default-features   # mock engine, no holaf-pw/midir
+```

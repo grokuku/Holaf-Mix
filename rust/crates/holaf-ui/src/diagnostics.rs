@@ -2457,9 +2457,18 @@ pub fn recorder_probe() -> RecorderProbe {
     let version = path.as_ref().and_then(|_| recorder_version(&command));
     // Only ask a binary that exists: probing a missing `pw-cat` would just print
     // the same ENOENT the spawn already reports.
+    //
+    // **`engine-pw` only**: the bounded `<recorder> --help` probe lives in
+    // [`crate::capture`], a module compiled only with the PipeWire backend —
+    // without it there is no meter capture at all, hence no recorder to ask.
+    // `None` is exactly what the report already prints for “could not be
+    // probed”, so no second copy of the probe is needed here.
+    #[cfg(feature = "engine-pw")]
     let raw = path
         .is_some()
         .then(|| crate::capture::recorder_supports_raw(&command));
+    #[cfg(not(feature = "engine-pw"))]
+    let raw: Option<bool> = None;
     RecorderProbe {
         env_override,
         command,
@@ -2512,10 +2521,28 @@ fn recorder_version(command: &str) -> Option<String> {
 }
 
 /// How long `<recorder> --version` is given to answer ([`recorder_version`]).
+///
+/// `engine-pw` only for the same reason as [`probe_version`]: it bounds a spawn
+/// of the recorder, which only exists in the PipeWire build.
+#[cfg(feature = "engine-pw")]
 const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// `<recorder> --version`, parsed.
+///
+/// **`engine-pw` only**: the bounded spawn it relies on lives in
+/// [`crate::capture`], which is compiled with the PipeWire backend; without it
+/// there is no meter capture and therefore no recorder to ask.  Reporting “no
+/// version” (what `None` already means everywhere) is honest and keeps the
+/// process plumbing in exactly one place.
+#[cfg(not(feature = "engine-pw"))]
+fn probe_version(_command: &str) -> Option<String> {
+    None
+}
+
+#[cfg(feature = "engine-pw")]
 fn probe_version(command: &str) -> Option<String> {
-    let output = crate::capture::recorder_probe_output(command, "--version", VERSION_PROBE_TIMEOUT)?;
+    let output =
+        crate::capture::recorder_probe_output(command, "--version", VERSION_PROBE_TIMEOUT)?;
     if !output.success {
         return None;
     }
@@ -3393,6 +3420,11 @@ mod tests {
     /// know and starts recording: `Command::output()` then never returns, and
     /// the diagnostic report froze for minutes (measured while capturing with
     /// such a wrapper).  Both probes are bounded.
+    ///
+    /// `engine-pw` only: the second half of the test drives
+    /// [`crate::capture::recorder_probe_output`], which is compiled out without
+    /// the PipeWire backend.
+    #[cfg(feature = "engine-pw")]
     #[test]
     fn a_recorder_that_never_answers_a_probe_cannot_hang_the_report() {
         use std::os::unix::fs::PermissionsExt;

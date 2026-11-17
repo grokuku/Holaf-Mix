@@ -979,6 +979,15 @@ La feature n'est **pas** dans les `default` de la crate (`default = ["engine-pw"
 c'est le script de build qui l'ajoute.  Ça garde `cargo test --workspace`
 hermitique sans renoncer à livrer l'icône.
 
+Conséquence à connaître : dans le run d'atelier, `tests/tray_live.rs` est
+`#![cfg(feature = "tray")]` et ne compte donc **0 test** (`cargo test -p holaf-ui`
+= 398 tests de lib ; `--features tray` = 399 + le test unique de
+`tray_live.rs`).  C'est la CI qui exerce le tray, par une étape dédiée **non
+hermitique** (`cargo test -p holaf-ui --features tray`) : elle démarre son propre
+`dbus-daemon --session` privé (paquet Arch `dbus`) et un faux
+`org.kde.StatusNotifierWatcher`, et l'étape **échoue** si le test se contente de
+se *SKIP* — c'est exactement la dette corrigée le 2026-11-15.
+
 | Dépendance | Rôle | Particularité |
 |---|---|---|
 | `tray-icon 0.26` (`default-features = false`, feature `ksni`) | icône + menu (`muda 0.21` ré-exporté, feature `snapshot`) | `default-features = false` retire le backend `libappindicator` **et** `libxdo` ; le menu est publié en `com.canonical.dbusmenu` |

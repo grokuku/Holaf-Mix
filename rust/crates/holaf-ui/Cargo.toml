@@ -103,6 +103,13 @@ midi = ["dep:midir"]
 # The *policy* (menu entries, close rule, menu-id → action mapping) is always
 # compiled and tested (`src/tray.rs`); only the tray-icon/D-Bus I/O lives
 # behind this feature.
+#
+# ⚠ Because it is not a default, `cargo test --workspace` runs the tray-gated
+# code with **zero** tests (`tests/tray_live.rs` is `#![cfg(feature = "tray")]`).
+# The CI therefore has a dedicated, intentionally NON-hermetic step:
+# `cargo test -p holaf-ui --features tray` (`.github/workflows/build.yml`), which
+# fails if the live test skips itself.  Run it locally before touching
+# `src/tray.rs` or `src/main.rs`'s tray wiring.
 tray = ["dep:tray-icon", "tray-icon/ksni", "dep:zbus"]
 tray-gtk = ["dep:tray-icon", "tray-icon/libappindicator", "dep:gtk"]
 

@@ -736,6 +736,15 @@ impl AppState {
     /// ```json
     /// { "ui_rust": { "mono_downmix": "average" } }
     /// ```
+    ///
+    /// **`engine-pw` only**: the policy type *is* [`holaf_pw::MonoDownmix`], and
+    /// `holaf-pw` is an optional dependency (`--no-default-features` builds the
+    /// mock engine, see [`crate::bridge`]).  Rather than mirror the enum and its
+    /// `parse`/gain maths here (two copies would drift), the whole accessor is
+    /// gated: with no PipeWire backend there is no engine to hand the policy to,
+    /// so nothing else in this crate — nor `main.rs` — calls it.  The shipped
+    /// product always has `engine-pw`.
+    #[cfg(feature = "engine-pw")]
     pub fn mono_downmix(&self) -> holaf_pw::MonoDownmix {
         let Some(config) = &self.config else {
             return holaf_pw::MonoDownmix::default();
@@ -2977,6 +2986,10 @@ mod tests {
     /// engine does not recognise falls back to **`left`** — the Python
     /// behaviour — instead of guessing.  The key is read once, at start-up, and
     /// handed to the engine thread.
+    ///
+    /// Gated like [`AppState::mono_downmix`] itself: the policy type belongs to
+    /// the optional `holaf-pw` crate.
+    #[cfg(feature = "engine-pw")]
     #[test]
     fn the_mono_downmix_policy_comes_from_the_config_and_defaults_to_left() {
         let path = scratch_config("downmix");
