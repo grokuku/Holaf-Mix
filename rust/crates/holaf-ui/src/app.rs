@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
-use holaf_core::model::{pulse_linear_gain, EffectKey, Strip, StripType};
+use holaf_core::model::{EffectKey, Strip, StripType};
 
 use crate::apps::{self, AppList, AppSelection};
 use crate::bridge::{EngineBridge, EngineCommand, EngineEvent};
@@ -51,7 +51,7 @@ use crate::devices::{self, DevicePresence};
 use crate::diagnostics::{DiagnosticsState, Inputs, Report};
 use crate::dialogs::{AddStripDialog, DeleteConfirm, DevicePicker, FxSettings};
 use crate::engine_json::DeviceInfo;
-use crate::meters::{attenuate_level, Envelope, MeterBoard, METER_INTERVAL};
+use crate::meters::{Envelope, MeterBoard, METER_INTERVAL};
 use crate::midi::{Binding, MidiMap, MidiMessage, MidiOutcome, MidiTarget};
 use crate::theme::images::ImageCache;
 use crate::theme::resolve::{resolve, ResolvedStripStyle, StripDescriptor};
@@ -785,15 +785,25 @@ impl AppState {
     /// Current `[left, right]` levels of the strip at `index`, mono-collapsed
     /// like `StripWidget.update_vumeter`.
     ///
-    /// The captured level is already **post-fader for a virtual strip**: the
-    /// engine writes `Props.monitorVolumes` on the strip's bus, so a tone into a
-    /// bus reads `pulse_linear_gain(volume)` of what it read at unity (measured:
-    /// 0.3535 → 0.0096 at volume 0.3).  A **physical** strip is the exception: it
-    /// records the *device* source or monitor, which is tapped before the strip's
-    /// fader, so the fader is applied here
-    /// ([`AppState::fader_compensation`]) — otherwise the bar ignores the fader
-    /// altogether, which is exactly the reported “quel que soit le volume de la
-    /// sortie, le vu-mètre est toujours à la même hauteur”.
+    /// The captured level is **post-fader for every strip kind**, so it is drawn
+    /// as captured — no fader correction anywhere:
+    ///
+    /// * a **virtual** strip is metered through its bus monitor, which the engine
+    ///   makes follow the fader (measured: a tone in a bus reads 0.3535 at volume
+    ///   1.0 and 0.0095 at 0.3, i.e. `pulse_linear_gain(volume)`);
+    /// * a **physical** strip is metered through its device monitor, which the
+    ///   engine makes follow the fader the same way, whichever rule the node uses
+    ///   (`monitor.channel-volumes` false *or* true — measured on PipeWire 1.4.2,
+    ///   see `holaf-pw/tests/backend_live.rs` and [`crate::meters`]).
+    ///
+    /// Both used to be wrong in a different way, which is why this doc is
+    /// explicit: a *pre-fader* device tap made the bar ignore the fader entirely
+    /// (“quel que soit le volume de la sortie, le vu-mètre est toujours à la même
+    /// hauteur”), and the correction added for it then attenuated a device that
+    /// was in fact post-fader a **second** time — `gain²`, i.e. a bar at 0.000 for
+    /// a −46 dBFS signal (“le vu-mètre des sorties est beaucoup beaucoup trop
+    /// bas”).  The engine now guarantees “post-fader exactly once”, so the UI
+    /// scales nothing.
     pub fn levels_for(&self, index: usize) -> [f32; 2] {
         let Some(strip) = self.strips.get(index) else {
             return [0.0, 0.0];
@@ -811,35 +821,43 @@ impl AppState {
         }
     }
 
-    /// The linear gain the capture of `strip` is missing, i.e. the strip fader
-    /// that sits **after** the tap.
+    /// How the capture of `strip` picks its fader up, as a sentence for the
+    /// diagnostic report.
     ///
-    /// * virtual strip (no device): the capture is its own bus monitor, which the
-    ///   engine already scales through `Props.monitorVolumes` → unity here;
-    /// * physical strip: the capture is the device's source/monitor, tapped
-    ///   before the fader → `pulse_linear_gain(volume)`, the same cubic curve the
-    ///   engine pushes to the node (so the bar follows the fader exactly like the
-    ///   sound does).
-    ///
-    /// Applying it twice is the only risk, and it is measurable: if a future
-    /// engine ever makes a *device* monitor honour `monitorVolumes`, the bar would
-    /// read `gain²` — the diagnostic report prints the factor it applied
-    /// (`VU gain`), so that shows up as a single wrong number instead of a
-    /// mystery.
-    pub fn fader_compensation(&self, strip: &Strip) -> f32 {
-        match strip.device_name.as_deref().filter(|name| !name.is_empty()) {
-            Some(_) => pulse_linear_gain(strip.volume),
-            None => 1.0,
+    /// It is read from the engine's `status` (`meter_tap`, straight from the live
+    /// node's `monitor.channel-volumes`) and falls back to the strip kind.  The
+    /// point is the garde-fou the report needs: a reader must be able to tell “no
+    /// fader correction is applied **because** the capture is post-fader” from “the
+    /// correction is broken”, and a `0.000` bar must not look like an unexplained
+    /// bug.
+    pub fn meter_tap(&self, strip: &Strip) -> String {
+        let reported = self
+            .backend_status
+            .as_ref()
+            .and_then(|status| status.get("strips"))
+            .and_then(|strips| strips.as_array())
+            .and_then(|strips| {
+                strips
+                    .iter()
+                    .find(|entry| {
+                        entry.get("uid").and_then(|uid| uid.as_str()) == Some(strip.uid.as_str())
+                    })
+                    .and_then(|entry| entry.get("meter_tap"))
+                    .and_then(|tap| tap.as_str())
+            });
+        match reported {
+            // The node applies `channelVolumes` to its own monitor: the fader is
+            // in the tap, so `monitorVolumes` is held at unity.
+            Some("channel-volumes") => "post-fader (monitor follows channelVolumes)".to_string(),
+            // The default `adapter` rule: the tap has its own gain, which the
+            // engine sets to the strip gain.
+            Some("monitor-volumes") => "post-fader (monitorVolumes)".to_string(),
+            Some(other) => format!("post-fader ({other})"),
+            None if strip.device_name.as_deref().is_some_and(|d| !d.is_empty()) => {
+                "post-fader (device monitor)".to_string()
+            }
+            None => "post-fader (bus monitor)".to_string(),
         }
-    }
-
-    /// Apply [`Self::fader_compensation`] to a `[left, right]` level.
-    fn post_fader(&self, strip: &Strip, levels: [f32; 2]) -> [f32; 2] {
-        let gain = self.fader_compensation(strip);
-        [
-            attenuate_level(levels[0], gain),
-            attenuate_level(levels[1], gain),
-        ]
     }
 
     /// Feed real meter values (from the engine bridge or the Python side).
@@ -1692,15 +1710,12 @@ impl AppState {
                     // The envelope takes `dt` into account, so a 60 fps repaint
                     // decays exactly like a 25 Hz one.
                     //
-                    // The level itself is used **as captured** for a virtual
-                    // strip (the capture is already post-fader: the engine writes
-                    // `Props.monitorVolumes` with the strip volume — measured, see
-                    // `crate::meters`), so multiplying it by the volume again
-                    // would attenuate twice.  A **physical** strip's capture is
-                    // the device tap, which sits *before* the fader, so its fader
-                    // is applied here (`post_fader`) — that is what makes the bar
-                    // move when the fader does.
-                    let levels = self.post_fader(&self.strips[index], levels);
+                    // The level is used **as captured**: every capture is
+                    // post-fader (the engine puts the strip volume on the master
+                    // node and makes its monitor follow it exactly once — see
+                    // `crate::meters`), so multiplying by the volume here would
+                    // attenuate a second time and give the reported “VU des
+                    // sorties beaucoup trop bas”.
                     self.feed_levels(&uid, levels, dt);
                 }
                 None => {
@@ -2141,14 +2156,13 @@ impl AppState {
                 )
             })
             .collect();
-        // Which strips' captures are tapped before their fader (see
-        // `fader_compensation`): the report prints the factor, so a VU that
-        // ignores the fader and a VU attenuated twice can be told apart.
-        let vu_gains: Vec<(String, f32)> = self
+        // How each capture picks its fader up (`monitor.channel-volumes`, as the
+        // engine reads it from the live node): the report states the rule per
+        // strip, so “no VU gain” is a documented fact and not a silent assumption.
+        let meter_taps: Vec<(String, String)> = self
             .strips
             .iter()
-            .map(|strip| (strip.uid.clone(), self.fader_compensation(strip)))
-            .filter(|(_, gain)| (gain - 1.0).abs() > f32::EPSILON)
+            .map(|strip| (strip.uid.clone(), self.meter_tap(strip)))
             .collect();
         let sources: HashMap<String, String> = HashMap::new();
         let config_path = self
@@ -2174,7 +2188,7 @@ impl AppState {
             missing_devices: &missing_devices,
             meter_missing: &meter_missing,
             meter_levels: &meter_levels,
-            vu_gains: &vu_gains,
+            meter_taps: &meter_taps,
             captures: captures.as_ref(),
             config_path: config_path.as_deref(),
             now_unix: crate::diagnostics::now_unix(),
@@ -3763,15 +3777,11 @@ mod tests {
         }];
         assert_eq!(s.device_presence(&hp_uid), DevicePresence::Found);
         s.feed_from_board(&board, now + METER_INTERVAL * 41, METER_INTERVAL);
-        // Post-fader: the device tap is **pre**-fader, so the strip's fader is
-        // applied to the captured level (HP is at 0.55 → gain 0.166 → 0 dBFS
-        // reads −15.6 dBFS = 0.673 on the bar).  A bar that ignored the fader
-        // was the second half of the report: “quel que soit le volume de la
-        // sortie, le vu-mètre est toujours à la même hauteur”.
-        let expected = crate::meters::attenuate_level(
-            crate::meters::level_from_amplitude(1.0),
-            pulse_linear_gain(s.strips[hp].volume),
-        );
+        // …and it is drawn **as captured**: every capture is post-fader (the
+        // engine makes the master node's monitor follow the strip gain exactly
+        // once), so a fader correction here would be a second attenuation — the
+        // reported “VU des sorties beaucoup trop bas”.
+        let expected = crate::meters::level_from_amplitude(1.0);
         assert!(
             (s.levels_for(hp)[0] - expected).abs() < 1e-5,
             "{:?} vs {expected}",
@@ -3780,16 +3790,18 @@ mod tests {
         assert!(!s.meter_missing.contains(&hp_uid));
     }
 
-    /// **The VU follows the fader.**  A physical strip's capture is the *device*
-    /// tap, which sits before the strip fader (measured on real hardware: fader at
-    /// 30 %, monitor RMS 0.51 — the VU never moved).  The fader is therefore
-    /// applied to the captured level, on the amplitude scale with PulseAudio's
-    /// cubic curve, so fader 1.0 → 0.3 attenuates by −31 dB (a ratio of 0.027),
-    /// never “30 % of the bar”.  A **virtual** strip needs nothing: its own bus
-    /// monitor is already post-fader (the engine writes `Props.monitorVolumes`),
-    /// and applying the fader again would attenuate twice.
+    /// **The VU is drawn as captured, whatever the strip kind.**
+    ///
+    /// The engine guarantees “post-fader exactly once” for a bus *and* for a
+    /// device (measured live: `holaf-pw/tests/backend_live.rs`, 0.3535 at fader
+    /// 1.0 → 0.0095 at 0.3 on both), so the UI must not scale a level by the fader:
+    /// the old per-strip correction attenuated a device that was already
+    /// post-fader **twice** (`gain²`), which is exactly the “beaucoup beaucoup trop
+    /// bas” report.  The test pins the invariant: the same captured level draws the
+    /// same bar on a physical and on a virtual strip, and moving a fader in the UI
+    /// changes **nothing** on screen — the capture already moved.
     #[test]
-    fn the_vu_of_a_physical_strip_follows_the_fader_and_a_virtual_one_does_not() {
+    fn the_vu_is_drawn_as_captured_on_every_strip_kind() {
         let mut s = state();
         let board = MeterBoard::new();
         let casque = s.strip_index("out-casque").expect("physical output");
@@ -3804,45 +3816,64 @@ mod tests {
         board.publish(slots[&casque_uid], captured);
         board.publish(slots[&mix_uid], captured);
         let now = Instant::now();
-        // Fader at 1.0: the bar shows the captured level as is.
         s.strips[casque].volume = 1.0;
         s.feed_from_board(&board, now, METER_INTERVAL);
         assert!((s.levels_for(casque)[0] - captured[0]).abs() < 1e-5);
         assert!((s.levels_for(mix)[0] - captured[0]).abs() < 1e-5);
-        // Fader at 0.3: the physical bar drops by 31.4 dB, the virtual one does
-        // not move (its capture is already scaled by the engine).
+        // Fader at 0.3 in the UI: the bar does not move, because the *capture*
+        // is where the fader lives (the engine already wrote it to the node).
         s.strips[casque].volume = 0.3;
-        let gain = pulse_linear_gain(0.3);
-        assert!((gain - 0.027).abs() < 1e-3, "{gain}");
-        // The release envelope takes ~1 s to follow the drop (350 ms constant),
-        // so the bar is read after it has settled.
         for tick in 1..60 {
             s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
         }
-        let expected = crate::meters::attenuate_level(captured[0], gain);
         assert!(
-            (s.levels_for(casque)[0] - expected).abs() < 1e-4,
-            "fader 0.3 must scale the physical VU: {:?} vs {expected}",
-            s.levels_for(casque)
-        );
-        assert!(
-            expected < captured[0] - 0.3,
-            "a −31 dB move has to be visible: {expected} vs {}",
+            (s.levels_for(casque)[0] - captured[0]).abs() < 1e-5,
+            "the UI must not attenuate a post-fader capture again: {:?} vs {}",
+            s.levels_for(casque),
             captured[0]
         );
-        assert!((s.levels_for(mix)[0] - captured[0]).abs() < 1e-5);
-        // Fader at 0 is silence, whatever the device monitor still carries.
-        s.strips[casque].volume = 0.0;
-        for tick in 200..300 {
+        // What the *engine* then reports (a capture 31.4 dB lower) is what the bar
+        // follows: `gain²` would have been the bug.
+        let gained =
+            crate::meters::level_from_amplitude(0.5 * holaf_core::model::pulse_linear_gain(0.3));
+        board.publish(slots[&casque_uid], [gained; 2]);
+        let mut s = s;
+        for tick in 60..200 {
             s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
         }
-        // The release is exponential, so the bar approaches zero rather than
-        // snapping: 100 ticks (4 s) leaves it visually dark.
         assert!(
-            s.levels_for(casque)[0] < 1e-5,
-            "a fader at zero is a dark bar: {:?}",
+            (s.levels_for(casque)[0] - gained).abs() < 1e-4,
+            "the bar follows the post-fader capture: {:?} vs {gained}",
             s.levels_for(casque)
         );
+        // …and a fader at zero is a dark bar once the capture is silent (4 s of
+        // the 350 ms release).
+        s.strips[casque].volume = 0.0;
+        board.publish(slots[&casque_uid], [0.0, 0.0]);
+        for tick in 200..320 {
+            s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
+        }
+        assert!(
+            s.levels_for(casque)[0] < 1e-5,
+            "a silent capture is a dark bar: {:?}",
+            s.levels_for(casque)
+        );
+        // The two channels stay **two** channels: a stereo capture with different
+        // left/right RMS draws two different bars (the L/R separation the user's
+        // report proved — Web L=0.210 R=0.278 — must not be lost in the change
+        // that removed the fader correction: nothing here sums or maxes).
+        let left_only = crate::meters::level_from_amplitude(0.25);
+        let right_hotter = crate::meters::level_from_amplitude(0.05);
+        board.publish(slots[&casque_uid], [left_only, right_hotter]);
+        for tick in 320..400 {
+            s.feed_from_board(&board, now + METER_INTERVAL * tick, METER_INTERVAL);
+        }
+        let shown = s.levels_for(casque);
+        assert!(
+            (shown[0] - left_only).abs() < 1e-4 && (shown[1] - right_hotter).abs() < 1e-4,
+            "L and R must stay separate: {shown:?} vs [{left_only}, {right_hotter}]"
+        );
+        assert!(shown[0] > shown[1] + 0.15, "{shown:?}");
     }
 
     #[test]

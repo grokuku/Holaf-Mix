@@ -971,16 +971,18 @@ pub struct Report {
     /// cannot be told apart from “the levels never arrive”.  It is the *drawn*
     /// value — envelope included — so it is exactly what is on screen.
     pub meter_levels: Vec<(String, String, [f32; 2])>,
-    /// `(uid, linear gain)` applied to a capture that is tapped **before** the
-    /// strip's fader (a physical device's source/monitor), printed in the
-    /// METERING section.
+    /// How each strip's VU capture picks its fader up, `(uid, sentence)`, printed
+    /// in the METERING section.
     ///
-    /// It exists so “my VU ignores the fader” and “my VU is far too quiet” can
-    /// both be diagnosed from a pasted report: a `×0.027` next to a strip at
-    /// volume 0.3 is the post-fader correction working, and a missing gain on a
-    /// strip that *should* have one names the strip the UI treated as a virtual
-    /// bus.
-    pub vu_gains: Vec<(String, f32)>,
+    /// **No fader correction is applied by the UI any more**, because the engine
+    /// makes every capture post-fader exactly once (see `holaf_ui::meters` and
+    /// `holaf-pw/tests/backend_live.rs`).  The report therefore has to state the
+    /// *rule* it relied on, per strip, read from the engine's `meter_tap` (the
+    /// live node's `monitor.channel-volumes`): “the bar is low because the signal
+    /// there is low” and “the bar is low because the compensation is broken” are
+    /// otherwise indistinguishable from a pasted report — and the second one was
+    /// the reported “VU des sorties beaucoup beaucoup trop bas”.
+    pub meter_taps: Vec<(String, String)>,
     /// The capture children themselves: source, pid, state, blocks, rejects,
     /// last level and what `pw-cat` said on stderr (see [`CaptureSummary`]).
     pub captures: CaptureSummary,
@@ -1066,10 +1068,9 @@ pub struct Inputs<'a> {
     /// `(uid, label, [left, right])` the VU bars currently draw (see
     /// [`Report::meter_levels`]).
     pub meter_levels: &'a [(String, String, [f32; 2])],
-    /// `(uid, linear gain)` the UI multiplies a **pre-fader** capture by (see
-    /// [`Report::vu_gains`]).  Only strips whose fader sits after the capture
-    /// tap appear here.
-    pub vu_gains: &'a [(String, f32)],
+    /// `(uid, sentence)` describing how each strip's capture picks up its fader
+    /// (see [`Report::meter_taps`]).
+    pub meter_taps: &'a [(String, String)],
     /// The capture children's own status (`None` = no capture instrumentation:
     /// a mock build, or no real engine attached).
     pub captures: Option<&'a CaptureSummary>,
@@ -1092,7 +1093,7 @@ impl<'a> Inputs<'a> {
             missing_devices: &[],
             meter_missing: &[],
             meter_levels: &[],
-            vu_gains: &[],
+            meter_taps: &[],
             captures: None,
             config_path: None,
             now_unix: 0,
@@ -1116,7 +1117,7 @@ impl Report {
             missing_devices: inputs.missing_devices.to_vec(),
             meter_missing: inputs.meter_missing.to_vec(),
             meter_levels: inputs.meter_levels.to_vec(),
-            vu_gains: inputs.vu_gains.to_vec(),
+            meter_taps: inputs.meter_taps.to_vec(),
             captures: inputs.captures.cloned().unwrap_or_default(),
             captures_instrumented: inputs.captures.is_some(),
             recorder: recorder_probe(),
@@ -1937,24 +1938,54 @@ impl Report {
                 } else {
                     ""
                 };
-                // A pre-fader capture (a physical strip's device tap) is scaled
-                // by the strip's fader before it is drawn: say so, otherwise a
-                // bar that does not match the raw monitor looks like a bug.
-                let gain = self
-                    .vu_gains
+                // Every capture is post-fader, so the UI applies **no** gain: say
+                // which rule made the tap post-fader for this strip, otherwise a bar
+                // that does not match the user's expectation looks like a bug (and
+                // the missing statement was the reported “VU des sorties beaucoup
+                // beaucoup trop bas”).
+                let tap = self
+                    .meter_taps
                     .iter()
-                    .find(|(gain_uid, _)| gain_uid == uid)
-                    .map(|(_, gain)| *gain)
-                    .unwrap_or(1.0);
-                let fader = if (gain - 1.0).abs() > f32::EPSILON {
-                    format!("  (post-fader x{gain:.3})")
-                } else {
-                    String::new()
-                };
+                    .find(|(tap_uid, _)| tap_uid == uid)
+                    .map(|(_, tap)| tap.as_str())
+                    .unwrap_or("post-fader");
                 lines.push(format!(
-                    "    - {:<24} L={left:.3} R={right:.3}{source}{fader}",
+                    "    - {:<24} L={left:.3} R={right:.3}{source}  ({tap}, no VU gain)",
                     label
                 ));
+                // A bar at 0.000 that *has* a signal is a different story: the
+                // level is under [`crate::meters::LEVEL_FLOOR_DB`] and the scale
+                // cannot show it.  Say it — “the VU is much too low” was the report,
+                // and after the double attenuation was removed a mix that really is
+                // at −66 dBFS still reads 0.000 with nothing to explain it.
+                let captured = self
+                    .captures
+                    .sources
+                    .iter()
+                    .find(|facts| facts.uid == *uid)
+                    .and_then(|facts| facts.last_rms)
+                    .map(|rms| rms[0].abs().max(rms[1].abs()))
+                    .unwrap_or(0.0);
+                if left.max(*right) <= 0.0 && captured > 0.0 {
+                    lines.push(format!(
+                        "      signal {:.0} dBFS is under the {:.0} dBFS floor - the bar cannot \
+                         show it (raise this fader or the source up the chain)",
+                        crate::meters::amplitude_to_db(captured),
+                        crate::meters::LEVEL_FLOOR_DB
+                    ));
+                }
+            }
+            // The garde-fou: state the correction that is NOT applied, and why.
+            lines.push("  VU gain: none".to_string());
+            for line in [
+                "    every capture is post-fader exactly once: the engine puts the strip volume",
+                "    on the master node's `channelVolumes` and makes that node's monitor follow",
+                "    it (through `monitorVolumes`, or through the node's own",
+                "    `monitor.channel-volumes`).  Measured on PipeWire 1.4.2: 0.3535 at fader",
+                "    1.0 -> 0.0095 at 0.3, bus and device alike.  The UI applies no",
+                "    correction at all, so a low bar is a low signal.",
+            ] {
+                lines.push(line.to_string());
             }
             // The dBFS the bar means: what a report reader needs to tell “this
             // strip is loud” from “this strip is at the top of the scale”.
@@ -2704,30 +2735,51 @@ mod tests {
         );
         // The scale is spelled out, so a reader can tell 0.73 from “full”.
         assert!(text.contains("0 dBFS -> 0.91"), "{text}");
-        // A **pre-fader** capture (a physical strip's device tap) is scaled by
-        // the strip's fader before it is drawn; the report prints the factor so
-        // “my VU ignores the fader” and “my VU is far too quiet” are
-        // distinguishable — and a strip with no factor is visibly a virtual one.
+        // The UI applies **no** fader correction any more (every capture is
+        // post-fader, see `holaf_ui::meters`), so the report must *state* the rule
+        // it relied on, per strip: “the bar is low because the signal is low” and
+        // “the bar is low because the correction is broken” are otherwise
+        // indistinguishable from a pasted report — the second one was the reported
+        // “VU des sorties beaucoup beaucoup trop bas”.
         let report = Report::collect(&Inputs {
             status: Some(&status),
             strips: &strips,
             meter_levels: &levels,
-            vu_gains: &[("in-mic".to_string(), 0.614_125_f32)],
+            meter_taps: &[
+                (
+                    "in-mic".to_string(),
+                    "post-fader (monitorVolumes)".to_string(),
+                ),
+                (
+                    "out-casque".to_string(),
+                    "post-fader (monitor follows channelVolumes)".to_string(),
+                ),
+            ],
             now_unix: 1_700_000_000,
             ..Inputs::empty(&strips)
         });
         let text = report.text();
         assert!(
-            text.contains("L=0.301 R=0.299") && text.contains("(post-fader x0.614)"),
+            text.contains("L=0.301 R=0.299  (post-fader (monitorVolumes), no VU gain)"),
             "{text}"
         );
-        // …and the strip without a gain shows none.
+        // The garde-fou line names the *absence* of the correction and its reason.
+        assert!(text.contains("VU gain: none"), "{text}");
+        assert!(
+            text.contains("UI applies no") && text.contains("correction at all"),
+            "{text}"
+        );
+        assert!(text.contains("0.0095 at 0.3"), "{text}");
+        // A device strip says which rule made *its* tap post-fader.
         let casque_lines = text
             .lines()
             .filter(|line| line.contains("Casque"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!casque_lines.contains("post-fader"), "{casque_lines}");
+        assert!(
+            casque_lines.contains("post-fader (monitor follows channelVolumes)"),
+            "{casque_lines}"
+        );
 
         // A report with no strips drawing anything says so (never an empty
         // heading that reads like a truncated report).
@@ -2736,6 +2788,65 @@ mod tests {
             empty.text().contains("(no strip is drawing a level)"),
             "{}",
             empty.text()
+        );
+    }
+
+    /// **A bar at 0.000 that has a signal is not a mystery, it is the scale.**
+    ///
+    /// The reported “VU des sorties beaucoup beaucoup trop bas” had two layers: a
+    /// fader applied twice (now impossible, the engine makes every capture
+    /// post-fader once) *and* a mix whose last stage really sits at −66 dBFS, i.e.
+    /// under [`crate::meters::LEVEL_FLOOR_DB`].  The report must say so — otherwise
+    /// the reader is back to guessing whether the meter is broken.
+    #[test]
+    fn a_bar_at_zero_with_a_signal_says_it_is_under_the_floor() {
+        let strips = strips();
+        let levels = vec![(
+            "out-casque".to_string(),
+            "Casque".to_string(),
+            [0.0_f32, 0.0],
+        )];
+        // What the user's own report showed on the HP strip: rms 0.0005 (≈ −66 dBFS)
+        // captured, drawn as 0.000 because the scale starts at −60 dBFS.
+        let mut facts = capture_facts(
+            "out-casque",
+            "alsa_output.usb.analog-stereo.monitor",
+            CaptureState::Streaming,
+            420,
+        );
+        facts.last_rms = Some([0.0005, 0.0005]);
+        let captures = summary_of(vec![facts.clone()]);
+        let report = Report::collect(&Inputs {
+            strips: &strips,
+            meter_levels: &levels,
+            captures: Some(&captures),
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        let text = report.text();
+        assert!(
+            text.contains("signal -66 dBFS is under the -60 dBFS floor"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the bar cannot show it") && text.contains("raise this fader"),
+            "{text}"
+        );
+        // A **silent** capture is a different answer: no signal, so no note (the
+        // bar being dark is then exactly right and `metering_silent` says why).
+        let mut silent = facts.clone();
+        silent.last_rms = Some([0.0, 0.0]);
+        let quiet = Report::collect(&Inputs {
+            strips: &strips,
+            meter_levels: &levels,
+            captures: Some(&summary_of(vec![silent])),
+            now_unix: 1_700_000_000,
+            ..Inputs::empty(&strips)
+        });
+        assert!(
+            !quiet.text().contains("under the -60 dBFS floor"),
+            "{}",
+            quiet.text()
         );
     }
 

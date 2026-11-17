@@ -53,7 +53,7 @@
 //! chain that no longer wants any effect.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -375,6 +375,10 @@ impl PwSession {
 
     /// Bind a live node by name to a typed proxy (for `set_param`); `Ok(None)`
     /// when the node is absent (e.g. a physical device not plugged in).
+    ///
+    /// Kept round-trip-for-round-trip identical to what it always was: the FX
+    /// parameter path (a knob drag) calls it on every change and must not pay the
+    /// extra info round-trip [`Self::bind_node_with_tap`] needs.
     fn bind_node_by_name(&self, name: &str) -> Result<Option<pw::node::Node>, BackendError> {
         let snap = self.snapshot();
         let Some(global) = snap
@@ -394,6 +398,67 @@ impl PwSession {
             .bind(global)
             .map(Some)
             .map_err(|e| BackendError::internal(&format!("bind node '{name}'"), e))
+    }
+
+    /// Bind a live node by name **and** report how its monitor tap follows the
+    /// strip volume (see [`crate::live::MonitorTap`]).
+    ///
+    /// The property is read from the **bound node's info**, not from the registry
+    /// global: PipeWire only exports a fixed key subset there (`node.name`,
+    /// `media.class`, `object.serial`, the client fields…) — verified on 1.4.2 with
+    /// `pw-cli ls Node`, which never shows `monitor.channel-volumes` even though
+    /// `pw-cli info <id>` does.  Reading the global was the first attempt and it
+    /// silently answered “not set”, i.e. it kept the double attenuation the whole
+    /// change exists to remove.
+    ///
+    /// A node whose property is absent reads as
+    /// [`MonitorTap::MonitorVolumes`], i.e. exactly the behaviour every version of
+    /// the engine had — the neutralised case only kicks in when the graph really
+    /// says `monitor.channel-volumes = true`.
+    fn bind_node_with_tap(
+        &self,
+        name: &str,
+    ) -> Result<Option<(pw::node::Node, crate::live::MonitorTap)>, BackendError> {
+        let snap = self.snapshot();
+        let Some(global) = snap.iter().find(|g| {
+            g.type_ == pw::types::ObjectType::Node
+                && g.props.as_ref().and_then(|p| p.get("node.name")) == Some(name)
+        }) else {
+            return Ok(None);
+        };
+        let registry = self
+            .core
+            .get_registry()
+            .map_err(|e| BackendError::internal("get_registry", e))?;
+        let node = registry
+            .bind(global)
+            .map_err(|e| BackendError::internal(&format!("bind node '{name}'"), e))?;
+        let tap = self.monitor_tap_of(&node);
+        Ok(Some((node, tap)))
+    }
+
+    /// `monitor.channel-volumes` of a **bound** node (see
+    /// [`Self::bind_node_with_tap`]): one info listener and one round-trip.
+    fn monitor_tap_of(&self, node: &pw::node::Node) -> crate::live::MonitorTap {
+        let seen: Rc<std::cell::RefCell<Option<bool>>> = Rc::new(std::cell::RefCell::new(None));
+        let slot = seen.clone();
+        let listener = node.add_listener_local().info(move |info| {
+            let value = info
+                .props()
+                .as_ref()
+                .and_then(|props| props.get("monitor.channel-volumes"))
+                .map(|value| value == "true");
+            *slot.borrow_mut() = Some(value.unwrap_or(false));
+        });
+        let _listener = listener.register();
+        self.roundtrip();
+        let follows_channel_volumes = seen.borrow().unwrap_or(false);
+        drop(_listener);
+        if follows_channel_volumes {
+            crate::live::MonitorTap::ChannelVolumes
+        } else {
+            crate::live::MonitorTap::MonitorVolumes
+        }
     }
 
     /// Bind the live metadata object named `metadata.name == "default"`.
@@ -497,6 +562,16 @@ pub struct Engine {
     /// [`MonoDownmix`]): `Left` by default — the Python behaviour — and set by
     /// the UI from `ui_rust.mono_downmix` (`EngineOp::SetMonoDownmix`).
     downmix: MonoDownmix,
+    /// How a strip's VU capture picks its fader up, per **master node name**
+    /// (`monitor.channel-volumes`, see [`crate::live::MonitorTap`]).
+    ///
+    /// Filled whenever the engine binds a node to push its volume, and read by
+    /// `status` (`meter_tap`) so the diagnostic report can say *why* the VU applies
+    /// no fader correction.  It is a cache because reading the property needs the
+    /// **bound node's info** (a round-trip), which a 25 Hz status poll must not
+    /// pay per strip.  Unknown nodes read as [`crate::live::MonitorTap::MonitorVolumes`],
+    /// i.e. the historical behaviour.
+    monitor_taps: HashMap<String, crate::live::MonitorTap>,
     /// Mainloop iterations performed while no order was in flight.
     ///
     /// Diagnostics only (reported by `status`): a daemon that hosts filter
@@ -554,6 +629,7 @@ impl Engine {
             pending: IndexMap::new(),
             repair_attempts: 0,
             next_repair_at: Instant::now(),
+            monitor_taps: HashMap::new(),
             idle_pumps: 0,
         })
     }
@@ -1320,17 +1396,22 @@ impl Engine {
         // `MonoDownmix::gain_trim`); every other case gets unity, i.e. the pod
         // written here is byte-identical to the historical one.
         let trim = self.downmix_trim(&strip.uid);
-        match self.session.bind_node_by_name(&master) {
-            Ok(Some(node)) => {
-                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute, trim) {
+        match self.session.bind_node_with_tap(&master) {
+            Ok(Some((node, tap))) => {
+                self.monitor_taps.insert(master.clone(), tap);
+                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute, trim, tap) {
                     log::warn!("strip '{}': volume push failed: {}", strip.label, e.message);
                 }
                 // Flush the outbound set_param (delivered on mainloop iterate).
                 self.session.roundtrip();
                 self.session
                     .sleep_pumping(Duration::from_millis(VOLUME_SETTLE_MS));
-                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute, trim) {
-                    log::warn!("strip '{}': volume re-push failed: {}", strip.label, e.message);
+                if let Err(e) = push_volume_mute_pod(&node, strip.volume, strip.mute, trim, tap) {
+                    log::warn!(
+                        "strip '{}': volume re-push failed: {}",
+                        strip.label,
+                        e.message
+                    );
                 }
                 self.session.roundtrip();
             }
@@ -1631,6 +1712,7 @@ impl Engine {
             let Some(node) = view.node_named(&name) else {
                 continue;
             };
+
             if view.port_fr(node.id, PortDir::In).is_none() {
                 mono += 1;
             } else {
@@ -1685,14 +1767,14 @@ impl Engine {
         let trim = self.downmix_trim(uid);
         let master = self.strip_master_node_name(uid);
         if let Some(name) = master {
-            if let Some(node) = self.session.bind_node_by_name(&name)? {
-                push_volume_mute_pod(&node, value, mute, trim)?;
+            if let Some((node, tap)) = self.session.bind_node_with_tap(&name)? {
+                self.monitor_taps.insert(name, tap);
+                push_volume_mute_pod(&node, value, mute, trim, tap)?;
                 self.session.roundtrip();
             }
         }
         Ok(json!({ "ok": true, "uid": uid, "value": value }))
     }
-
     fn set_mute(&mut self, uid: &str, muted: bool) -> Result<JsonValue, BackendError> {
         let volume = {
             let strip = self
@@ -1705,14 +1787,14 @@ impl Engine {
         let trim = self.downmix_trim(uid);
         let master = self.strip_master_node_name(uid);
         if let Some(name) = master {
-            if let Some(node) = self.session.bind_node_by_name(&name)? {
-                push_volume_mute_pod(&node, volume, muted, trim)?;
+            if let Some((node, tap)) = self.session.bind_node_with_tap(&name)? {
+                self.monitor_taps.insert(name, tap);
+                push_volume_mute_pod(&node, volume, muted, trim, tap)?;
                 self.session.roundtrip();
             }
         }
         Ok(json!({ "ok": true, "uid": uid, "muted": muted }))
     }
-
     fn set_mono(&mut self, uid: &str, mono: bool) -> Result<JsonValue, BackendError> {
         {
             let strip = self
@@ -1737,7 +1819,6 @@ impl Engine {
         }
         Ok(json!({ "ok": true, "uid": uid, "mono": mono, "changed": true }))
     }
-
     // ------------------------------------------------------------------
     // FX toggles / params (hot-reload path)
     // ------------------------------------------------------------------
@@ -1792,9 +1873,12 @@ impl Engine {
                                 uid: uid.to_string(),
                             },
                         );
+
                     }
                 } else {
                     return Err(e);
+
+
                 }
             }
         }
@@ -1877,7 +1961,6 @@ impl Engine {
         }
         Some(self.names.master_node(strip))
     }
-
 
     /// Create the audio links between a source node and a sink node (FL→FL,
     /// FR→FR; mono → FL duplicated on both, exactly like the Python
@@ -2116,6 +2199,26 @@ impl Engine {
     }
 
     fn status(&mut self) -> Result<JsonValue, BackendError> {
+        // How each strip's VU capture picks up its fader: `meter_tap` comes from the
+        // cache filled when the engine pushes a volume (`monitor.channel-volumes`,
+        // read from the bound node's info — the registry global does not export
+        // it).  The diagnostic report prints it, so a report says *why* the VU
+        // applies no fader correction instead of leaving a bar that “does not match
+        // the monitor” unexplained.  A node the engine never pushed a volume to
+        // reads as `monitor-volumes`, i.e. the historical behaviour.
+        let taps: HashMap<String, &'static str> = self
+            .strips
+            .values()
+            .map(|strip| {
+                let master = self.names.master_node(strip);
+                let tap = self
+                    .monitor_taps
+                    .get(&master)
+                    .copied()
+                    .unwrap_or(crate::live::MonitorTap::MonitorVolumes);
+                (strip.uid.clone(), tap.as_str())
+            })
+            .collect();
         // Every strip plus its **public handle**: `node_name` is the bus node
         // other programs target (`Holaf_Bus_<Label>`, see
         // [`graph::bus_node_name`]).  Clients (the Qt UI moving an app onto a
@@ -2129,6 +2232,12 @@ impl Engine {
                     .map_err(|e| BackendError::internal("status", e))?;
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("node_name".into(), json!(self.bus_name(&strip.uid)));
+                    obj.insert(
+                        "meter_tap".into(),
+                        json!(taps.get(&strip.uid).copied().unwrap_or_else(|| {
+                            crate::live::MonitorTap::MonitorVolumes.as_str()
+                        })),
+                    );
                 }
                 Ok(value)
             })
@@ -2521,26 +2630,49 @@ pub(crate) fn push_params_pod(
 /// (`0.44` → `0.085`), otherwise every strip plays **+14 dB** louder than with
 /// the Python engine (measured bug report: "much louder, VU meters pinned").
 ///
-/// # Why `monitorVolumes` / `monitorMute` are set too
+/// # Why `monitorVolumes` / `monitorMute` are set too — and when they are not
 ///
-/// The monitor tap of a sink (`<node>.monitor`, what the Python VU-meter engine
-/// records) has its **own** gain (`Props:monitorVolumes`).  The Python engine
-/// sets it explicitly (`pactl set-source-volume <monitor> <pct>%` and
-/// `set-source-mute`), so leaving it at unity makes every VU bar read the
-/// pre-fader level: "both output strips' meters are pinned while the sliders
-/// are low" — the other half of the same bug report.
+/// The monitor tap of a sink (`<node>.monitor`, what the VU capture records) has
+/// its **own** gain (`Props:monitorVolumes`), and the node property
+/// `monitor.channel-volumes` decides whether `channelVolumes` also applies to it.
+/// The engine makes the tap **post-fader exactly once**, whichever kind of node
+/// it is holding:
+///
+/// * [`MonitorTap::MonitorVolumes`] (the `adapter` default: bare null-sinks, ALSA
+///   nodes): the tap ignores `channelVolumes`, so `monitorVolumes = gain` is what
+///   makes the VU follow the fader.  This is also the Python behaviour
+///   (`pactl set-source-volume <monitor> <pct>%`); leaving it at unity made every
+///   output bar read the pre-fader level.
+/// * [`MonitorTap::ChannelVolumes`] (`module-null-sink`, WirePlumber's fallback
+///   `auto_null`): the tap already is the fader output, so `monitorVolumes` is set
+///   to **unity** — writing the gain there as well attenuated twice (measured on
+///   PipeWire 1.4.2: 0.3536 at unity → 0.000258 at fader 0.3, i.e. `gain²`, where
+///   post-fader is 0.0095).  Unity is written rather than skipped so a stale
+///   `monitorVolumes` from an older run (WirePlumber restores per-node state) is
+///   neutralised instead of silently halving the VU.
 fn push_volume_mute_pod(
     node: &pw::node::Node,
     volume: f32,
     mute: bool,
     trim: f32,
+    tap: crate::live::MonitorTap,
 ) -> Result<(), BackendError> {
     // `trim` is the mono-downmix compensation (`MonoDownmix::gain_trim`): 1.0
     // unless the strip sums both channels into a mono target, in which case
     // −6 dB turns the sum into the average.  It scales **both** gains, so the
-    // VU (which reads `monitorVolumes`) stays post-fader.
-    let trim = if trim.is_finite() && trim > 0.0 { trim } else { 1.0 };
+    // VU (which reads the monitor tap) stays post-fader.
+    let trim = if trim.is_finite() && trim > 0.0 {
+        trim
+    } else {
+        1.0
+    };
     let gain = holaf_core::model::pulse_linear_gain(volume) * trim;
+    // The tap's own gain: the strip gain, or unity when the tap already follows
+    // `channelVolumes` (never both, or the VU reads `gain²`).
+    let monitor = match tap {
+        crate::live::MonitorTap::MonitorVolumes => gain,
+        crate::live::MonitorTap::ChannelVolumes => 1.0,
+    };
     let object = Value::Object(pw::spa::pod::Object {
         type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
         id: pw::spa::sys::SPA_PARAM_Props,
@@ -2555,11 +2687,17 @@ fn push_volume_mute_pod(
             ),
             pw::spa::pod::Property::new(
                 pw::spa::sys::SPA_PROP_monitorVolumes,
-                Value::ValueArray(pw::spa::pod::ValueArray::Float(vec![gain; 2])),
+                Value::ValueArray(pw::spa::pod::ValueArray::Float(vec![monitor; 2])),
             ),
             pw::spa::pod::Property::new(
                 pw::spa::sys::SPA_PROP_monitorMute,
-                Value::Bool(mute),
+                // A tap that follows `channelVolumes` follows `mute` as well
+                // (measured), so its own mute stays off; the other kind needs it,
+                // otherwise a muted strip keeps drawing a level.
+                Value::Bool(match tap {
+                    crate::live::MonitorTap::MonitorVolumes => mute,
+                    crate::live::MonitorTap::ChannelVolumes => false,
+                }),
             ),
         ],
     });

@@ -129,6 +129,25 @@ pub struct LiveNode {
     pub id: u32,
     pub name: String,
     pub media_class: String,
+    /// The node property `monitor.channel-volumes`: does this node's **monitor
+    /// tap** already apply its `channelVolumes`?
+    ///
+    /// It decides how the engine makes a VU capture post-fader, and getting it
+    /// wrong is audible as a bar that is “beaucoup trop bas” — so it is read from
+    /// the graph rather than assumed per strip kind:
+    ///
+    /// * `false` (the `adapter` default, and what a bare `null-audio-sink` or an
+    ///   ALSA node has): the tap ignores `channelVolumes`, so the engine writes
+    ///   `monitorVolumes = gain` and the capture is post-fader **once**;
+    /// * `true` (`module-null-sink`, WirePlumber's fallback `auto_null`): the tap
+    ///   *is* the fader output, so writing `monitorVolumes = gain` as well applies
+    ///   the volume **twice** (measured on a `monitor.channel-volumes=true` sink,
+    ///   PipeWire 1.4.2: 0.3536 at unity → 0.000258 at fader 0.3 = `gain²`, where
+    ///   the correct post-fader reading is 0.0095 = `gain`).  The engine neutralises
+    ///   `monitorVolumes` there instead.
+    ///
+    /// Absent from the global's properties means `false`.
+    pub monitor_channel_volumes: bool,
     /// `node.description` (or `node.nick`), when the node publishes one.
     ///
     /// This is the **human** name of the device (`Studio 26c`, `Built-in Audio
@@ -153,6 +172,39 @@ impl LiveNode {
     /// Is this one of our bus nodes (it carries a `holaf.uid`)?
     pub fn is_ours(&self) -> bool {
         self.uid.is_some()
+    }
+
+    /// How this node's monitor tap picks up the strip volume — the rule the
+    /// engine applies to make a VU capture post-fader exactly once.
+    pub fn monitor_tap(&self) -> MonitorTap {
+        if self.monitor_channel_volumes {
+            MonitorTap::ChannelVolumes
+        } else {
+            MonitorTap::MonitorVolumes
+        }
+    }
+}
+
+/// Which gain a node's **monitor tap** follows (see
+/// [`LiveNode::monitor_channel_volumes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorTap {
+    /// `monitor.channel-volumes = true`: the tap already follows
+    /// `channelVolumes`, so `monitorVolumes` must stay at unity.
+    ChannelVolumes,
+    /// `monitor.channel-volumes = false` (the default): the tap follows
+    /// `monitorVolumes`, which the engine sets to the strip gain.
+    MonitorVolumes,
+}
+
+impl MonitorTap {
+    /// Short name for the `status` payload (the diagnostic report prints it, so a
+    /// pasted report says *why* the VU has no fader correction).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MonitorTap::ChannelVolumes => "channel-volumes",
+            MonitorTap::MonitorVolumes => "monitor-volumes",
+        }
     }
 }
 
@@ -214,6 +266,8 @@ pub fn collect_view(globals: &[GlobalObject<PropertiesBox>]) -> LiveView {
                     id: g.id,
                     name,
                     media_class: prop(g, "media.class").unwrap_or_default(),
+                    monitor_channel_volumes: prop(g, "monitor.channel-volumes").as_deref()
+                        == Some("true"),
                     description: prop(g, "node.description")
                         .or_else(|| prop(g, "node.nick"))
                         .map(|text| text.trim().to_string())

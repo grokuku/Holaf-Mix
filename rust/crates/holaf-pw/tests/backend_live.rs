@@ -986,6 +986,204 @@ fn the_vu_monitor_level_follows_the_strip_fader() {
     backend.stop().expect("stop");
 }
 
+/// Create a sink node with the **`monitor.channel-volumes` property of our
+/// choice**, which is the whole point of the measurement below.
+///
+/// `true` is what a `pipewire-pulse` `module-null-sink` publishes (and what the
+/// WirePlumber fallback `auto_null` sink sets); `false` is the `adapter` default
+/// (bare null-sinks, ALSA nodes).  Created through `pw-cli create-node` rather
+/// than `pactl` so the test does not need a pulse server behind the headless
+/// daemon — and so both cases are reachable on the same bench.
+fn create_sink(name: &str, monitor_channel_volumes: bool) -> bool {
+    let spec = format!(
+        "create-node adapter {{ factory.name=support.null-audio-sink node.name={name} \
+         node.description={name} media.class=Audio/Sink object.linger=true \
+         audio.channels=2 audio.position=[ FL FR ] monitor.channel-volumes={monitor_channel_volumes} }}"
+    );
+    run("pw-cli", &[&spec]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if node_id_by_name(name).is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// **Device monitor vs bus monitor: same signal, same fader, same level — and
+/// the fader applies exactly once on both.**
+///
+/// This is the measurement behind the removed `fader_compensation` (user report:
+/// “le vu-mètre des sorties est beaucoup beaucoup trop bas, ce n'est pas normal”).
+/// One tone is played into one input strip routed to **two** outputs: a virtual
+/// bus (the engine's own adapter, `monitor.channel-volumes` unset) and a
+/// *device-like* sink (`monitor.channel-volumes = true`, the rule a
+/// pipewire-pulse sink and the WirePlumber fallback sink publish).  Both monitors
+/// are recorded at fader 1.0 and at fader 0.3.
+///
+/// Expected, and asserted:
+///
+/// * at 1.0 the two monitors read the same RMS (±20 %) — a capture can be
+///   compared to its neighbour;
+/// * at 0.3 each reads `pulse_linear_gain(0.3) = 0.027` of that (a ratio of
+///   0.018…0.040), and **not** `0.027² = 0.00073`, which is what writing
+///   `channelVolumes` *and* `monitorVolumes` on a node whose monitor already
+///   follows `channelVolumes` used to produce (measured on a pactl sink,
+///   PipeWire 1.4.2: 0.3536 → 0.000258).
+///
+/// A capture is therefore post-fader on every strip kind — which is why the UI
+/// applies no fader correction any more (see `holaf_ui::meters`).
+#[test]
+fn the_device_and_bus_monitors_read_the_same_post_fader_level() {
+    let _guard = live_lock();
+    let _ = env_logger::try_init();
+    if !live_allowed() {
+        eprintln!("SKIP backend_live: no headless PipeWire configured (set XDG_RUNTIME_DIR to the headless runtime or HOLAF_PW_LIVE=1)");
+        return;
+    }
+    fresh_sandbox_daemon();
+
+    // A device-like sink whose monitor already follows `channelVolumes`.
+    const DEVICE: &str = "alsa_output.holaf_vu_device.analog-stereo";
+    if !create_sink(DEVICE, true) {
+        eprintln!("SKIP the_device_and_bus_monitors_read_the_same_post_fader_level: pw-cli could not create {DEVICE}");
+        return;
+    }
+
+    let mut backend = match PipeWireBackend::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP backend_live: cannot reach a PipeWire daemon: {e}");
+            return;
+        }
+    };
+    let _ = backend.stop();
+
+    // One source, two outputs: a virtual bus and the device.
+    let mut device_out = Strip::with_uid("o-vu-dev", "VU Dev", StripType::Output);
+    device_out.device_name = Some(DEVICE.to_string());
+    device_out.volume = 1.0;
+    let mut bus_out = Strip::with_uid("o-vu-bus", "VU Bus", StripType::Output);
+    bus_out.volume = 1.0;
+    let mut source = Strip::with_uid("i-vu-src", "VU Src", StripType::Input);
+    source.volume = 1.0;
+    source.routes = vec!["o-vu-dev".to_string(), "o-vu-bus".to_string()];
+    let res = backend
+        .apply_snapshot(&[device_out, bus_out, source])
+        .expect("apply_snapshot (vu semantics)");
+    assert_eq!(res["degraded"], false, "{res}");
+
+    let sources = backend.meter_sources().expect("meter.sources");
+    let bus_source = sources["sources"]["o-vu-bus"]
+        .as_str()
+        .expect("the virtual strip has a source")
+        .to_string();
+    let bus_node = bus_source
+        .strip_suffix(".monitor")
+        .expect("a virtual bus is metered through its monitor")
+        .to_string();
+    // The input strip's own bus: where the tone is injected (both outputs are
+    // fed by it, so they receive byte-identical signal).
+    let src_node = sources["sources"]["i-vu-src"]
+        .as_str()
+        .expect("the input strip has a source")
+        .strip_suffix(".monitor")
+        .expect("a virtual bus is metered through its monitor")
+        .to_string();
+    assert_eq!(
+        sources["sources"]["o-vu-dev"].as_str(),
+        Some(format!("{DEVICE}.monitor").as_str()),
+        "a physical strip is metered through its device monitor"
+    );
+
+    // The tone plays into the input strip's bus, so both outputs receive the
+    // same signal (and the input fader, at 1.0, is out of the picture).
+    let wav = std::path::PathBuf::from("/tmp/holaf-vu-tone.wav");
+    write_tone(&wav, 0.5);
+    let mut player = Command::new("pw-cat")
+        .args(["--playback", "--target"])
+        .arg(&src_node)
+        .arg(&wav)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the tone");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let bus_loud = monitor_rms(&bus_node, 2).expect("the bus monitor is recordable");
+    let dev_loud = monitor_rms(DEVICE, 2).expect("the device monitor is recordable");
+    assert!(
+        bus_loud > 0.2 && dev_loud > 0.2,
+        "the tone must reach both monitors (bus {bus_loud}, device {dev_loud})"
+    );
+    let ratio = dev_loud / bus_loud;
+    assert!(
+        (0.8..=1.25).contains(&ratio),
+        "at the same fader the device and the bus must read the same level: \
+         device {dev_loud} vs bus {bus_loud} (ratio {ratio})"
+    );
+
+    // Fader 0.3 on the *device* strip: post-fader exactly once.
+    backend.set_volume("o-vu-dev", 0.3).expect("set_volume 0.3");
+    std::thread::sleep(Duration::from_millis(400));
+    let dev_quiet = monitor_rms(DEVICE, 2).expect("the device monitor is recordable");
+    let dev_ratio = dev_quiet / dev_loud;
+    assert!(
+        (0.018..=0.040).contains(&dev_ratio),
+        "the device monitor must follow the fader by pulse_linear_gain(0.3) = 0.027: \
+         {dev_loud} → {dev_quiet} (ratio {dev_ratio})"
+    );
+    assert!(
+        dev_quiet > dev_loud * 0.005,
+        "0.0007 would be `gain²` — the double attenuation this test exists for (got {dev_quiet})"
+    );
+
+    // …and the same fader on the *virtual* strip behaves identically, which is
+    // what lets the UI ignore the strip kind entirely.
+    backend.set_volume("o-vu-bus", 0.3).expect("set_volume 0.3");
+    std::thread::sleep(Duration::from_millis(400));
+    let bus_quiet = monitor_rms(&bus_node, 2).expect("the bus monitor is recordable");
+    let bus_ratio = bus_quiet / bus_loud;
+    assert!(
+        (0.018..=0.040).contains(&bus_ratio),
+        "the bus monitor must follow the fader the same way: {bus_loud} → {bus_quiet} \
+         (ratio {bus_ratio})"
+    );
+    let after = dev_quiet / bus_quiet;
+    assert!(
+        (0.8..=1.25).contains(&after),
+        "both strips are metered post-fader once: device {dev_quiet} vs bus {bus_quiet} \
+         (ratio {after})"
+    );
+
+    // The report needs to say *which* rule made the tap post-fader: the status
+    // carries it per strip (`meter_tap`), read from the graph rather than guessed.
+    eprintln!(
+        "VU semantics (PipeWire live): fader 1.0 → bus {bus_loud:.4} / device {dev_loud:.4}; \
+         fader 0.3 → bus {bus_quiet:.4} (×{bus_ratio:.4}) / device {dev_quiet:.4} (×{dev_ratio:.4})"
+    );
+    let status = backend.status().expect("status");
+    let tap_of = |uid: &str| {
+        status["strips"]
+            .as_array()
+            .and_then(|strips| {
+                strips
+                    .iter()
+                    .find(|strip| strip["uid"].as_str() == Some(uid))
+                    .and_then(|strip| strip["meter_tap"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(tap_of("o-vu-dev"), "channel-volumes", "{status}");
+    assert_eq!(tap_of("o-vu-bus"), "monitor-volumes", "{status}");
+
+    let _ = player.kill();
+    let _ = player.wait();
+    backend.stop().expect("stop");
+}
+
 /// `channelVolumes` of a node, read back from the daemon (`pw-cli enum-params`).
 fn channel_volume(node_id: u32) -> Option<f32> {
     let text = run("pw-cli", &["enum-params", &node_id.to_string(), "Props"])?;

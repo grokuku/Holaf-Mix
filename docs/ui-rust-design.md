@@ -1191,7 +1191,9 @@ strip, volume du strip à 1.0 / 0.3 / 0.1 : RMS **0.3535 / 0.0096 / 0.0004**,
 c.-à-d. exactement `pulse_linear_gain(volume)` (courbe cubique PulseAudio).
 Activer `monitor.channel-volumes` **en plus** doublerait l'atténuation (mesuré :
 0.3 → 0.032 au lieu de 0.106) : c'est le piège à ne pas refaire, et l'UI ne
-multiplie donc **jamais** le niveau par le volume du strip.
+multiplie donc **jamais** le niveau par le volume du strip.  Depuis le
+2026-11-16 le moteur lit cette propriété sur le nœud et n'écrit `monitorVolumes`
+que lorsqu'elle est absente ou fausse : voir **§10sexies.2bis**.
 
 La vraie cause du « à fond » était donc l'**échelle** : `min(1, rms × 5)`
 (parité Qt) sature à RMS 0.2 = **−14 dBFS**, donc tout morceau ou toute voix
@@ -1269,12 +1271,109 @@ court se termine en `partial` au lieu de passer pour du silence.
 | 0.0316 | −30 | 0.16 | 0.50 | 0.45 |
 | 0.00316 | −50 | 0.02 | 0.17 | 0.15 | |
 
-En plus : un strip **mute** force un VU noir (le moteur coupe le monitor d'un bus,
-mais un strip physique enregistre sa *source* de device, dont `monitorMute` n'est
-pas à nous).  Tests : échelle (7 points + monotonie + silence/NaN), « un sinus
+Quatrième tour (2026-11-16, PipeWire 1.4.2 en dev, 1.6.11 chez l'utilisateur) —
+« les vu-mètres bougent, mais ils ont toujours un peu de lag » et « le vu-mètre
+des sorties est beaucoup beaucoup trop bas ».  Deux défauts distincts, tous deux
+corrigés par la mesure ; la sémantique et les relevés sont en **§10sexies.2bis**.
+
+En plus : un strip **mute** force un VU noir.  Le moteur écrit `mute` **et**
+`monitorMute` sur le nœud master, et il applique la combinaison correcte selon le
+nœud (voir §10sexies.2bis) : un monitor qui suit `channelVolumes` suit aussi son
+`mute` (mesuré), donc son `monitorMute` reste à `false` et n'est pas redondant.  Tests : échelle (7 points + monotonie + silence/NaN), « un sinus
 faible n'est pas à fond », post-fader (fader 1.0 vs 0.3 vs 0.5), mute → noir,
 **et deux tests live** (opt-in) : `the_vu_monitor_level_follows_the_strip_fader`
 (RMS du monitor à 1.0 vs 0.3 vs mute) et `a_live_capture_feeds_the_board`.
+
+### 10sexies.2bis Latence du VU et sémantique du monitoring (2026-11-16)
+
+Deux rapports utilisateur du même jour, diagnostiqués et corrigés **par la
+mesure**, sur le banc headless en **PipeWire 1.4.2** (l'utilisateur, lui, est en
+PipeWire 1.6.11 — c'est la seule chose qui reste à revérifier chez lui).
+
+#### a) La fenêtre RMS passe de 300 ms à 100 ms
+
+Verbatim : « les vu-mètres bougent, mais ils ont toujours un peu de lag.  tu
+affiches la valeur direct ou tu as une sorte d'inertie ? »  Inertie = fenêtre
+RMS (`meters::RmsWindow`) + release `exp(-dt/350 ms)`.  Le release **est** la
+ballistics d'un VU et ne change pas ; la fenêtre, elle, était celle d'un
+*loudness meter* (300 ms), pas d'un VU.
+
+Mesure (`meters::tests::the_window_is_short_enough_to_react_to_a_burst`, blocs de
+10 ms, lecture au poll de 25 Hz) — ton à −9 dBFS et burst de 50 ms :
+
+| fenêtre | temps pour atteindre 90 % de la lecture | pic d'un burst de 50 ms |
+|---|---|---|
+| 300 ms (avant) | **120 ms** (3 ticks d'UI) | 0.654 |
+| **100 ms (maintenant)** | **40 ms** (1 tick) | **0.727** |
+
+100 ms est le compromis : un tick de retard au lieu de trois, et toujours dix
+blocs moyennés — un bloc seul déplace la lecture de +10 dB, dix blocs de
++10·log10(11/10) ≈ 0,4 dB, donc ça ne « vibre » pas (le défaut d'avant était la
+fenêtre d'**un** bloc de 10 ms + max-hold, pas 100 ms).
+
+#### b) Le VU des sorties : double atténuation supprimée
+
+Verbatim : « le vu-mètre des sorties est beaucoup beaucoup trop bas, ce n'est pas
+normal ».  Rapport fourni : HP capte un RMS **10× plus faible** que le bus Web qui
+l'alimente.  La cause n'était pas « le monitor d'un device est pré-fader » mais
+**deux** règles de gain empilées.
+
+Ce qui décide, c'est la propriété de nœud **`monitor.channel-volumes`** :
+
+| nœud | propriété | monitor | `monitorVolumes = gain` en plus ? |
+|---|---|---|---|
+| `adapter`/`null-audio-sink` brut (bus du moteur), nœud ALSA | absente/fausse (défaut `pipewire.conf`) | **pré**-volume | **oui** — c'est ce qui rend le tap post-fader |
+| `module-null-sink` (pipewire-pulse), fallback `auto_null` de WirePlumber | `true` | **post**-volume (`channelVolumes`) | **non** — sinon `gain²` |
+
+Mesures (ton 1 kHz, amplitude 0.5 → RMS 0.3536 au repos) :
+
+| nœud `monitor.channel-volumes=true` | `channelVolumes` | `monitorVolumes` | RMS du monitor |
+|---|---|---|---|
+| sink pulse / nœud créé par `pw-cli` | 1.0 | 1.0 | 0.3536 |
+| idem | 0.3 (= 0.027) | 1.0 | **0.0095** (= `gain`, post-fader une fois) |
+| idem | 1.0 | 0.027 | 0.0095 |
+| idem | 0.027 | 0.027 | **0.000258** (= `gain²`, double atténuation) |
+| mute du sink | — | — | 0.0000 |
+
+Conséquences, toutes appliquées :
+
+1. **Moteur** (`holaf-pw`): `LiveNode::monitor_channel_volumes` est lu sur le
+   **nœud bindé** (`pw::node` info — les *globals* du registre n'exportent pas
+   cette clé, vérifié avec `pw-cli ls Node` vs `pw-cli info <id>`), et
+   `push_volume_mute_pod` écrit alors `monitorVolumes = 1.0` / `monitorMute =
+   false` au lieu du gain.  Résultat garanti : **post-fader exactement une fois**,
+   quel que soit le nœud.  Le `status` expose `meter_tap` par strip
+   (`channel-volumes` | `monitor-volumes`) et le cache est rempli au moment du
+   push de volume.
+2. **UI** : `AppState::fader_compensation` / `post_fader` sont **supprimés**.  Le
+   niveau capté est dessiné tel quel, pour les deux genres de strip.  L'ancienne
+   compensation multipliait un device déjà post-fader par `pulse_linear_gain`
+   **une seconde fois** (`gain³` avec la fader du device) : c'est exactement le
+   « beaucoup beaucoup trop bas » rapporté (HP : 0.457 → ×0.091 → 0.000).
+3. **Rapport** (`diagnostics`): la section METERING écrit, par strip, la règle
+   qui rend le tap post-fader (`post-fader (monitorVolumes)`, `post-fader
+   (monitor follows channelVolumes)`), puis une ligne explicite **`VU gain: none`**
+   avec la raison et la mesure.  Un rapport collé dit donc si la compensation est
+   active (elle ne l'est plus) et **pourquoi**.
+
+Test live de non-régression (`holaf-pw/tests/backend_live.rs`, nommé
+`the_device_and_bus_monitors_read_the_same_post_fader_level`) : un sinus entre
+par un strip d'entrée routé vers **deux** sorties (un bus virtuel et un nœud
+`monitor.channel-volumes=true`), et les deux monitors sont relevés :
+
+| | fader 1.0 | fader 0.3 | rapport |
+|---|---|---|---|
+| bus virtuel | 0.3535 | 0.0095 | ×0.0270 |
+| « device » (`monitor.channel-volumes=true`) | 0.3535 | 0.0095 | ×0.0270 |
+
+Même signal, même volume → **même niveau**, et le fader n'est appliqué qu'une
+fois (0.00073 serait `gain²`, l'ancien bug).
+
+**Reste à vérifier chez l'utilisateur (PipeWire 1.6.11)** : que le monitor de son
+device physique suive bien le fader une seule fois — le rapport de diagnostic le
+dit maintenant tout seul (`meter_tap` + `VU gain: none`), et si son device était
+vraiment pré-fader le symptôme serait « le VU ne bouge pas avec le fader », plus
+« le VU est trop bas ».
 
 ### 10sexies.3 Sortie mono : option de downmix L+R
 

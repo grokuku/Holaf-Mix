@@ -10,7 +10,7 @@
 //!        ▼ raw f32le, 2 ch, 48 kHz
 //! block maths: rms + peak per channel     ← this module (pure, unit-tested)
 //!        ▼
-//! RmsWindow: RMS over the last 300 ms     ← the value a VU shows
+//! RmsWindow: RMS over the last 100 ms     ← the value a VU shows
 //!        ▼
 //! MeterBoard: Arc<[AtomicU32]>            ← the UI reads f32 bits, no lock
 //!        ▼ polled at 25 Hz by AppState::poll_engine
@@ -24,6 +24,10 @@
 //! * the **bar shows a short-term RMS** ([`RMS_WINDOW`]), never a peak: a peak
 //!   follower on music sits at the loudest sample and reads “constant and too
 //!   high”, vibrating on every transient;
+//! * that window is **100 ms**, not 300: a VU has to *react* (user report: “les
+//!   vu-mètres bougent, mais ils ont toujours un peu de lag”), and 100 ms of
+//!   integration is enough to stop a 10 ms block from vibrating the bar — the
+//!   number that gives a meter its inertia is the release time, not the window;
 //! * the **release is a real time constant** ([`RELEASE_TAU`]) applied to the
 //!   elapsed `dt`, so the bar falls at the same speed whatever the frame rate,
 //!   and a 10 % drop of the signal is visible immediately instead of being
@@ -57,22 +61,33 @@
 //! | 0.00316 | −50 | 0.15 |
 //! | 0 | −∞ | 0.00 |
 //!
-//! The **capture of a virtual strip's bus is post-fader**, and that was measured
-//! rather than assumed: the engine writes `Props.monitorVolumes` together with
-//! `channelVolumes` on a strip's master node, and a tone played into a bus reads
-//! 0.3535 at volume 1.0, 0.0096 at 0.3 and 0.0004 at 0.1 — exactly
-//! `pulse_linear_gain(volume)` (the PulseAudio cubic curve).  A **physical**
-//! strip is different: its capture is the *device* source/monitor, which sits
-//! before the strip's fader (measured on real hardware: fader at 30 %, monitor
-//! RMS 0.51, i.e. a VU that never moves with the fader).  `AppState` therefore
-//! applies `pulse_linear_gain(volume)` to physical strips only — see
-//! [`crate::app::AppState::levels_for`] and [`attenuate_level`].  A bare
-//! `adapter`/`null-audio-sink` whose
-//! `monitor.channel-volumes` is left at its default is **pre**-fader (measured:
-//! identical RMS at every gain), which is why the engine sets `monitorVolumes`
-//! explicitly.  Turning `monitor.channel-volumes` on **as well** doubles the
-//! attenuation (measured: 0.3 → 0.032 instead of 0.106), so the UI must *not*
-//! multiply the level by the strip volume again — that was the trap.
+//! # Monitoring semantics: post-fader, everywhere, exactly once
+//!
+//! The bar shows the signal **at a strip's master node**, after its fader.  Both
+//! strip kinds are measured, not assumed (PipeWire 1.4.2 headless sandbox; see
+//! `holaf-pw/tests/backend_live.rs`):
+//!
+//! * a **virtual strip** is metered through its bus (`Holaf_Bus_<Label>.monitor`);
+//! * a **physical strip** through its device (`<device>.monitor`).
+//!
+//! A sink's monitor tap has its **own** gain (`Props.monitorVolumes`) and its own
+//! rule — `monitor.channel-volumes` decides whether `channelVolumes` also applies
+//! to it.  The engine writes the strip volume to `channelVolumes` (that is the
+//! sound) and makes the tap follow it *once*: `monitorVolumes = gain` when the
+//! node does not apply `channelVolumes` to its monitor (the engine's own buses,
+//! and ALSA nodes, whose default is `false`), and `monitorVolumes = 1.0` when it
+//! does (`module-null-sink`, the WirePlumber fallback sink: `true`).  Writing both
+//! gains on the second kind doubled the attenuation — measured on a
+//! `monitor.channel-volumes=true` sink: 0.3536 at unity, **0.000258** at fader 0.3
+//! (= `gain²`), against 0.0095 (= `gain`) once fixed.
+//!
+//! Consequence for this module: **the UI never scales a level by the fader.**  A
+//! capture is post-fader on every strip kind, so multiplying by
+//! `pulse_linear_gain(volume)` again — what [`crate::app`] used to do for physical
+//! strips — showed `gain²` and made the output bars read “beaucoup beaucoup trop
+//! bas” (user report).  [`attenuate_level`] remains as a pure helper (a linear
+//! gain applied to a level that is already on the dB scale) for callers that
+//! really do hold a pre-fader signal, but the meter path does not use it.
 //!
 //! Everything except [`MeterBoard`] is a pure function of its inputs, so the
 //! DSP is verified with synthetic buffers (sine, silence, clipped saturation)
@@ -104,18 +119,36 @@ pub const RELEASE_TAU: Duration = Duration::from_millis(350);
 /// A 10 ms block is the *capture* granularity, not a meter time constant.  With
 /// the block RMS feeding the bar directly, the level jumps on every hi-hat and
 /// the max-hold below turns the bar into a peak follower: “le niveau est plus
-/// ou moins constant (et trop haut) mais ça vibre”.  Averaging over ~300 ms
-/// gives the reading a human eye integrates over, and makes loud music read
-/// its *short-term* RMS (−12…−9 dBFS) instead of its loudest 10 ms.
-pub const RMS_WINDOW: Duration = Duration::from_millis(300);
+/// ou moins constant (et trop haut) mais ça vibre”.  Averaging over a window
+/// makes loud music read its *short-term* RMS (−12…−9 dBFS) instead of its
+/// loudest 10 ms.
+///
+/// **Why 100 ms and not 300.**  The window was 300 ms, which is the time a
+/// *loudness meter* integrates over, not a VU: it delayed the attack by three
+/// UI ticks and diluted every transient (user report: “les vu-mètres bougent,
+/// mais ils ont toujours un peu de lag.  tu affiches la valeur direct ou tu as
+/// une sorte d'inertie ?”).  Measured on a −9 dBFS tone and a 25 Hz poll
+/// (see `the_window_is_short_enough_to_react_to_a_burst`):
+///
+/// | window | time to 90 % of the reading | 50 ms burst peak |
+/// |---|---|---|
+/// | 300 ms (before) | 120 ms | 0.654 |
+/// | **100 ms (now)** | **40 ms** | **0.727** |
+///
+/// 100 ms is the compromise: one UI tick of delay instead of three, still ten
+/// blocks of averaging so a single hi-hat cannot move the bar (a 10 ms block
+/// alone moves the reading by +10 dB, ten of them by +10·log10(11/10) ≈ 0.4 dB).
+/// The *ballistics* of the meter — what a VU's inertia really is — live in the
+/// release ([`RELEASE_TAU`], 350 ms), which this window does not touch.
+pub const RMS_WINDOW: Duration = Duration::from_millis(100);
 
 /// Frames per published block in the capture path: 480 frames at 48 kHz = 10 ms.
 pub const BLOCK_FRAMES: usize = 480;
 
-/// Blocks in [`RMS_WINDOW`] (`300 ms / 10 ms`): the reader keeps this many
-/// per-channel mean squares, which makes the window exactly 300 ms of audio
+/// Blocks in [`RMS_WINDOW`] (`100 ms / 10 ms`): the reader keeps this many
+/// per-channel mean squares, which makes the window exactly 100 ms of audio
 /// whatever the wall-clock jitter of the capture thread.
-pub const RMS_WINDOW_BLOCKS: usize = 30;
+pub const RMS_WINDOW_BLOCKS: usize = 10;
 
 /// Bottom of the level scale: this many dB below full scale maps to 0.
 ///
@@ -358,13 +391,14 @@ pub fn decay_factor(dt: Duration) -> f32 {
 /// Why not the block RMS: a 10 ms RMS is dominated by whatever the loudest
 /// handful of cycles in that block were, so the level of steady music jumps
 /// several dB from block to block (measured on the sandbox: 10 ms blocks of the
-/// same mix ranged over 0.075…0.117 RMS = −22…−19 dBFS, while the 300 ms RMS sat
-/// at 0.10 = −20 dBFS).  Feeding that into a max-hold envelope gives exactly the
-/// reported symptom: a bar that is **constant and too high** (it tracks the
-/// loudest recent block) while **vibrating** (every block is a new maximum).
+/// same mix ranged over 0.075…0.117 RMS = −22…−19 dBFS, while the 100 ms RMS
+/// stayed within ±0.4 dB of 0.10 = −20 dBFS).  Feeding the 10 ms value into a
+/// max-hold envelope gives exactly the reported symptom: a bar that is
+/// **constant and too high** (it tracks the loudest recent block) while
+/// **vibrating** (every block is a new maximum).
 ///
 /// The window is a ring of per-block *mean squares*, so it is exact (no IIR
-/// bias, no attack transient) and its length is a number of blocks — 300 ms of
+/// bias, no attack transient) and its length is a number of blocks — 100 ms of
 /// audio by construction, independent of the thread's scheduling.
 #[derive(Debug, Clone)]
 pub struct RmsWindow {
@@ -382,8 +416,17 @@ impl Default for RmsWindow {
 
 impl RmsWindow {
     pub fn new() -> Self {
+        Self::with_blocks(RMS_WINDOW_BLOCKS)
+    }
+
+    /// A window of `blocks` blocks (10 ms each) instead of [`RMS_WINDOW_BLOCKS`].
+    ///
+    /// Only the tests use it, to compare the 100 ms window with the 300 ms one it
+    /// replaced (see `the_window_is_short_enough_to_react_to_a_burst`): the
+    /// measured difference is what justifies the constant.
+    pub fn with_blocks(blocks: usize) -> Self {
         Self {
-            means: vec![[0.0; 2]; RMS_WINDOW_BLOCKS.max(1)],
+            means: vec![[0.0; 2]; blocks.max(1)],
             next: 0,
             filled: 0,
         }
@@ -421,7 +464,7 @@ impl RmsWindow {
     }
 
     /// Forget the window (mute, stop): the next block starts a fresh average
-    /// instead of dragging 300 ms of the old signal along.
+    /// instead of dragging 100 ms of the old signal along.
     pub fn reset(&mut self) {
         self.means.fill([0.0; 2]);
         self.next = 0;
@@ -893,7 +936,7 @@ mod tests {
         assert!(envelope.level()[0] >= 0.0);
     }
 
-    /// The bar reads the **RMS over 300 ms**, not the loudest 10 ms block: a
+    /// The bar reads the **RMS over 100 ms**, not the loudest 10 ms block: a
     /// transient must be diluted, and a steady signal must give a steady bar
     /// (no “ça vibre”).
     #[test]
@@ -912,16 +955,16 @@ mod tests {
         assert!((window.rms()[0] - 0.1).abs() < 1e-6, "{:?}", window.rms());
         let steady_level = window.level()[0];
         assert!((steady_level - 0.61).abs() < 0.01, "{steady_level}");
-        // One loud block (a snare) moves the window by ~1/30 of its energy:
-        // RMS = sqrt((29·0.01 + 0.64)/30) = 0.176, i.e. +4.9 dB — a visible
+        // One loud block (a snare) moves the window by ~1/10 of its energy:
+        // RMS = sqrt((9·0.01 + 0.64)/10) = 0.270, i.e. +8.6 dB — a visible
         // kick, not the +10 dB a peak follower would show.
         window.push(&MeterSample {
             rms: [0.8, 0.8],
             peak: [1.0, 1.0],
         });
         let kicked = window.rms()[0];
-        assert!(kicked > 0.17 && kicked < 0.19, "{kicked}");
-        assert!(window.level()[0] - steady_level < 0.1, "{steady_level}");
+        assert!(kicked > 0.26 && kicked < 0.28, "{kicked}");
+        assert!(window.level()[0] - steady_level > 0.1, "{steady_level}");
         // Two different channels stay two different channels.
         let mut stereo = RmsWindow::new();
         for _ in 0..RMS_WINDOW_BLOCKS {
@@ -938,6 +981,109 @@ mod tests {
         warm.reset();
         assert!(warm.is_empty());
         assert_eq!(warm.level(), [0.0, 0.0]);
+    }
+
+    /// **The window is short enough to react**, and that is measured rather than
+    /// argued: the bar is fed the way the app feeds it (one 10 ms block every
+    /// 10 ms, the level read at the 25 Hz poll) and the time to reach 90 % of the
+    /// reading is taken.
+    ///
+    /// The 300 ms window needed **three** UI ticks (120 ms) — the reported “ils
+    /// ont toujours un peu de lag” — and a 50 ms burst only ever reached 0.654.
+    /// At 100 ms the tone is at 90 % within one tick (40 ms) and the same burst
+    /// reaches 0.727.  The test keeps both ends honest: fast enough on the way
+    /// up, still averaging ten blocks.
+    #[test]
+    fn the_window_is_short_enough_to_react_to_a_burst() {
+        const BLOCK: Duration = Duration::from_millis(10);
+
+        // `burst` = how many blocks carry the tone (`None` = it never stops).
+        // Returns (the level when the bar settles, the peak, the first tick at
+        // 90 % of the settled level).
+        fn run(burst: Option<usize>, window_blocks: usize) -> (f32, f32, u128) {
+            let tone = MeterSample {
+                rms: [0.3536, 0.3536],
+                peak: [0.5, 0.5],
+            };
+            let mut window = RmsWindow::with_blocks(window_blocks);
+            // Warm the window with silence first: a meter that has been running
+            // has a *full* window, and that is the state in which dilution can
+            // be measured at all (a fresh window averages only what it holds, so
+            // the very first burst reads full on any length).
+            for _ in 0..window_blocks {
+                window.push(&MeterSample::default());
+            }
+            let mut envelope = Envelope::new();
+            let blocks_per_tick = (METER_INTERVAL.as_millis() / BLOCK.as_millis()) as usize;
+            let mut peak = 0.0_f32;
+            let mut settled = 0.0_f32;
+            let mut level_at = |tick: usize| {
+                for block in 0..blocks_per_tick {
+                    let index = tick * blocks_per_tick + block;
+                    let sample = match burst {
+                        Some(count) if index >= count => MeterSample::default(),
+                        _ => tone,
+                    };
+                    window.push(&sample);
+                }
+                envelope.update(window.level(), METER_INTERVAL)[0]
+            };
+            let mut trace = Vec::new();
+            for tick in 0..12 {
+                let level = level_at(tick);
+                peak = peak.max(level);
+                settled = level;
+                trace.push(((tick as u128 + 1) * METER_INTERVAL.as_millis(), level));
+            }
+            let target = 0.9 * settled;
+            let reached = trace
+                .iter()
+                .find(|(_, level)| *level >= target)
+                .map(|(ms, _)| *ms)
+                .unwrap_or(u128::MAX);
+            (settled, peak, reached)
+        }
+
+        // A sustained −9 dBFS tone: the bar is at 90 % of its reading after one
+        // poll (40 ms) instead of three (120 ms at 300 ms of integration).
+        let (settled, _, reached) = run(None, RMS_WINDOW_BLOCKS);
+        assert!(settled > 0.7, "the reading itself is unchanged: {settled}");
+        assert!(
+            reached <= METER_INTERVAL.as_millis(),
+            "the bar must reach 90 % within one UI tick, took {reached} ms"
+        );
+        // …and a 300 ms window really was three ticks slower: the measurement
+        // is what justifies the constant, not a guess.
+        let (_, _, slow) = run(None, 30);
+        assert!(
+            slow >= 3 * METER_INTERVAL.as_millis(),
+            "300 ms took {slow} ms"
+        );
+
+        // A 50 ms burst (5 blocks) is *not* swallowed: it draws most of the bar.
+        let (_, burst_peak, _) = run(Some(5), RMS_WINDOW_BLOCKS);
+        assert!(
+            burst_peak > 0.70,
+            "a 50 ms burst must be visible (got {burst_peak})"
+        );
+        let (_, old_peak, _) = run(Some(5), 30);
+        assert!(
+            old_peak < 0.68,
+            "the old 300 ms window diluted it (got {old_peak})"
+        );
+        assert!(burst_peak > old_peak + 0.05, "{burst_peak} vs {old_peak}");
+
+        // The constants themselves: 100 ms of audio, ten blocks.
+        assert_eq!(RMS_WINDOW, Duration::from_millis(100));
+        assert_eq!(RMS_WINDOW_BLOCKS, 10);
+        assert_eq!(
+            RMS_WINDOW.as_millis(),
+            RMS_WINDOW_BLOCKS as u128 * BLOCK.as_millis(),
+            "the window is a number of blocks, and it is 100 ms of audio"
+        );
+        // The tone above is a −9 dBFS sine: 0.3536 RMS, i.e. what the reading
+        // converges to (±0.01 of 0.77 on the bar scale).
+        assert!((settled - 0.77).abs() < 0.02, "{settled}");
     }
 
     /// The post-fader correction works in the **amplitude** domain: a fader at
